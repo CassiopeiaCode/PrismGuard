@@ -5,13 +5,17 @@
 import os
 import jieba
 import joblib
-from typing import List
+from typing import List, Dict, Tuple, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier, LogisticRegression
 
 from ai_proxy.moderation.smart.profile import ModerationProfile
 from ai_proxy.moderation.smart.storage import SampleStorage
 from ai_proxy.moderation.smart.ai import ModerationResult
+
+
+# 模型缓存：{profile_name: (vectorizer, clf, model_mtime, vectorizer_mtime)}
+_model_cache: Dict[str, Tuple[object, object, float, float]] = {}
 
 
 def tokenize_for_bow(text: str, use_char_ngram: bool = True) -> str:
@@ -114,6 +118,45 @@ def bow_model_exists(profile: ModerationProfile) -> bool:
             os.path.exists(profile.get_vectorizer_path()))
 
 
+def _load_model_with_cache(profile: ModerationProfile) -> Tuple[object, object]:
+    """
+    加载模型（带缓存，避免重复加载和内存泄漏）
+    
+    Returns:
+        (vectorizer, clf)
+    """
+    profile_name = profile.profile_name
+    model_path = profile.get_model_path()
+    vectorizer_path = profile.get_vectorizer_path()
+    
+    # 获取文件修改时间
+    model_mtime = os.path.getmtime(model_path)
+    vectorizer_mtime = os.path.getmtime(vectorizer_path)
+    
+    # 检查缓存
+    if profile_name in _model_cache:
+        cached_vec, cached_clf, cached_model_mtime, cached_vec_mtime = _model_cache[profile_name]
+        
+        # 如果文件没有更新，重用缓存
+        if model_mtime == cached_model_mtime and vectorizer_mtime == cached_vec_mtime:
+            print(f"[DEBUG] 重用缓存的模型: {profile_name}")
+            return cached_vec, cached_clf
+        else:
+            print(f"[DEBUG] 模型文件已更新，重新加载: {profile_name}")
+            # 清理旧模型（帮助GC回收内存）
+            del _model_cache[profile_name]
+    
+    # 加载模型
+    print(f"[DEBUG] 加载模型文件: {profile_name}")
+    vectorizer = joblib.load(vectorizer_path)
+    clf = joblib.load(model_path)
+    
+    # 保存到缓存
+    _model_cache[profile_name] = (vectorizer, clf, model_mtime, vectorizer_mtime)
+    
+    return vectorizer, clf
+
+
 def bow_predict_proba(text: str, profile: ModerationProfile) -> float:
     """
     使用词袋模型预测违规概率
@@ -127,9 +170,8 @@ def bow_predict_proba(text: str, profile: ModerationProfile) -> float:
     """
     print(f"[DEBUG] 词袋模型预测")
     
-    # 加载模型
-    vectorizer = joblib.load(profile.get_vectorizer_path())
-    clf = joblib.load(profile.get_model_path())
+    # 加载模型（带缓存）
+    vectorizer, clf = _load_model_with_cache(profile)
     
     print(f"  模型类型: {type(clf).__name__}")
     print(f"  特征数量: {len(vectorizer.get_feature_names_out())}")
