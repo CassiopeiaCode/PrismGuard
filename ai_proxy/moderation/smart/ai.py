@@ -140,13 +140,31 @@ async def ai_moderate(text: str, profile: ModerationProfile) -> ModerationResult
 
 
 async def run_ai_moderation_and_log(text: str, profile: ModerationProfile) -> ModerationResult:
-    """AI 审核并记录结果"""
+    """AI 审核并记录结果（先查数据库，避免重复调用AI）"""
+    storage = SampleStorage(profile.get_db_path())
+    
+    # 先查数据库，如果已有记录则直接返回
+    existing_sample = storage.find_by_text(text)
+    if existing_sample:
+        print(f"[DEBUG] 数据库命中: 文本已审核过")
+        result = ModerationResult(
+            violation=bool(existing_sample.label),
+            category=existing_sample.category,
+            reason=f"From DB: {existing_sample.created_at}",
+            source="ai",  # 来源仍标记为 ai（因为是之前AI审核的）
+            confidence=None
+        )
+        print(f"[MODERATION] 数据库结果: {'❌ 违规' if result.violation else '✅ 通过'}")
+        return result
+    
+    # 数据库没有，调用AI审核
+    print(f"[DEBUG] 数据库未命中，调用AI审核")
     result = await ai_moderate(text, profile)
     
     # 保存到数据库
-    storage = SampleStorage(profile.get_db_path())
     label = 1 if result.violation else 0
     storage.save_sample(text, label, result.category)
+    print(f"[DEBUG] 审核结果已保存到数据库")
     
     return result
 

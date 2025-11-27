@@ -85,3 +85,24 @@ class SampleStorage:
         count = cursor.fetchone()[0]
         conn.close()
         return count
+    
+    def find_by_text(self, text: str) -> Optional[Sample]:
+        """根据文本查找样本"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, text, label, category, created_at FROM samples WHERE text = ? ORDER BY created_at DESC LIMIT 1",
+            (text,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return Sample(
+                id=row[0],
+                text=row[1],
+                label=row[2],
+                category=row[3],
+                created_at=row[4]
+            )
+        return None
