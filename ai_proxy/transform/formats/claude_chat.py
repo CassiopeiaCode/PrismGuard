@@ -20,6 +20,15 @@ def can_parse_claude_chat(path: str, headers: Dict[str, str], body: Dict[str, An
     if "prompt" in body and "messages" not in body:
         return False
     
+    # 排斥带有 role="tool" 的 OpenAI Chat 格式
+    # Claude Chat 不使用 role="tool"，而是使用 content 中的 tool_result type
+    if "messages" in body:
+        messages = body.get("messages", [])
+        if messages and isinstance(messages, list):
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "tool":
+                    return False
+    
     # 检查路径
     if "/messages" in path:
         return True
