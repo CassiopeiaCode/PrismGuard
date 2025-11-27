@@ -45,7 +45,7 @@ async def process_request(
     处理请求审核和格式转换
     
     Returns:
-        (通过, 错误信息, 转换后的body, 源格式名称)
+        (通过, 错误信息, 转换后的body或错误详情, 源格式名称)
     """
     try:
         return await _process_request_impl(config, body, path, headers)
@@ -96,7 +96,19 @@ async def _process_request_impl(
             passed, result = await smart_moderation(text, config["smart_moderation"])
             if not passed:
                 print(f"[DEBUG] ========== 请求被拒绝（智能审核） ==========\n")
-                return False, f"Smart moderation: {result.reason}", None, None
+                # 构建详细错误信息
+                details = {
+                    "source": result.source,  # ai / bow_model / cache
+                    "reason": result.reason,
+                    "category": result.category,
+                    "confidence": result.confidence
+                }
+                error_msg = f"Smart moderation blocked by {result.source}"
+                if result.category:
+                    error_msg += f" (category: {result.category})"
+                if result.confidence is not None:
+                    error_msg += f" (confidence: {result.confidence:.3f})"
+                return False, error_msg, details, None
         
         print(f"[DEBUG] ========== 请求通过审核 ==========\n")
         return True, None, body, None
@@ -129,7 +141,19 @@ async def _process_request_impl(
         passed, result = await smart_moderation(text, config["smart_moderation"])
         if not passed:
             print(f"[DEBUG] ========== 请求被拒绝（智能审核） ==========\n")
-            return False, f"Smart moderation: {result.reason}", None, src_format
+            # 构建详细错误信息
+            details = {
+                "source": result.source,
+                "reason": result.reason,
+                "category": result.category,
+                "confidence": result.confidence
+            }
+            error_msg = f"Smart moderation blocked by {result.source}"
+            if result.category:
+                error_msg += f" (category: {result.category})"
+            if result.confidence is not None:
+                error_msg += f" (confidence: {result.confidence:.3f})"
+            return False, error_msg, details, src_format
     
     # 格式转换
     target_format = transform_cfg.get("to", src_format)
@@ -198,22 +222,28 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
     path = upstream_path
     
     # 处理审核和转换
-    passed, error_msg, transformed_body, src_format = await process_request(
+    passed, error_msg, data, src_format = await process_request(
         config, body, path, dict(request.headers)
     )
     
     if not passed:
+        error_response = {
+            "code": "MODERATION_BLOCKED",
+            "message": error_msg,
+            "type": "moderation_error",
+            "source_format": src_format
+        }
+        # 如果 data 是字典且包含审核详情，添加到响应中
+        if isinstance(data, dict) and "source" in data:
+            error_response["moderation_details"] = data
+        
         return JSONResponse(
             status_code=400,
-            content={
-                "error": {
-                    "code": "MODERATION_BLOCKED",
-                    "message": error_msg,
-                    "type": "moderation_error",
-                    "source_format": src_format
-                }
-            }
+            content={"error": error_response}
         )
+    
+    # passed=True 时，data 是转换后的 body
+    transformed_body = data
     
     # 转发到上游
     upstream_client = UpstreamClient(upstream_base)
