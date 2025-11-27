@@ -20,17 +20,34 @@ router = APIRouter()
 def parse_url_config(cfg_and_upstream: str) -> Tuple[dict, str]:
     """
     解析 URL 中的配置和上游地址
-    格式: {encoded_json_config}${upstream_url}
+    格式1: {encoded_json_config}${upstream_url}
+    格式2: !{env_key}${upstream_url}  (从环境变量读取配置)
     """
     parts = cfg_and_upstream.split("$", 1)
     if len(parts) != 2:
         raise HTTPException(400, "Invalid URL format: expected {config}${upstream}")
     
     try:
-        cfg_str = urllib.parse.unquote(parts[0])
-        config = json.loads(cfg_str)
+        cfg_part = parts[0]
         upstream = parts[1]
+        
+        # 检查是否使用环境变量
+        if cfg_part.startswith("!"):
+            # 从环境变量读取配置
+            env_key = cfg_part[1:]  # 移除 ! 前缀
+            from ai_proxy.config import settings
+            config_str = getattr(settings, env_key, None)
+            if not config_str:
+                raise HTTPException(400, f"Environment variable {env_key} not found")
+            config = json.loads(config_str)
+        else:
+            # URL编码的JSON配置
+            cfg_str = urllib.parse.unquote(cfg_part)
+            config = json.loads(cfg_str)
+        
         return config, upstream
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(400, f"Config parse error: {str(e)}")
 

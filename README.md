@@ -53,11 +53,21 @@ python -m ai_proxy.app
 
 ### URL 格式
 
+支持两种配置方式：
+
+#### 1. URL 编码配置（临时测试）
+
 ```
 http://proxy-host/{urlencoded_json_config}${upstream_url}
 ```
 
-### 基础示例
+#### 2. 环境变量配置（推荐，URL更短）
+
+```
+http://proxy-host/!{env_key}${upstream_url}
+```
+
+### 基础示例（URL编码方式）
 
 ```python
 from openai import OpenAI
@@ -93,6 +103,44 @@ response = client.chat.completions.create(
 )
 ```
 
+### 环境变量配置方式（推荐）
+
+**优点**：URL 更短，避免数据库字段溢出
+
+#### 1. 配置环境变量
+
+在 `.env` 文件中添加：
+
+```bash
+# 默认配置（基础+智能审核）
+PROXY_CONFIG_DEFAULT={"basic_moderation":{"enabled":true,"keywords_file":"configs/keywords.txt"},"smart_moderation":{"enabled":true,"profile":"default"},"format_transform":{"enabled":false}}
+
+# Claude 转换配置
+PROXY_CONFIG_CLAUDE={"basic_moderation":{"enabled":true,"keywords_file":"configs/keywords.txt"},"smart_moderation":{"enabled":true,"profile":"4claude"},"format_transform":{"enabled":true,"from":"openai_chat","to":"claude_chat"}}
+```
+
+#### 2. 使用客户端
+
+```python
+from openai import OpenAI
+
+# 使用环境变量配置
+upstream = "https://api.openai.com/v1"
+base_url = f"http://localhost:8000/!PROXY_CONFIG_DEFAULT${upstream}"
+
+client = OpenAI(api_key="sk-xxx", base_url=base_url)
+response = client.chat.completions.create(
+    model="gpt-4",
+    messages=[{"role": "user", "content": "你好"}]
+)
+```
+
+#### URL 长度对比
+
+- URL 编码方式：~300+ 字符
+- 环境变量方式：~80 字符
+- **节省**：~220+ 字符
+
 ### 工具调用示例
 
 ```python
@@ -118,29 +166,32 @@ response = client.chat.completions.create(
 )
 ```
 
-### 格式转换示例
+### 格式转换示例（环境变量方式）
 
 ```python
 # OpenAI SDK + Claude API（自动转换）
-config = {
-    "format_transform": {
-        "enabled": True,
-        "from": "openai_chat",
-        "to": "claude_chat"
-    }
-}
+upstream = "https://api.anthropic.com/v1"
+base_url = f"http://localhost:8000/!PROXY_CONFIG_CLAUDE${upstream}"
 
 # 使用 OpenAI SDK，实际调用 Claude API
 client = OpenAI(
-    api_key="sk-ant-xxx",
-    base_url=create_proxy_url(config, "https://api.anthropic.com/v1")
+    api_key="sk-ant-xxx",  # Claude API Key
+    base_url=base_url
 )
 
 response = client.chat.completions.create(
-    model="claude-3-opus-20240229",
+    model="claude-3-5-sonnet-20241022",
     messages=[{"role": "user", "content": "你好"}]
 )
 ```
+
+### 完整客户端示例
+
+参见 [`examples/client_example.py`](examples/client_example.py)：
+
+- URL 编码配置
+- 环境变量配置（推荐）
+- OpenAI → Claude 转换
 
 ## ⚙️ 配置说明
 
