@@ -25,6 +25,16 @@
   - SGDClassifier 增量学习
   - 定时自动训练（可配置间隔）
 
+> Note: BoW training now uses batch mode + layered vocabulary + async scheduling. See the next section for details.
+
+#### BoW 模型与训练
+
+- 当前版本采用 **一次性训练 + 分层词表**：调度器触发时会批量加载 `max_samples` 条样本，基于文档频率构建多层词表，再用 `TfidfVectorizer(lowercase=False)` + `SGDClassifier` 训练。
+- `use_layered_vocab` 与 `vocab_buckets` 可自定义不同频率区间与数量，既保留高价值违规特征，又显著降低 6w+ 字符长文本带来的稀疏矩阵体积。
+- 默认 `max_features=8000`（可通过 profile 调整，长文本环境建议降低到 5000 或更小以控制内存）。
+- 训练任务通过 `asyncio.to_thread()` 在后台执行，不会阻塞 FastAPI 主线程；若需要立即重新训练，可运行 `python tools/train_bow_model.py <profile>`。
+- 配套工具：`tools/diagnose_training_data.py`（检查样本质量）与 `tools/fix_bow_model.py`（辅助修复配置/样本不足问题）。
+
 ### 🔄 多格式透明转换
 
 支持主流 AI API 格式的自动检测和相互转换：
@@ -301,7 +311,16 @@ response = client.chat.completions.create(
     "char_ngram_range": [2, 3],
     "use_word_ngram": true,
     "word_ngram_range": [1, 2],
-    "model_type": "sgd_logistic"
+    "model_type": "sgd_logistic",
+    "batch_size": 2000,
+    "max_seconds": 300,
+    "max_db_items": 100000,
+    "use_layered_vocab": true,
+    "vocab_buckets": [
+      {"name": "high_freq", "min_doc_ratio": 0.05, "max_doc_ratio": 0.6, "limit": 1200},
+      {"name": "mid_freq", "min_doc_ratio": 0.01, "max_doc_ratio": 0.05, "limit": 2600},
+      {"name": "low_freq", "min_doc_ratio": 0.002, "max_doc_ratio": 0.01, "limit": 1200}
+    ]
   }
 }
 ```
@@ -312,6 +331,9 @@ response = client.chat.completions.create(
 - [`high_risk_threshold`](ai_proxy/moderation/smart/ai.py:238): 高风险阈值，高于此值直接拒绝
 - [`min_samples`](ai_proxy/moderation/smart/bow.py:56): 最少样本数，达到后才开始训练
 - [`retrain_interval_minutes`](ai_proxy/moderation/smart/scheduler.py:48): 模型重训练间隔
+- [`max_samples`](ai_proxy/moderation/smart/bow.py:66): 每次训练最多加载的样本数，影响训练内存峰值
+- [`max_db_items`](ai_proxy/moderation/smart/storage.py:248): 样本库容量上限；超出后按标签平衡随机清理
+- [`use_layered_vocab` / `vocab_buckets`](ai_proxy/moderation/smart/profile.py:34): 是否启用分层词表及其频率区间/数量配置
 
 ### 格式转换配置
 
@@ -542,6 +564,10 @@ python tools/train_bow_model.py 4claude
 
 模型训练需要满足最小样本数（默认 200 条），可在 [`profile.json`](ai_proxy/moderation/smart/profile.py:67) 中配置。
 
+- 训练前可执行 `python tools/diagnose_training_data.py <profile>` 检查标签分布；若违规样本过少，可暂时提高 `ai_review_rate` 积累标注或使用 `tools/fix_bow_model.py` 获取修复建议。
+- `bow_training.use_layered_vocab` 默认开启，若有特殊语料（多语言/大小写敏感），可在 profile 中调整 `vocab_buckets` 与 `max_features`。
+- 训练日志会打印词表覆盖度和训练准确率；如发现异常，可删除最新模型文件后重新训练，或调高 `min_samples` 暂停自动训练。
+
 ### 查询审核日志
 
 ```bash
@@ -579,7 +605,16 @@ mkdir -p configs/mod_profiles/my_profile
   },
   "bow_training": {
     "min_samples": 200,
-    "retrain_interval_minutes": 60
+    "retrain_interval_minutes": 60,
+    "max_samples": 20000,
+    "max_features": 5000,
+    "max_db_items": 50000,
+    "use_layered_vocab": true,
+    "vocab_buckets": [
+      {"name": "high_freq", "min_doc_ratio": 0.05, "max_doc_ratio": 0.6, "limit": 1000},
+      {"name": "mid_freq", "min_doc_ratio": 0.01, "max_doc_ratio": 0.05, "limit": 2500},
+      {"name": "low_freq", "min_doc_ratio": 0.002, "max_doc_ratio": 0.01, "limit": 1500}
+    ]
   }
 }
 ```
@@ -799,6 +834,8 @@ ls -lh configs/mod_profiles/*/bow_model.pkl
 ```python
 start_scheduler(check_interval_minutes=10)  # 修改检查间隔
 ```
+
+调度器会逐个 profile 获取锁并在后台线程中调用 `train_bow_model()`，因此不会阻塞 FastAPI 主事件循环；若某个 profile 正在训练，会在下一轮自动跳过。
 
 ### 数据备份
 
