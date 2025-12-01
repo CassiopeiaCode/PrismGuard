@@ -12,6 +12,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier, LogisticRegression
+from sklearn.utils.class_weight import compute_class_weight
 
 from ai_proxy.moderation.smart.profile import ModerationProfile
 from ai_proxy.moderation.smart.storage import SampleStorage
@@ -51,48 +52,32 @@ def tokenize_for_bow(text: str, use_char_ngram: bool = True) -> str:
 
 def train_bow_model(profile: ModerationProfile):
     """
-    训练词袋线性模型（支持大规模数据的增量训练）
-    
-    优化特性:
-    1. 随机打乱训练顺序（避免样本顺序偏差）
-    2. 训练时间限制（默认最多5分钟）
-    3. 批量增量训练（使用 partial_fit）
-    4. 内存友好的数据访问方式
+    训练词袋线性模型（一次性训练版本）
     """
+    storage = SampleStorage(profile.get_db_path())
     cfg = profile.config.bow_training
-    db_path = profile.get_db_path()
-    storage = SampleStorage(db_path)
     
-    max_samples = cfg.max_samples
-    batch_size = cfg.batch_size
-    max_seconds = cfg.max_seconds
+    # 数据库清理
+    storage.cleanup_excess_samples(cfg.max_db_items)
     
-    print(f"[BOW] 开始训练 profile={profile.profile_name}")
-    print(f"[BOW] 配置: max_samples={max_samples}, batch_size={batch_size}, max_seconds={max_seconds}秒")
-    start_time = time.time()
-    
-    # 0. 数据库清理（在训练前执行）
-    max_db_items = cfg.max_db_items
-    print(f"[BOW] 数据库限制: max_db_items={max_db_items}")
-    storage.cleanup_excess_samples(max_db_items)
-    
-    # 1. 查询总样本数
-    total = storage.get_sample_count()
-    if total < cfg.min_samples:
-        print(f"[BOW] 样本数不足 {cfg.min_samples}，当前={total}，跳过训练")
+    # 检查样本数量
+    sample_count = storage.get_sample_count()
+    if sample_count < cfg.min_samples:
+        print(f"[BOW] 样本数不足 {cfg.min_samples}，当前={sample_count}，跳过训练")
         return
     
-    print(f"[BOW] 总样本数: {total}")
+    # 加载样本
+    samples = storage.load_samples(cfg.max_samples)
+    texts = [s.text for s in samples]
+    labels = [s.label for s in samples]
     
-    # 2. 取出要参与训练的样本 ID 列表（只取最新的 max_samples 条）
-    ids = storage.get_sample_ids(limit=min(max_samples, total))
-    print(f"[BOW] 选取样本数: {len(ids)}")
+    print(f"[BOW] 开始训练，共 {len(samples)} 个样本")
     
-    # 3. 随机打乱（避免样本顺序偏差）
-    random.shuffle(ids)
-    print(f"[BOW] 样本顺序已随机打乱")
+    # 文本预处理和分词
+    use_char_ngram = cfg.use_char_ngram
+    corpus = [tokenize_for_bow(t, use_char_ngram) for t in texts]
     
-    # 4. 准备 TF-IDF 向量器和分类器
+    # 构建 TF-IDF 向量化器
     word_ngram = cfg.word_ngram_range
     vectorizer = TfidfVectorizer(
         max_features=cfg.max_features,
@@ -100,90 +85,38 @@ def train_bow_model(profile: ModerationProfile):
         min_df=2,
         max_df=0.8
     )
+    X = vectorizer.fit_transform(corpus)
     
-    # 只有 SGDClassifier 支持 partial_fit
+    # 训练线性模型
     model_type = cfg.model_type
-    if model_type != "sgd_logistic":
-        print(f"[BOW] 大规模训练需要使用 sgd_logistic 模型，当前配置为 {model_type}，将强制使用 sgd_logistic")
     
-    clf = SGDClassifier(
-        loss="log_loss",
-        class_weight="balanced",
-        max_iter=1000,
-        n_jobs=1,
-        random_state=42
-    )
-    classes = np.array([0, 1])  # 预定义类别
+    if model_type == "sgd_logistic":
+        clf = SGDClassifier(
+            loss="log_loss",
+            class_weight="balanced",
+            max_iter=1000,
+            n_jobs=1,
+            random_state=42
+        )
+    else:
+        clf = LogisticRegression(
+            class_weight="balanced",
+            max_iter=1000,
+            n_jobs=1,
+            random_state=42
+        )
     
-    # 5. 第一批：fit (建立词表)
-    first_batch_size = min(batch_size, len(ids))
-    first_batch_ids = ids[:first_batch_size]
+    clf.fit(X, labels)
     
-    print(f"[BOW] 第一批训练: {len(first_batch_ids)} 样本")
-    first_samples = storage.load_by_ids(first_batch_ids)
-    
-    if not first_samples:
-        print(f"[BOW] 无法加载第一批样本，训练终止")
-        return
-    
-    # 预处理第一批
-    use_char_ngram = cfg.use_char_ngram
-    texts0 = [tokenize_for_bow(s.text, use_char_ngram) for s in first_samples]
-    y0 = np.array([s.label for s in first_samples])
-    
-    # 时间检查
-    if time.time() - start_time > max_seconds:
-        print("[BOW] 训练时间已达上限（准备 fit 前），终止")
-        return
-    
-    # fit 第一批（建立词表）
-    X0 = vectorizer.fit_transform(texts0)
-    clf.partial_fit(X0, y0, classes=classes)
-    
-    elapsed = time.time() - start_time
-    print(f"[BOW] 第一批完成，耗时 {elapsed:.1f}秒，词表大小 {len(vectorizer.get_feature_names_out())}")
-    
-    # 6. 剩余样本：分批随机顺序训练，每个 batch 前检查时间
-    total_batches = (len(ids) - first_batch_size + batch_size - 1) // batch_size
-    current_batch = 0
-    
-    for i in range(first_batch_size, len(ids), batch_size):
-        # 时间到了就停
-        elapsed = time.time() - start_time
-        if elapsed > max_seconds:
-            print(f"[BOW] 训练时间已达上限 ({elapsed:.1f}秒)，提前停止")
-            print(f"[BOW] 已完成 {current_batch}/{total_batches} 批次")
-            break
-        
-        current_batch += 1
-        batch_ids = ids[i:i + batch_size]
-        
-        # 加载批次样本
-        samples = storage.load_by_ids(batch_ids)
-        if not samples:
-            continue
-        
-        # 预处理
-        texts = [tokenize_for_bow(s.text, use_char_ngram) for s in samples]
-        y = np.array([s.label for s in samples])
-        
-        # 增量训练
-        X = vectorizer.transform(texts)
-        clf.partial_fit(X, y)
-        
-        # 进度报告（每10批或最后一批）
-        if current_batch % 10 == 0 or i + batch_size >= len(ids):
-            elapsed = time.time() - start_time
-            print(f"[BOW] 进度: {current_batch}/{total_batches} 批次，已用时 {elapsed:.1f}秒")
-    
-    # 7. 保存模型 + 向量器
+    # 保存模型
     joblib.dump(vectorizer, profile.get_vectorizer_path())
     joblib.dump(clf, profile.get_model_path())
     
-    total_elapsed = time.time() - start_time
-    print(f"[BOW] 训练完成，总耗时 {total_elapsed:.1f}秒")
-    print(f"[BOW] 最终词表大小: {len(vectorizer.get_feature_names_out())}")
-    print(f"[BOW] 训练样本数: {min(len(ids), current_batch * batch_size + first_batch_size)}")
+    print(f"[BOW] 训练完成")
+    
+    # 简单评估
+    train_acc = clf.score(X, labels)
+    print(f"[BOW] 训练准确率: {train_acc:.3f}")
 
 
 def bow_model_exists(profile: ModerationProfile) -> bool:
@@ -262,10 +195,22 @@ def bow_predict_proba(text: str, profile: ModerationProfile) -> float:
     if hasattr(clf, 'predict_proba'):
         # SGDClassifier(loss="log_loss") 和 LogisticRegression 都支持
         proba = clf.predict_proba(X)[0]
-        print(f"  概率分布: [正常={proba[0]:.3f}, 违规={proba[1]:.3f}]")
-        if len(proba) > 1:
-            return float(proba[1])  # 类别 1 = 违规
-        return 0.0
+        
+        # ✅ 关键修复：检查模型的实际类别顺序
+        actual_classes = clf.classes_
+        print(f"  模型类别顺序: {actual_classes}")
+        print(f"  原始概率分布: {proba}")
+        
+        # 找到类别1（违规）在概率数组中的位置
+        if 1 in actual_classes:
+            violation_idx = list(actual_classes).index(1)
+            violation_prob = float(proba[violation_idx])
+            print(f"  违规类别索引: {violation_idx}")
+            print(f"  违规概率: {violation_prob:.3f}")
+            return violation_prob
+        else:
+            print(f"  警告：模型中没有类别1，返回默认值0")
+            return 0.0
     else:
         # 如果模型不支持 predict_proba，使用 decision_function
         score = clf.decision_function(X)[0]
