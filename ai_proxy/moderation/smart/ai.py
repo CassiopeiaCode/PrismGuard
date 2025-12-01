@@ -229,16 +229,22 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
         return True, None
     
     print(f"[DEBUG] 智能审核开始")
-    print(f"  待审核文本: {text[:100]}{'...' if len(text) > 100 else ''}")
     
     profile_name = cfg.get("profile", "default")
+    profile = get_profile(profile_name)
+    
+    # 统一截断文本
+    original_len = len(text)
+    text = profile.truncate_text(text)
+    if len(text) < original_len:
+        print(f"  文本已截断: {original_len} -> {len(text)}")
+    
+    print(f"  待审核文本: {text[:100]}{'...' if len(text) > 100 else ''}")
     
     # 0. 检查缓存
     cached_result = _check_cache(profile_name, text)
     if cached_result is not None:
         return not cached_result.violation, cached_result
-    
-    profile = get_profile(profile_name)
     
     print(f"  使用配置: {profile_name}")
     print(f"  AI审核概率: {profile.config.probability.ai_review_rate * 100:.1f}%")
