@@ -288,10 +288,11 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
 
     # 检查是否需要响应转换
     transform_cfg = config.get("format_transform", {})
+    target_format_cfg = transform_cfg.get("to", src_format)
     need_response_transform = (
         transform_cfg.get("enabled", False)
         and src_format is not None
-        and src_format != transform_cfg.get("to", src_format)
+        and src_format != target_format_cfg
     )
 
     # 获取流式响应头延迟配置
@@ -299,6 +300,8 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
     delay_stream_header = transform_cfg.get("delay_stream_header", False)
     
     # 转发请求
+    # 注意：即使不需要响应转换，如果启用了 delay_stream_header，
+    # 也需要传递格式信息用于内容检查
     try:
         response = await upstream_client.forward_request(
             method=request.method,
@@ -307,7 +310,7 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
             body=transformed_body if transformed_body else body,
             is_stream=body.get("stream", False) if isinstance(body, dict) else False,
             src_format=src_format if need_response_transform else None,
-            target_format=transform_cfg.get("to") if need_response_transform else None,
+            target_format=target_format_cfg if (need_response_transform or delay_stream_header) else None,
             delay_stream_header=delay_stream_header
         )
         return response

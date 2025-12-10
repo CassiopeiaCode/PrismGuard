@@ -203,6 +203,7 @@ def check_response_content(response: Dict[str, Any], format_name: str) -> Tuple[
             f"accumulated {len(accumulated_content)} chars (threshold: {char_threshold}), "
             f"has_tool_call: {has_tool_call}. "
             f"The AI response appears to be empty or too short."
+            f"Format name: {format_name}"
         )
         return False, error_msg
     

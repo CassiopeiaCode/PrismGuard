@@ -123,7 +123,7 @@ class UpstreamClient:
                             # 检查是否真的为空或者只有空白字符
                             # 这里策略：如果流正常结束但内容很少，我们还是返回它
                             # 只有在发生异常断开时才认为是错误
-                            pass
+                            raise Exception("Stream disconnected before valid content")
                             
                     except Exception as e:
                         print(f"[STREAM_PRE_READ_ERROR] {e}")
@@ -189,8 +189,12 @@ class UpstreamClient:
                 
                 # 如果启用了内容检查（delay_stream_header 对非流式也生效）
                 if delay_stream_header and response.status_code == 200:
-                    # 使用 target_format（上游格式）进行检查
-                    check_format = target_format or "openai_chat"
+                    # 如果进行了格式转换，应该用转换后的格式（src_format）进行检查
+                    # 否则用上游格式（target_format）进行检查
+                    if src_format and target_format and src_format != target_format:
+                        check_format = src_format  # 使用转换后的格式
+                    else:
+                        check_format = target_format or "openai_chat"  # 使用上游格式
                     passed, error_msg = check_response_content(content, check_format)
                     
                     if not passed:
