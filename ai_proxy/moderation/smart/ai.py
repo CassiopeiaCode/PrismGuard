@@ -328,7 +328,24 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
             return not result.violation, result
             
         except Exception as e:
-            print(f"[DEBUG] 本地模型预测失败: {e} -> 回退到AI")
+            import traceback
+            error_msg = str(e)
+            print(f"[DEBUG] 本地模型预测失败: {error_msg}")
+            
+            # 检查是否是 NumPy 2.0 兼容性问题
+            if "copy" in error_msg and "np.array" in error_msg:
+                print(f"[WARNING] 检测到 NumPy 2.0 兼容性问题!")
+                print(f"[WARNING] fastText 库尚未完全兼容 NumPy 2.0")
+                print(f"[WARNING] 建议降级 NumPy: pip install 'numpy<2.0'")
+                print(f"[WARNING] 或等待 fastText 更新以支持 NumPy 2.0")
+            
+            # 打印详细堆栈信息（仅在首次出现时）
+            if not hasattr(local_model_predict_proba, '_error_logged'):
+                print(f"[DEBUG] 详细错误信息:")
+                traceback.print_exc()
+                local_model_predict_proba._error_logged = True
+            
+            print(f"[DEBUG] 回退到 AI 审核")
     else:
         print(f"[DEBUG] 决策路径: 无本地模型 -> AI审核")
     

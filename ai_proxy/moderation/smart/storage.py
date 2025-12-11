@@ -137,42 +137,76 @@ class SampleStorage:
     
     def load_balanced_samples(self, max_samples: int = 20000) -> List[Sample]:
         """
-        加载样本并尽量保持标签平衡
+        加载样本并强制保持标签平衡
+        
+        策略：
+        1. 每个标签加载 max_samples/2 个样本
+        2. 如果某个标签样本不足，通过复制现有样本来补足
+        3. 最终返回完全平衡的样本集（正常:违规 = 1:1）
+        
+        Args:
+            max_samples: 最大样本数（必须是偶数，如果是奇数会向下取整）
+            
+        Returns:
+            平衡的样本列表
         """
         if max_samples <= 0:
             return []
         
+        # 确保每个标签的目标数量
+        target_per_label = max_samples // 2
+        
+        if target_per_label == 0:
+            return []
+        
         pass_count, violation_count = self.get_label_counts()
+        
+        # 如果某个标签完全没有样本，返回空列表
         if pass_count == 0 or violation_count == 0:
-            return self.load_samples(max_samples)
+            print(f"[WARNING] 标签不平衡: 正常={pass_count}, 违规={violation_count}")
+            print(f"[WARNING] 无法进行平衡采样，返回空列表")
+            return []
         
-        base_per_label = max_samples // 2
-        remainder = max_samples - base_per_label * 2
-        pass_limit = base_per_label
-        violation_limit = base_per_label
+        # 加载正常样本
+        pass_samples = self._load_samples_by_label(0, min(target_per_label, pass_count))
+        print(f"[BalancedSampling] 正常样本: 加载 {len(pass_samples)}/{target_per_label}")
         
-        if remainder > 0:
-            if pass_count >= violation_count:
-                pass_limit += remainder
-            else:
-                violation_limit += remainder
+        # 加载违规样本
+        violation_samples = self._load_samples_by_label(1, min(target_per_label, violation_count))
+        print(f"[BalancedSampling] 违规样本: 加载 {len(violation_samples)}/{target_per_label}")
         
-        pass_samples = self._load_samples_by_label(0, pass_limit)
-        violation_samples = self._load_samples_by_label(1, violation_limit)
+        # 如果正常样本不足，通过复制来补足
+        if len(pass_samples) < target_per_label:
+            original_count = len(pass_samples)
+            while len(pass_samples) < target_per_label:
+                # 循环复制样本
+                for sample in pass_samples[:original_count]:
+                    if len(pass_samples) >= target_per_label:
+                        break
+                    pass_samples.append(sample)
+            print(f"[BalancedSampling] 正常样本不足，已复制到 {len(pass_samples)} 个")
         
-        if len(pass_samples) < pass_limit and violation_count > len(violation_samples):
-            need = min(pass_limit - len(pass_samples), max_samples - len(pass_samples) - len(violation_samples))
-            if need > 0:
-                violation_samples = self._load_samples_by_label(1, violation_limit + need)
+        # 如果违规样本不足，通过复制来补足
+        if len(violation_samples) < target_per_label:
+            original_count = len(violation_samples)
+            while len(violation_samples) < target_per_label:
+                # 循环复制样本
+                for sample in violation_samples[:original_count]:
+                    if len(violation_samples) >= target_per_label:
+                        break
+                    violation_samples.append(sample)
+            print(f"[BalancedSampling] 违规样本不足，已复制到 {len(violation_samples)} 个")
         
-        if len(violation_samples) < violation_limit and pass_count > len(pass_samples):
-            need = min(violation_limit - len(violation_samples), max_samples - len(pass_samples) - len(violation_samples))
-            if need > 0:
-                pass_samples = self._load_samples_by_label(0, pass_limit + need)
-        
+        # 合并样本
         combined = pass_samples + violation_samples
-        combined.sort(key=lambda s: s.created_at or "", reverse=True)
-        return combined[:max_samples]
+        
+        # 打乱顺序（重要：避免模型学到标签顺序）
+        import random
+        random.shuffle(combined)
+        
+        print(f"[BalancedSampling] 最终样本: 正常={len(pass_samples)}, 违规={len(violation_samples)}, 总计={len(combined)}")
+        
+        return combined
     
     def get_sample_count(self) -> int:
         """获取样本总数"""
