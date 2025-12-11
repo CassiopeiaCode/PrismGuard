@@ -42,6 +42,7 @@ def get_all_profiles() -> List[str]:
 def train_local_model(profile: ModerationProfile):
     """
     训练本地模型（根据配置类型）
+    对于 fastText，根据 use_jieba 配置选择训练方式
     
     Args:
         profile: 配置对象
@@ -49,8 +50,14 @@ def train_local_model(profile: ModerationProfile):
     model_type = profile.config.local_model_type
     
     if model_type == LocalModelType.fasttext:
-        from ai_proxy.moderation.smart.fasttext_model import train_fasttext_model
-        train_fasttext_model(profile)
+        # 根据 use_jieba 配置选择对应的训练函数
+        use_jieba = profile.config.fasttext_training.use_jieba
+        if use_jieba:
+            from ai_proxy.moderation.smart.fasttext_model_jieba import train_fasttext_model_jieba
+            train_fasttext_model_jieba(profile)
+        else:
+            from ai_proxy.moderation.smart.fasttext_model import train_fasttext_model
+            train_fasttext_model(profile)
     else:  # 默认 BoW
         train_bow_model(profile)
 

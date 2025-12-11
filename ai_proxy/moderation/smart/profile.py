@@ -45,13 +45,16 @@ class FastTextTrainingConfig(BaseModel):
     max_samples: int = 50000
     max_db_items: int = 100000  # 数据库最大项目数
     
+    # 分词配置
+    use_jieba: bool = False    # 是否使用 jieba 分词（推荐中文使用）
+    
     # fastText 超参数
     dim: int = 64              # 词向量维度
     lr: float = 0.1            # 学习率
     epoch: int = 5             # 训练轮数
     word_ngrams: int = 2       # 词级 n-gram
-    minn: int = 2              # 子词最小长度
-    maxn: int = 4              # 子词最大长度
+    minn: int = 2              # 子词最小长度（use_jieba=True 时自动设为 0）
+    maxn: int = 4              # 子词最大长度（use_jieba=True 时自动设为 0）
     bucket: int = 200000       # hash 词表大小
 
 

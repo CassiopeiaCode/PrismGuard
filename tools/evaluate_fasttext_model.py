@@ -9,6 +9,10 @@ fastText 模型评估脚本
 - F1 分数 (F1 Score)
 - 混淆矩阵 (Confusion Matrix)
 
+根据配置自动选择：
+- use_jieba=true: 使用 jieba 分词进行预测
+- use_jieba=false: 使用原版字符级 n-gram
+
 使用方法:
     python tools/evaluate_fasttext_model.py <profile_name> [--sample-size N]
     
@@ -35,6 +39,8 @@ sys.path.insert(0, str(project_root))
 from ai_proxy.moderation.smart.profile import get_profile
 from ai_proxy.moderation.smart.storage import SampleStorage
 from ai_proxy.moderation.smart.fasttext_model import fasttext_model_exists, _load_fasttext_with_cache
+import jieba
+from tqdm import tqdm
 
 
 def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
@@ -64,6 +70,10 @@ def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
         return
     
     print(f"✅ 模型文件: {profile.get_fasttext_model_path()}")
+    
+    # 检查是否使用 jieba
+    use_jieba = profile.config.fasttext_training.use_jieba
+    print(f"✅ 分词方式: {'jieba 中文分词' if use_jieba else '字符级 n-gram'}")
     
     # 加载数据库样本
     storage = SampleStorage(profile.get_db_path())
@@ -127,12 +137,16 @@ def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
     y_pred = []  # 预测标签
     y_proba = []  # 预测概率
     
-    for i, sample in enumerate(samples):
-        if (i + 1) % 100 == 0:
-            print(f"  进度: {i + 1}/{len(samples)}")
-        
+    # 使用 tqdm 显示预测进度
+    for sample in tqdm(samples, desc="模型预测", unit="样本"):
         # 预处理文本
         text = sample.text.replace('\n', ' ').replace('\r', ' ')
+        
+        # 根据配置选择分词方式
+        if use_jieba:
+            # 使用 jieba 分词
+            words = jieba.cut(text)
+            text = ' '.join(words)
         
         # 预测
         try:
@@ -153,10 +167,10 @@ def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
             y_proba.append(violation_prob)
             
         except Exception as e:
-            print(f"  ⚠️ 预测失败 (样本 {i+1}): {e}")
+            tqdm.write(f"  ⚠️ 预测失败: {e}")
             continue
     
-    print(f"✅ 预测完成: {len(y_pred)}/{len(samples)} 条成功")
+    print(f"\n✅ 预测完成: {len(y_pred)}/{len(samples)} 条成功")
     
     # 计算评估指标
     print(f"\n{'='*60}")

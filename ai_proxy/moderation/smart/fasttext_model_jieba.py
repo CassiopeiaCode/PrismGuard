@@ -6,12 +6,14 @@ fastText 模型训练和预测模块（jieba 分词版本）
 - 使用 jieba 分词，更符合中文语言特性
 - 关闭子词 n-gram (minn=0, maxn=0)
 - 使用词级 n-gram 提取特征
+- 使用 tqdm 显示分词进度
 """
 import os
 import tempfile
 import fasttext
 import jieba
 from typing import Dict, Tuple, Optional
+from tqdm import tqdm
 from ai_proxy.moderation.smart.profile import ModerationProfile
 from ai_proxy.moderation.smart.storage import SampleStorage
 
@@ -79,6 +81,7 @@ def train_fasttext_model_jieba(profile: ModerationProfile):
             maxn=0,  # 关闭子词 n-gram
             bucket=cfg.bucket,
             loss="ova",  # one-vs-all，适合二分类
+            thread=2,  # 限制为单线程，降低 CPU 使用率
             verbose=2
         )
         
@@ -113,8 +116,10 @@ def _prepare_training_file_jieba(samples, profile: ModerationProfile) -> str:
     # 创建临时文件
     fd, train_file = tempfile.mkstemp(suffix=".txt", prefix="fasttext_jieba_train_")
     
+    print(f"[FastText-Jieba] 开始 jieba 分词...")
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        for sample in samples:
+        # 使用 tqdm 显示分词进度
+        for sample in tqdm(samples, desc="jieba 分词", unit="样本"):
             # 预处理文本
             text = sample.text.replace('\n', ' ').replace('\r', ' ')
             

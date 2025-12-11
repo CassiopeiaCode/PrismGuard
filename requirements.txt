@@ -17,6 +17,9 @@ numpy<2.0  # fastText 尚未完全兼容 NumPy 2.0
 # 中文分词
 jieba==0.42.1
 
+# 进度条
+tqdm==4.67.1
+
 # 数据库
 aiosqlite==0.21.0
 

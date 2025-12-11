@@ -22,6 +22,7 @@ def local_model_predict_proba(text: str, profile: ModerationProfile) -> float:
     本地模型预测接口（统一抽象）
     
     根据配置的 local_model_type 决定使用哪种模型
+    对于 fastText，根据 use_jieba 配置选择分词方式
     
     Args:
         text: 待预测文本
@@ -35,8 +36,14 @@ def local_model_predict_proba(text: str, profile: ModerationProfile) -> float:
     model_type = profile.config.local_model_type
     
     if model_type == LocalModelType.fasttext:
-        from ai_proxy.moderation.smart.fasttext_model import fasttext_predict_proba
-        return fasttext_predict_proba(text, profile)
+        # 根据 use_jieba 配置选择对应的预测函数
+        use_jieba = profile.config.fasttext_training.use_jieba
+        if use_jieba:
+            from ai_proxy.moderation.smart.fasttext_model_jieba import fasttext_predict_proba_jieba
+            return fasttext_predict_proba_jieba(text, profile)
+        else:
+            from ai_proxy.moderation.smart.fasttext_model import fasttext_predict_proba
+            return fasttext_predict_proba(text, profile)
     else:  # 默认使用 BoW
         from ai_proxy.moderation.smart.bow import bow_predict_proba
         return bow_predict_proba(text, profile)

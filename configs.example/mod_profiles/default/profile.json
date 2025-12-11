@@ -42,6 +42,7 @@
     "retrain_interval_minutes": 60,
     "max_samples": 50000,
     "max_db_items": 100000,
+    "use_jieba": false,
     "dim": 64,
     "lr": 0.1,
     "epoch": 5,
