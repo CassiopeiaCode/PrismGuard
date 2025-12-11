@@ -16,6 +16,7 @@
     "low_risk_threshold": 0.2,
     "high_risk_threshold": 0.8
   },
+  "local_model_type": "bow",
   "bow_training": {
     "min_samples": 200,
     "retrain_interval_minutes": 60,
@@ -35,5 +36,18 @@
       {"name": "mid_freq", "min_doc_ratio": 0.01, "max_doc_ratio": 0.05, "limit": 2600},
       {"name": "low_freq", "min_doc_ratio": 0.002, "max_doc_ratio": 0.01, "limit": 1200}
     ]
+  },
+  "fasttext_training": {
+    "min_samples": 200,
+    "retrain_interval_minutes": 60,
+    "max_samples": 50000,
+    "max_db_items": 100000,
+    "dim": 64,
+    "lr": 0.1,
+    "epoch": 5,
+    "word_ngrams": 2,
+    "minn": 2,
+    "maxn": 4,
+    "bucket": 200000
   }
 }

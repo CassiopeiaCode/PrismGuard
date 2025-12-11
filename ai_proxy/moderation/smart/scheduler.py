@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from typing import List, Dict
 
-from ai_proxy.moderation.smart.profile import ModerationProfile
+from ai_proxy.moderation.smart.profile import ModerationProfile, LocalModelType
 from ai_proxy.moderation.smart.bow import train_bow_model
 from ai_proxy.moderation.smart.storage import SampleStorage
 
@@ -39,23 +39,48 @@ def get_all_profiles() -> List[str]:
     return profiles
 
 
+def train_local_model(profile: ModerationProfile):
+    """
+    训练本地模型（根据配置类型）
+    
+    Args:
+        profile: 配置对象
+    """
+    model_type = profile.config.local_model_type
+    
+    if model_type == LocalModelType.fasttext:
+        from ai_proxy.moderation.smart.fasttext_model import train_fasttext_model
+        train_fasttext_model(profile)
+    else:  # 默认 BoW
+        train_bow_model(profile)
+
+
 def should_train(profile: ModerationProfile) -> bool:
     """判断是否需要训练"""
+    model_type = profile.config.local_model_type
+    
+    # 获取对应模型的配置
+    if model_type == LocalModelType.fasttext:
+        cfg = profile.config.fasttext_training
+        model_path = profile.get_fasttext_model_path()
+    else:
+        cfg = profile.config.bow_training
+        model_path = profile.get_model_path()
+    
     # 检查样本数量
     storage = SampleStorage(profile.get_db_path())
     sample_count = storage.get_sample_count()
     
-    if sample_count < profile.config.bow_training.min_samples:
+    if sample_count < cfg.min_samples:
         return False
     
     # 检查模型是否存在
-    if not profile.bow_model_exists():
+    if not profile.local_model_exists():
         return True
     
     # 检查模型文件修改时间
-    model_path = profile.get_model_path()
     model_mtime = os.path.getmtime(model_path)
-    interval_seconds = profile.config.bow_training.retrain_interval_minutes * 60
+    interval_seconds = cfg.retrain_interval_minutes * 60
     
     return (time.time() - model_mtime) > interval_seconds
 
@@ -81,9 +106,10 @@ async def train_all_profiles():
                     print(f"[SCHEDULER] {profile_name} 正在训练中，跳过本次调度")
                     continue
                 
-                print(f"[SCHEDULER] 开始训练: {profile_name}")
+                model_type = profile.config.local_model_type
+                print(f"[SCHEDULER] 开始训练: {profile_name} (模型类型={model_type.value})")
                 async with lock:
-                    await asyncio.to_thread(train_bow_model, profile)
+                    await asyncio.to_thread(train_local_model, profile)
                 print(f"[SCHEDULER] 训练完成: {profile_name}")
             else:
                 storage = SampleStorage(profile.get_db_path())

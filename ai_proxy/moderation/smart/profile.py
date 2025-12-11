@@ -3,6 +3,7 @@
 """
 import json
 import os
+from enum import Enum
 from typing import Optional, List
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,29 @@ class ProbabilityConfig(BaseModel):
     # 新增：阈值配置
     low_risk_threshold: float = 0.2   # p < 0.2 直接判安全
     high_risk_threshold: float = 0.8  # p > 0.8 直接判违规
+
+
+class LocalModelType(str, Enum):
+    """本地模型类型"""
+    bow = "bow"
+    fasttext = "fasttext"
+
+
+class FastTextTrainingConfig(BaseModel):
+    """fastText 模型训练配置"""
+    min_samples: int = 200
+    retrain_interval_minutes: int = 60
+    max_samples: int = 50000
+    max_db_items: int = 100000  # 数据库最大项目数
+    
+    # fastText 超参数
+    dim: int = 64              # 词向量维度
+    lr: float = 0.1            # 学习率
+    epoch: int = 5             # 训练轮数
+    word_ngrams: int = 2       # 词级 n-gram
+    minn: int = 2              # 子词最小长度
+    maxn: int = 4              # 子词最大长度
+    bucket: int = 200000       # hash 词表大小
 
 
 class VocabBucket(BaseModel):
@@ -78,7 +102,13 @@ class ProfileConfig(BaseModel):
     ai: AIConfig = AIConfig()
     prompt: PromptConfig = PromptConfig()
     probability: ProbabilityConfig = ProbabilityConfig()
+    
+    # 本地模型类型选择
+    local_model_type: LocalModelType = LocalModelType.bow
+    
+    # 各模型的训练配置
     bow_training: BoWTrainingConfig = BoWTrainingConfig()
+    fasttext_training: FastTextTrainingConfig = FastTextTrainingConfig()
 
 
 class ModerationProfile:
@@ -141,10 +171,25 @@ class ModerationProfile:
         """获取向量化器路径"""
         return os.path.join(self.base_dir, "bow_vectorizer.pkl")
     
+    def get_fasttext_model_path(self) -> str:
+        """获取 fastText 模型路径"""
+        return os.path.join(self.base_dir, "fasttext_model.bin")
+    
     def bow_model_exists(self) -> bool:
         """检查词袋模型是否存在"""
-        return (os.path.exists(self.get_model_path()) and 
+        return (os.path.exists(self.get_model_path()) and
                 os.path.exists(self.get_vectorizer_path()))
+    
+    def fasttext_model_exists(self) -> bool:
+        """检查 fastText 模型是否存在"""
+        return os.path.exists(self.get_fasttext_model_path())
+    
+    def local_model_exists(self) -> bool:
+        """检查本地模型是否存在（根据配置的模型类型）"""
+        if self.config.local_model_type == LocalModelType.fasttext:
+            return self.fasttext_model_exists()
+        else:
+            return self.bow_model_exists()
 
 
 # 全局配置缓存

@@ -17,6 +17,31 @@ from ai_proxy.moderation.smart.storage import SampleStorage
 from ai_proxy.utils.memory_guard import track_container, check_container
 
 
+def local_model_predict_proba(text: str, profile: ModerationProfile) -> float:
+    """
+    本地模型预测接口（统一抽象）
+    
+    根据配置的 local_model_type 决定使用哪种模型
+    
+    Args:
+        text: 待预测文本
+        profile: 配置对象
+        
+    Returns:
+        违规概率 (0-1)
+    """
+    from ai_proxy.moderation.smart.profile import LocalModelType
+    
+    model_type = profile.config.local_model_type
+    
+    if model_type == LocalModelType.fasttext:
+        from ai_proxy.moderation.smart.fasttext_model import fasttext_predict_proba
+        return fasttext_predict_proba(text, profile)
+    else:  # 默认使用 BoW
+        from ai_proxy.moderation.smart.bow import bow_predict_proba
+        return bow_predict_proba(text, profile)
+
+
 class ModerationResult(BaseModel):
     """审核结果"""
     violation: bool
@@ -259,13 +284,13 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
         _save_to_cache(profile_name, text, result)
         return not result.violation, result
     
-    # 2. 尝试本地词袋模型
-    if profile.bow_model_exists():
-        print(f"[DEBUG] 决策路径: 词袋模型预测")
-        from ai_proxy.moderation.smart.bow import bow_predict_proba
+    # 2. 尝试本地模型
+    if profile.local_model_exists():
+        model_type = profile.config.local_model_type
+        print(f"[DEBUG] 决策路径: 本地模型预测 (类型={model_type.value})")
         
         try:
-            p = bow_predict_proba(text, profile)
+            p = local_model_predict_proba(text, profile)
             low_t = profile.config.probability.low_risk_threshold
             high_t = profile.config.probability.high_risk_threshold
             
@@ -274,11 +299,11 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
             
             # 低风险：直接放行
             if p < low_t:
-                print(f"[DEBUG] 词袋模型结果: ✅ 低风险放行")
+                print(f"[DEBUG] 本地模型结果: ✅ 低风险放行")
                 result = ModerationResult(
                     violation=False,
-                    reason=f"BoW: low risk (p={p:.3f})",
-                    source="bow_model",
+                    reason=f"{model_type.value}: low risk (p={p:.3f})",
+                    source=f"{model_type.value}_model",
                     confidence=p
                 )
                 _save_to_cache(profile_name, text, result)
@@ -286,26 +311,26 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
             
             # 高风险：直接拒绝
             if p > high_t:
-                print(f"[DEBUG] 词袋模型结果: ❌ 高风险拒绝")
+                print(f"[DEBUG] 本地模型结果: ❌ 高风险拒绝")
                 result = ModerationResult(
                     violation=True,
-                    reason=f"BoW: high risk (p={p:.3f})",
-                    source="bow_model",
+                    reason=f"{model_type.value}: high risk (p={p:.3f})",
+                    source=f"{model_type.value}_model",
                     confidence=p
                 )
                 _save_to_cache(profile_name, text, result)
                 return False, result
             
             # 不确定：交给 AI 复核
-            print(f"[DEBUG] 词袋模型结果: ⚠️ 不确定 -> AI复核")
+            print(f"[DEBUG] 本地模型结果: ⚠️ 不确定 -> AI复核")
             result = await run_ai_moderation_and_log(text, profile)
             _save_to_cache(profile_name, text, result)
             return not result.violation, result
             
         except Exception as e:
-            print(f"[DEBUG] 词袋模型预测失败: {e} -> 回退到AI")
+            print(f"[DEBUG] 本地模型预测失败: {e} -> 回退到AI")
     else:
-        print(f"[DEBUG] 决策路径: 无词袋模型 -> AI审核")
+        print(f"[DEBUG] 决策路径: 无本地模型 -> AI审核")
     
     # 3. 无模型或失败：全部交 AI
     result = await run_ai_moderation_and_log(text, profile)
