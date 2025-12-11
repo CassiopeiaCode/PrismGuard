@@ -22,6 +22,19 @@ class FormatParser(Protocol):
         """从内部格式转为特定格式"""
         ...
     
+    def get_target_path(self, req: InternalChatRequest, original_path: str) -> str:
+        """
+        获取目标格式的请求路径
+        
+        Args:
+            req: 内部格式请求对象
+            original_path: 原始请求路径
+            
+        Returns:
+            目标格式的请求路径
+        """
+        ...
+    
     def resp_to_internal(self, resp: Dict[str, Any]) -> InternalChatResponse:
         """响应转为内部格式"""
         ...
@@ -44,6 +57,10 @@ class OpenAIChatParser:
     def to_format(self, req: InternalChatRequest) -> Dict[str, Any]:
         return openai_chat.to_openai_chat(req)
     
+    def get_target_path(self, req: InternalChatRequest, original_path: str) -> str:
+        """OpenAI Chat 格式的标准路径"""
+        return "/v1/chat/completions"
+    
     def resp_to_internal(self, resp: Dict[str, Any]) -> InternalChatResponse:
         return openai_chat.openai_chat_resp_to_internal(resp)
     
@@ -64,6 +81,10 @@ class ClaudeChatParser:
     def to_format(self, req: InternalChatRequest) -> Dict[str, Any]:
         return claude_chat.to_claude_chat(req)
     
+    def get_target_path(self, req: InternalChatRequest, original_path: str) -> str:
+        """Claude Chat 格式的标准路径"""
+        return "/v1/messages"
+    
     def resp_to_internal(self, resp: Dict[str, Any]) -> InternalChatResponse:
         return claude_chat.claude_resp_to_internal(resp)
     
@@ -83,6 +104,10 @@ class OpenAICodexParser:
     
     def to_format(self, req: InternalChatRequest) -> Dict[str, Any]:
         return openai_codex.to_openai_codex(req)
+    
+    def get_target_path(self, req: InternalChatRequest, original_path: str) -> str:
+        """OpenAI Codex 格式的标准路径"""
+        return "/v1/completions"
     
     def resp_to_internal(self, resp: Dict[str, Any]) -> InternalChatResponse:
         return openai_codex.openai_codex_resp_to_internal(resp)
@@ -108,6 +133,19 @@ class GeminiChatParser:
     
     def to_format(self, req: InternalChatRequest) -> Dict[str, Any]:
         return gemini_chat.to_gemini_chat(req)
+    
+    def get_target_path(self, req: InternalChatRequest, original_path: str) -> str:
+        """
+        Gemini Chat 格式的路径（需要包含模型名）
+        格式：/v1beta/models/{model}:generateContent 或 :streamGenerateContent
+        """
+        model = req.model or "gemini-2.5-flash"
+        
+        # 判断是否流式
+        if req.stream:
+            return f"/v1beta/models/{model}:streamGenerateContent"
+        else:
+            return f"/v1beta/models/{model}:generateContent"
     
     def resp_to_internal(self, resp: Dict[str, Any]) -> InternalChatResponse:
         return gemini_chat.gemini_resp_to_internal(resp)

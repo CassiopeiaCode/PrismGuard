@@ -3,7 +3,7 @@
 """
 import httpx
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, AsyncIterator
 from fastapi.responses import StreamingResponse, JSONResponse
 from ai_proxy.utils.memory_guard import check_container
 from ai_proxy.proxy.stream_checker import StreamChecker, check_response_content
@@ -180,72 +180,36 @@ class UpstreamClient:
                     print(f"[UPSTREAM] Creating combined generator with {len(buffer)} buffered chunks")
                     print(f"[UPSTREAM] Buffer content preview: {buffer[0][:200] if buffer else 'empty'}")
                     
-                    async def combined_generator():
-                        print(f"[UPSTREAM] ⚡ Generator started! This should appear when client starts reading")
-                        try:
-                            # 先输出缓冲的内容 - 保持原始字节
-                            print(f"[UPSTREAM] Yielding {len(buffer)} buffered chunks")
-                            for i, chunk in enumerate(buffer):
-                                print(f"!!! chunk={chunk.decode()}")
-                                # await asyncio.sleep(0.1)
-                                yield chunk
-                            
-                            # 继续从迭代器读取剩余内容
-                            print(f"[UPSTREAM] Continuing with remaining stream...")
-                            remaining_count = 0
-                            try:
-                                while True:
-                                    chunk = await aiter.__anext__()
-                                    print(f"!!! chunk={chunk.decode()[:100]}")
-                                    remaining_count += 1
-                                    yield chunk
-                            except StopAsyncIteration:
-                                print(f"[UPSTREAM] Stream completed, yielded {remaining_count} remaining chunks")
-                        except Exception as e:
-                            print(f"[UPSTREAM] ❌ Generator exception: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            raise
-                        finally:
-                            print(f"[UPSTREAM] Closing response connection")
-                            await response.aclose()
+                    # 检查是否需要流式响应转换
+                    if src_format and target_format and src_format != target_format:
+                        print(f"[UPSTREAM] Stream response transform enabled: {target_format} -> {src_format}")
+                        combined_gen = self._create_combined_generator_with_transform(
+                            buffer, aiter, response, target_format, src_format
+                        )
+                    else:
+                        print(f"[UPSTREAM] No stream response transform needed")
+                        combined_gen = self._create_combined_generator(buffer, aiter, response)
 
-                    # # 保持原始的 Content-Type，但确保指定 charset=utf-8
-                    # original_content_type = response.headers.get("content-type", "text/event-stream")
-                    # print(f"[UPSTREAM] Original Content-Type: {original_content_type}")
-                    
-                    # # 如果 Content-Type 没有指定 charset，添加 charset=utf-8
-                    # if "charset" not in original_content_type.lower():
-                    #     original_content_type = f"{original_content_type}; charset=utf-8"
-                    #     print(f"[UPSTREAM] Added charset=utf-8 to Content-Type: {original_content_type}")
-                    
                     print(f"[UPSTREAM] All response headers: {dict(response.headers)}")
                     
                     # 构建要传递的响应头
-                    # ⚠️ 过滤掉不应该透传的头：
-                    # - 传输编码相关：httpx 已自动处理
-                    # - 认证相关：上游的 cookie 不应传给客户端
-                    # - 安全策略头：上游的安全策略不应该应用到代理域名
                     filtered_header_names = [
-                        "content-length", "transfer-encoding", "content-encoding",  # 传输编码
-                        "set-cookie",  # 认证
-                        "strict-transport-security",  # HSTS - 会强制 HTTPS
-                        "content-security-policy", "content-security-policy-report-only",  # CSP
-                        "x-frame-options",  # 禁止嵌入
-                        "x-content-type-options",  # MIME 嗅探
-                        "x-xss-protection",  # XSS 过滤
-                        "permissions-policy",  # 浏览器功能限制
-                        "referrer-policy",  # Referer 策略
+                        "content-length", "transfer-encoding", "content-encoding",
+                        "set-cookie",
+                        "strict-transport-security",
+                        "content-security-policy", "content-security-policy-report-only",
+                        "x-frame-options",
+                        "x-content-type-options",
+                        "x-xss-protection",
+                        "permissions-policy",
+                        "referrer-policy",
                     ]
                     pass_headers = {k: v for k, v in response.headers.items()
                                    if k.lower() not in filtered_header_names}
                     print(f"[UPSTREAM] Passing headers (after filtering): {pass_headers}")
-                    print(f"[UPSTREAM] Checking if content-encoding was removed: 'content-encoding' in pass_headers = {'content-encoding' in pass_headers}")
-                    # print(f"[UPSTREAM] Returning StreamingResponse with media_type={original_content_type}")
                     
                     streaming_resp = StreamingResponse(
-                        combined_generator(),
-                        # media_type=original_content_type,
+                        combined_gen,
                         headers=pass_headers
                     )
                     print(f"[UPSTREAM] StreamingResponse object created, returning to caller")
@@ -253,20 +217,6 @@ class UpstreamClient:
                 
                 else:
                     # 不延迟，直接透传
-                    # async def simple_generator():
-                    #     try:
-                    #         async for chunk in response.aiter_bytes():
-                    #             print(f"!!! chunk = {chunk}")
-                    #             yield chunk
-                    #     finally:
-                    #         await response.aclose()
-                    
-                    # # 保持原始的 Content-Type，但确保指定 charset=utf-8
-                    # original_content_type = response.headers.get("content-type", "text/event-stream")
-                    # if "charset" not in original_content_type.lower():
-                    #     original_content_type = f"{original_content_type}; charset=utf-8"
-                    
-                    # ⚠️ 使用相同的过滤策略
                     filtered_header_names = [
                         "content-length", "transfer-encoding", "content-encoding",
                         "set-cookie",
@@ -280,7 +230,6 @@ class UpstreamClient:
                     ]
                     return StreamingResponse(
                         response.aiter_bytes(),
-                        # media_type=original_content_type,
                         headers={k: v for k, v in response.headers.items()
                                 if k.lower() not in filtered_header_names}
                     )
@@ -349,6 +298,53 @@ class UpstreamClient:
                     }
                 }
             )
+    
+    async def _create_combined_generator(
+        self,
+        buffer: list,
+        aiter: AsyncIterator,
+        response: httpx.Response
+    ) -> AsyncIterator[bytes]:
+        """创建组合生成器（无转换）"""
+        print(f"[UPSTREAM] ⚡ Generator started!")
+        try:
+            # 先输出缓冲的内容
+            print(f"[UPSTREAM] Yielding {len(buffer)} buffered chunks")
+            for chunk in buffer:
+                yield chunk
+            
+            # 继续从迭代器读取剩余内容
+            print(f"[UPSTREAM] Continuing with remaining stream...")
+            try:
+                while True:
+                    chunk = await aiter.__anext__()
+                    yield chunk
+            except StopAsyncIteration:
+                print(f"[UPSTREAM] Stream completed")
+        except Exception as e:
+            print(f"[UPSTREAM] ❌ Generator exception: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        finally:
+            print(f"[UPSTREAM] Closing response connection")
+            await response.aclose()
+    
+    async def _create_combined_generator_with_transform(
+        self,
+        buffer: list,
+        aiter: AsyncIterator,
+        response: httpx.Response,
+        from_format: str,
+        to_format: str
+    ) -> AsyncIterator[bytes]:
+        """创建组合生成器（带格式转换）- 暂时透传"""
+        print(f"[UPSTREAM] ⚡ Transform generator started: {from_format} -> {to_format}")
+        print(f"[UPSTREAM] Note: Stream response transform is not yet fully implemented, falling back to passthrough")
+        
+        # 暂时直接调用无转换版本
+        async for chunk in self._create_combined_generator(buffer, aiter, response):
+            yield chunk
     
     def _transform_response(
         self,

@@ -56,12 +56,12 @@ def parse_url_config(cfg_and_upstream: str) -> Tuple[dict, str]:
 
 async def process_request(
     config: dict, body: dict, path: str, headers: dict
-) -> Tuple[bool, Optional[str], Optional[dict], Optional[str]]:
+) -> Tuple[bool, Optional[str], Optional[Tuple[dict, Optional[str]]], Optional[str]]:
     """
     处理请求审核和格式转换
 
     Returns:
-        (通过, 错误信息, 转换后的body或错误详情, 源格式名称)
+        (通过, 错误信息, (转换后的body, 转换后的path)或错误详情, 源格式名称)
     """
     try:
         return await _process_request_impl(config, body, path, headers)
@@ -80,7 +80,7 @@ async def process_request(
 
 async def _process_request_impl(
     config: dict, body: dict, path: str, headers: dict
-) -> Tuple[bool, Optional[str], Optional[dict], Optional[str]]:
+) -> Tuple[bool, Optional[str], Optional[Tuple[dict, Optional[str]]], Optional[str]]:
     """实际的请求处理逻辑"""
     print(f"\n[DEBUG] ========== 请求处理开始 ==========")
     print(f"  路径: {path}")
@@ -127,7 +127,7 @@ async def _process_request_impl(
                 return False, error_msg, details, None
 
         print(f"[DEBUG] ========== 请求通过审核 ==========\n")
-        return True, None, body, None
+        return True, None, (body, None), None
 
     # 检测并解析来源格式
     config_from = transform_cfg.get("from", "auto")
@@ -158,7 +158,7 @@ async def _process_request_impl(
             # 非严格模式：透传
             print(f"[DEBUG] 无法识别格式，透传")
             print(f"[DEBUG] ========== 请求处理结束 ==========\n")
-            return True, None, body, None
+            return True, None, (body, None), None
 
     print(f"  检测到格式: {src_format}")
 
@@ -202,23 +202,27 @@ async def _process_request_impl(
         # 目标格式与源格式相同，不转换
         print(f"  格式相同，无需转换")
         transformed_body = body
+        transformed_path = None  # 不需要转换路径
     else:
         # 转换到目标格式
         target_parser = get_parser(target_format)
         if target_parser is None:
             print(f"[DEBUG] 目标格式 {target_format} 不支持，使用源格式")
             transformed_body = body
+            transformed_path = None
         else:
             try:
                 transformed_body = target_parser.to_format(internal_req)
+                transformed_path = target_parser.get_target_path(internal_req, path)
                 print(f"[DEBUG] 格式转换成功: {src_format} -> {target_format}")
+                print(f"[DEBUG] 路径转换: {path} -> {transformed_path}")
             except Exception as e:
                 print(f"[DEBUG] 格式转换失败: {e}")
                 print(f"[DEBUG] ========== 请求处理失败 ==========\n")
                 return False, f"Format transform error: {str(e)}", None, src_format
 
     print(f"[DEBUG] ========== 请求通过审核 ==========\n")
-    return True, None, transformed_body, src_format
+    return True, None, (transformed_body, transformed_path), src_format
 
 
 @router.api_route("/{cfg_and_upstream:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -274,14 +278,21 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
             "type": "moderation_error",
             "source_format": src_format,
         }
-        # 如果 data 是字典且包含审核详情，添加到响应中
-        if isinstance(data, dict) and "source" in data:
+        # 如果 data 是元组的第一个元素是字典且包含审核详情，添加到响应中
+        if isinstance(data, tuple):
+            actual_data = data[0]
+            if isinstance(actual_data, dict) and "source" in actual_data:
+                error_response["moderation_details"] = actual_data
+        elif isinstance(data, dict) and "source" in data:
             error_response["moderation_details"] = data
 
         return JSONResponse(status_code=400, content={"error": error_response})
 
-    # passed=True 时，data 是转换后的 body
-    transformed_body = data
+    # passed=True 时，data 是 (转换后的body, 转换后的path) 元组
+    transformed_body, transformed_path = data if isinstance(data, tuple) else (data, None)
+    
+    # 如果有转换后的路径，使用它；否则使用原始路径
+    final_path = transformed_path if transformed_path is not None else path
 
     # 转发到上游
     upstream_client = UpstreamClient(upstream_base)
@@ -324,7 +335,7 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
     try:
         response = await upstream_client.forward_request(
             method=request.method,
-            path=path,
+            path=final_path,
             headers=dict(request.headers),
             body=transformed_body if transformed_body else body,
             is_stream=is_stream_request,
