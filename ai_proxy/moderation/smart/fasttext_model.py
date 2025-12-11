@@ -1,6 +1,11 @@
 """
 fastText 模型训练和预测模块
 使用 fastText 进行文本分类,支持字符级和词级 n-gram
+
+注意: 本模块使用新版 fastText API
+- fasttext.load_model() 返回 FastText 对象（不再是 WordVectorModel 或 SupervisedModel）
+- fasttext.train_supervised() 返回 FastText 对象
+- 所有类型注解已更新为 fasttext.FastText
 """
 import os
 import tempfile
@@ -117,8 +122,11 @@ def _load_fasttext_with_cache(profile: ModerationProfile) -> fasttext.FastText:
     """
     加载 fastText 模型（带缓存）
     
+    注意: fasttext.load_model() 现在返回 FastText 对象，
+    而不是旧版本的 WordVectorModel 或 SupervisedModel
+    
     Returns:
-        fastText 模型对象
+        fastText 模型对象 (FastText)
     """
     profile_name = profile.profile_name
     model_path = profile.get_fasttext_model_path()
@@ -141,7 +149,7 @@ def _load_fasttext_with_cache(profile: ModerationProfile) -> fasttext.FastText:
             print(f"[DEBUG] fastText 模型文件已更新，重新加载: {profile_name}")
             del _fasttext_cache[profile_name]
     
-    # 加载模型
+    # 加载模型 (返回 FastText 对象，兼容新版 API)
     print(f"[DEBUG] 加载 fastText 模型: {model_path}")
     model = fasttext.load_model(model_path)
     

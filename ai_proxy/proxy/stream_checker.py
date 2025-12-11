@@ -70,46 +70,53 @@ class StreamChecker:
     
     def _check_gemini_format(self, text: str) -> bool:
         """
-        检查 Gemini 流式格式
+        检查 Gemini SSE 流式格式
         
-        Gemini 流式响应格式：
-        [{"candidates"...}    ← 第一个 chunk，去掉 [ 后是完整的 JSON
-        ,
-        {"candidates"...}     ← 后续 chunk
-        ]
+        Gemini SSE 响应格式（使用 alt=sse 参数）：
+        data: {"candidates": [...], ...}
+        
+        data: {"candidates": [...], ...}
+        
+        每行以 "data: " 开头，后面是完整的 JSON 对象
         """
-        print(f"[DEBUG] _check_gemini_format: processing {len(text)} chars")
-        print(f"[DEBUG] Gemini text preview: {text[:300]}")
+        print(f"[DEBUG] _check_gemini_format (SSE): processing {len(text)} chars")
+        print(f"[DEBUG] Gemini SSE text preview: {text[:300]}")
         
-        text_stripped = text.strip()
-        
-        # 情况 1: 第一个 chunk，格式为 [{...}
-        # 直接去掉开头的 [，剩下的就是完整的 JSON 对象
-        if text_stripped.startswith('['):
-            text_stripped = text_stripped[1:].strip()
-            print(f"[DEBUG] Removed leading '[', now parsing: {text_stripped[:200]}")
-        
-        # 情况 2: 后续 chunk，格式为 ,\n{...}
-        # 去掉开头的逗号
-        if text_stripped.startswith(','):
-            text_stripped = text_stripped[1:].strip()
-            print(f"[DEBUG] Removed leading ',', now parsing: {text_stripped[:200]}")
-        
-        # 现在 text_stripped 应该是 {...} 格式的完整 JSON 对象
-        if text_stripped.startswith('{'):
+        # 按行处理 SSE 格式
+        for line in text.split('\n'):
+            line = line.strip()
+            
+            # 跳过空行
+            if not line:
+                continue
+            
+            # 检查是否是 SSE 数据行
+            if not line.startswith('data: '):
+                print(f"[DEBUG] Skipping non-data line: {line[:50]}")
+                continue
+            
+            # 提取 JSON 数据（移除 "data: " 前缀）
+            data_str = line[6:]  # remove 'data: '
+            
+            # 跳过 [DONE] 标记
+            if data_str == '[DONE]':
+                print(f"[DEBUG] Found [DONE] marker")
+                continue
+            
             try:
-                data = json.loads(text_stripped)
-                print(f"[DEBUG] Gemini parsed as JSON object")
+                data = json.loads(data_str)
+                print(f"[DEBUG] Gemini SSE parsed JSON object")
                 
                 self._parse_gemini_data(data)
                 
                 if self.has_tool_call or len(self.accumulated_content) > self.char_threshold:
-                    print(f"[DEBUG] Gemini check satisfied: has_tool_call={self.has_tool_call}, content_len={len(self.accumulated_content)}")
+                    print(f"[DEBUG] Gemini SSE check satisfied: has_tool_call={self.has_tool_call}, content_len={len(self.accumulated_content)}")
                     return True
             except json.JSONDecodeError as e:
-                print(f"[DEBUG] JSON parse error: {e}")
+                print(f"[DEBUG] JSON parse error: {e}, data_str: {data_str[:100]}")
+                continue
         
-        print(f"[DEBUG] Gemini check not satisfied yet: content_len={len(self.accumulated_content)}")
+        print(f"[DEBUG] Gemini SSE check not satisfied yet: content_len={len(self.accumulated_content)}")
         return False
 
     def _parse_data(self, data: dict):

@@ -25,7 +25,9 @@
   - SGDClassifier 增量学习
   - 定时自动训练（可配置间隔）
 
-> Note: BoW training now uses batch mode + layered vocabulary + async scheduling. See the next section for details.
+> **Note:** BoW training now uses batch mode + layered vocabulary + async scheduling. See the next section for details.
+>
+> **fastText 替代方案：** 项目现已支持使用 fastText 模型替代 BoW 模型，提供更快的训练速度和更低的内存占用。详见 [fastText 迁移指南](docs/FASTTEXT_MIGRATION.md) 和 [fastText API 更新说明](docs/FASTTEXT_API_UPDATE.md)。
 
 #### BoW 模型与训练
 

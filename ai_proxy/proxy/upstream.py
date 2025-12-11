@@ -3,6 +3,7 @@
 """
 import httpx
 import json
+import gzip
 from typing import Optional, Dict, Any, AsyncIterator
 from fastapi.responses import StreamingResponse, JSONResponse
 from ai_proxy.utils.memory_guard import check_container
@@ -74,6 +75,13 @@ class UpstreamClient:
         print(f"[UPSTREAM] Request headers: {filtered_headers}")
         
         url = f"{self.base_url}{path}"
+        
+        # 🔥 强制为 Gemini 流式请求添加 alt=sse 参数
+        if target_format == "gemini_chat" and is_stream and "streamGenerateContent" in path:
+            if "alt=sse" not in url:
+                separator = "&" if "?" in url else "?"
+                url = f"{url}{separator}alt=sse"
+                print(f"[UPSTREAM] ✅ Added alt=sse parameter for Gemini streaming: {url}")
         
         try:
             if is_stream:
@@ -164,7 +172,7 @@ class UpstreamClient:
                             else:
                                 # 接收到了数据但不满足验证条件（内容太少或格式不对）
                                 print(f"[UPSTREAM] ERROR: Stream validation failed after receiving {total_bytes} bytes in {chunk_count} chunks")
-                                raise Exception(f"Stream content validation failed: received {total_bytes} bytes but content is insufficient")
+                                raise Exception(f"Stream content validation failed: received {total_bytes} bytes but content is insufficient, debug:{buffer.__repr__()}")
                             
                     except Exception as e:
                         print(f"[UPSTREAM] STREAM_PRE_READ_ERROR: {e}")
@@ -180,15 +188,18 @@ class UpstreamClient:
                     print(f"[UPSTREAM] Creating combined generator with {len(buffer)} buffered chunks")
                     print(f"[UPSTREAM] Buffer content preview: {buffer[0][:200] if buffer else 'empty'}")
                     
+                    # 🔥 SSE 格式不需要 gzip 压缩（HTTP 层面会自动处理）
+                    use_gzip = False
+                    
                     # 检查是否需要流式响应转换
                     if src_format and target_format and src_format != target_format:
                         print(f"[UPSTREAM] Stream response transform enabled: {target_format} -> {src_format}")
                         combined_gen = self._create_combined_generator_with_transform(
-                            buffer, aiter, response, target_format, src_format
+                            buffer, aiter, response, target_format, src_format, use_gzip
                         )
                     else:
                         print(f"[UPSTREAM] No stream response transform needed")
-                        combined_gen = self._create_combined_generator(buffer, aiter, response)
+                        combined_gen = self._create_combined_generator(buffer, aiter, response, use_gzip)
 
                     print(f"[UPSTREAM] All response headers: {dict(response.headers)}")
                     
@@ -206,6 +217,16 @@ class UpstreamClient:
                     ]
                     pass_headers = {k: v for k, v in response.headers.items()
                                    if k.lower() not in filtered_header_names}
+                    
+                    # 🔥 确保 Gemini SSE 格式的 Content-Type 正确
+                    # 使用 alt=sse 参数后，上游应该返回 text/event-stream
+                    if target_format == "gemini_chat":
+                        if pass_headers.get("content-type") != "text/event-stream":
+                            print(f"[UPSTREAM] ⚠️  Setting Content-Type to text/event-stream for Gemini SSE format")
+                            pass_headers["content-type"] = "text/event-stream"
+                        else:
+                            print(f"[UPSTREAM] ✅ Content-Type is already text/event-stream")
+                    
                     print(f"[UPSTREAM] Passing headers (after filtering): {pass_headers}")
                     
                     streaming_resp = StreamingResponse(
@@ -228,10 +249,22 @@ class UpstreamClient:
                         "permissions-policy",
                         "referrer-policy",
                     ]
+                    
+                    # 准备响应头
+                    pass_headers = {k: v for k, v in response.headers.items()
+                                   if k.lower() not in filtered_header_names}
+                    
+                    # 🔥 确保 Gemini SSE 格式的 Content-Type 正确
+                    if target_format == "gemini_chat":
+                        if pass_headers.get("content-type") != "text/event-stream":
+                            print(f"[UPSTREAM] ⚠️  Setting Content-Type to text/event-stream for Gemini SSE format")
+                            pass_headers["content-type"] = "text/event-stream"
+                        else:
+                            print(f"[UPSTREAM] ✅ Content-Type is already text/event-stream")
+                    
                     return StreamingResponse(
                         response.aiter_bytes(),
-                        headers={k: v for k, v in response.headers.items()
-                                if k.lower() not in filtered_header_names}
+                        headers=pass_headers
                     )
             else:
                 # 非流式请求（httpx 会自动处理 gzip 解压）
@@ -303,32 +336,78 @@ class UpstreamClient:
         self,
         buffer: list,
         aiter: AsyncIterator,
-        response: httpx.Response
+        response: httpx.Response,
+        use_gzip: bool = False
     ) -> AsyncIterator[bytes]:
         """创建组合生成器（无转换）"""
-        print(f"[UPSTREAM] ⚡ Generator started!")
-        try:
-            # 先输出缓冲的内容
-            print(f"[UPSTREAM] Yielding {len(buffer)} buffered chunks")
-            for chunk in buffer:
-                yield chunk
-            
-            # 继续从迭代器读取剩余内容
-            print(f"[UPSTREAM] Continuing with remaining stream...")
+        print(f"[UPSTREAM] ⚡ Generator started! (gzip={use_gzip})")
+        
+        if not use_gzip:
+            # 不使用 gzip，直接透传
             try:
-                while True:
-                    chunk = await aiter.__anext__()
+                # 先输出缓冲的内容
+                print(f"[UPSTREAM] Yielding {len(buffer)} buffered chunks")
+                for chunk in buffer:
                     yield chunk
-            except StopAsyncIteration:
-                print(f"[UPSTREAM] Stream completed")
-        except Exception as e:
-            print(f"[UPSTREAM] ❌ Generator exception: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
-        finally:
-            print(f"[UPSTREAM] Closing response connection")
-            await response.aclose()
+                
+                # 继续从迭代器读取剩余内容
+                print(f"[UPSTREAM] Continuing with remaining stream...")
+                try:
+                    while True:
+                        chunk = await aiter.__anext__()
+                        yield chunk
+                except StopAsyncIteration:
+                    print(f"[UPSTREAM] Stream completed")
+            except Exception as e:
+                print(f"[UPSTREAM] ❌ Generator exception: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            finally:
+                print(f"[UPSTREAM] Closing response connection")
+                await response.aclose()
+        else:
+            # 使用 gzip 压缩
+            try:
+                # 创建压缩对象
+                import zlib
+                compressor = zlib.compressobj(
+                    level=6,
+                    method=zlib.DEFLATED,
+                    wbits=zlib.MAX_WBITS | 16  # 16 = gzip 格式
+                )
+                
+                # 先压缩缓冲的内容
+                print(f"[UPSTREAM] Compressing {len(buffer)} buffered chunks with gzip")
+                for chunk in buffer:
+                    compressed = compressor.compress(chunk)
+                    if compressed:
+                        yield compressed
+                
+                # 继续压缩剩余流
+                print(f"[UPSTREAM] Continuing with remaining stream (compressed)...")
+                try:
+                    while True:
+                        chunk = await aiter.__anext__()
+                        compressed = compressor.compress(chunk)
+                        if compressed:
+                            yield compressed
+                except StopAsyncIteration:
+                    print(f"[UPSTREAM] Stream completed, flushing compressor")
+                
+                # 刷新压缩器，输出剩余数据
+                final_compressed = compressor.flush()
+                if final_compressed:
+                    yield final_compressed
+                    
+            except Exception as e:
+                print(f"[UPSTREAM] ❌ Generator exception: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+            finally:
+                print(f"[UPSTREAM] Closing response connection")
+                await response.aclose()
     
     async def _create_combined_generator_with_transform(
         self,
@@ -336,14 +415,15 @@ class UpstreamClient:
         aiter: AsyncIterator,
         response: httpx.Response,
         from_format: str,
-        to_format: str
+        to_format: str,
+        use_gzip: bool = False
     ) -> AsyncIterator[bytes]:
         """创建组合生成器（带格式转换）- 暂时透传"""
-        print(f"[UPSTREAM] ⚡ Transform generator started: {from_format} -> {to_format}")
+        print(f"[UPSTREAM] ⚡ Transform generator started: {from_format} -> {to_format} (gzip={use_gzip})")
         print(f"[UPSTREAM] Note: Stream response transform is not yet fully implemented, falling back to passthrough")
         
         # 暂时直接调用无转换版本
-        async for chunk in self._create_combined_generator(buffer, aiter, response):
+        async for chunk in self._create_combined_generator(buffer, aiter, response, use_gzip):
             yield chunk
     
     def _transform_response(

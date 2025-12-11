@@ -209,6 +209,12 @@ pip install fasttext
 fasttext>=0.9.2
 ```
 
+**重要提示：新版 fastText API**
+- 新版 `fasttext.load_model()` 返回 `FastText` 对象（不再是旧版的 `WordVectorModel` 或 `SupervisedModel`）
+- 新版 `fasttext.train_supervised()` 也返回 `FastText` 对象
+- 本项目已兼容新版 API，所有类型注解已更新为 `fasttext.FastText`
+- 如果遇到警告 "load_model does not return WordVectorModel or SupervisedModel any more"，可以忽略，这只是提示 API 变化
+
 ## 相关文件
 
 - 模型实现: [`ai_proxy/moderation/smart/fasttext_model.py`](../ai_proxy/moderation/smart/fasttext_model.py)
