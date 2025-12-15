@@ -181,28 +181,86 @@ configs/mod_profiles/default/
 └── bow_vectorizer.pkl   # TF-IDF 向量化器（自动生成）
 ```
 
-**核心参数** (`profile.json`)：
+**完整配置示例** (`profile.json`)：
 
 ```json
 {
   "ai": {
+    "provider": "openai",
     "base_url": "https://api.openai.com/v1",
     "model": "gpt-4o-mini",
-    "api_key_env": "MOD_AI_API_KEY"
+    "api_key_env": "MOD_AI_API_KEY",
+    "timeout": 10
+  },
+  "prompt": {
+    "template_file": "ai_prompt.txt",
+    "max_text_length": 4000
   },
   "probability": {
-    "ai_review_rate": 0.3,        // 30% 随机抽样
-    "low_risk_threshold": 0.2,    // 低于此值直接放行
-    "high_risk_threshold": 0.8    // 高于此值直接拒绝
+    "ai_review_rate": 0.3,
+    "random_seed": 42,
+    "low_risk_threshold": 0.2,
+    "high_risk_threshold": 0.8
   },
+  "local_model_type": "bow",
   "bow_training": {
-    "min_samples": 200,           // 最少样本数才开始训练
-    "retrain_interval_minutes": 60, // 重训练间隔
-    "max_samples": 50000,         // 每次训练最多样本数
-    "max_features": 8000          // TF-IDF 最大特征数
+    "min_samples": 200,
+    "retrain_interval_minutes": 60,
+    "max_samples": 50000,
+    "max_features": 8000,
+    "use_char_ngram": true,
+    "char_ngram_range": [2, 3],
+    "use_word_ngram": true,
+    "word_ngram_range": [1, 2],
+    "model_type": "sgd_logistic",
+    "batch_size": 2000,
+    "max_seconds": 300,
+    "max_db_items": 100000,
+    "use_layered_vocab": true,
+    "vocab_buckets": [
+      {"name": "high_freq", "min_doc_ratio": 0.05, "max_doc_ratio": 0.6, "limit": 1200},
+      {"name": "mid_freq", "min_doc_ratio": 0.01, "max_doc_ratio": 0.05, "limit": 2600},
+      {"name": "low_freq", "min_doc_ratio": 0.002, "max_doc_ratio": 0.01, "limit": 1200}
+    ]
+  },
+  "fasttext_training": {
+    "min_samples": 200,
+    "retrain_interval_minutes": 60,
+    "max_samples": 50000,
+    "max_db_items": 100000,
+    "use_jieba": false,
+    "use_tiktoken": false,
+    "tiktoken_model": "cl100k_base",
+    "dim": 64,
+    "lr": 0.1,
+    "epoch": 5,
+    "word_ngrams": 2,
+    "minn": 2,
+    "maxn": 4,
+    "bucket": 200000
   }
 }
 ```
+
+**主要参数说明**：
+
+| 配置项 | 说明 |
+|--------|------|
+| `ai.provider` | AI 服务提供商（openai/anthropic） |
+| `ai.timeout` | API 请求超时时间（秒） |
+| `prompt.template_file` | AI 审核提示词模板文件 |
+| `prompt.max_text_length` | 最大文本长度限制 |
+| `probability.ai_review_rate` | AI 随机抽样比例（0-1） |
+| `probability.low_risk_threshold` | 低风险阈值，低于此值直接放行 |
+| `probability.high_risk_threshold` | 高风险阈值，高于此值直接拒绝 |
+| `local_model_type` | 本地模型类型（"bow" 或 "fasttext"） |
+| `bow_training.max_samples` | 每次训练最多加载样本数 |
+| `bow_training.max_features` | TF-IDF 最大特征数 |
+| `bow_training.use_layered_vocab` | 是否使用分层词表 |
+| `bow_training.max_db_items` | 数据库最大样本数 |
+| `fasttext_training.use_jieba` | 是否使用 jieba 分词 |
+| `fasttext_training.dim` | fastText 词向量维度 |
+| `fasttext_training.epoch` | 训练轮数 |
 
 ## 工具脚本
 
