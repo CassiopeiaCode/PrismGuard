@@ -20,7 +20,6 @@ PrismGuard 是一个专为 AI API 设计的智能中间件，提供三段式内�
 - [运维与安全（Production）](#运维与安全production)
 - [工具与脚本（Tools）](#工具与脚本tools)
 - [FAQ / Troubleshooting](#faq--troubleshooting)
-- [更新日志](#更新日志)
 - [License](#license)
 - [致谢](#致谢)
 
@@ -177,6 +176,15 @@ print(resp)
 ```
 
 更多示例请参见 `examples/`。
+
+**示例索引（建议从这里开始）**：
+
+- `examples/client_example.py`：3 种接入方式（URL 编码 / 环境变量 / OpenAI→Claude）
+- `examples/client_usage.py`：演示工具调用、基础审核与格式转换（需要自行填 API Key）
+- `examples/config_examples.py`：常用 URL 配置生成示例（适合复制到 `.env` 或做临时测试）
+- `examples/stream_delay_header.py`：流式请求 + `delay_stream_header=true` 防空回复（将新增）
+- `examples/disable_tools_demo.py`：`disable_tools=true` 的拒绝效果与报错示例（将新增）
+- `examples/responses_stream_transform.py`：`openai_chat` ↔ `openai_responses` 流式互转（将新增）
 
 ---
 
@@ -472,26 +480,6 @@ python tools/test_fasttext_model.py default "测试文本"
 - 提高 `ai_review_rate` → 更多 AI 审核（更准确，更贵）
 - 降低 `low_risk_threshold` → 更严格（误拦截更多）
 - 提高 `high_risk_threshold` → 更宽松（漏掉更多）
-
----
-
-## 更新日志
-
-### v1.1.0 (2024-12)
-
-- ✅ 修复 NumPy 2.0 兼容性检查（启动时自动检测）
-- ✅ 修复 OpenAI Responses 格式文本提取
-- ✅ 改进 Gemini 流式请求检测（使用端点而非 stream 字段）
-- ✅ 改进 fastText 概率计算（处理边缘情况）
-- ✨ 新增 Gemini 格式支持
-- ✨ 新增 OpenAI Responses API 支持
-- ✨ 新增 `disable_tools` 配置项
-
-### v1.0.0 (2024-11)
-
-- ✨ 初始版本发布
-
----
 
 ## License
 
