@@ -8,28 +8,28 @@
   },
   "prompt": {
     "template_file": "ai_prompt.txt",
-    "max_text_length": 4000
+    "max_text_length": 60000
   },
   "probability": {
-    "ai_review_rate": 0.3,
+    "ai_review_rate": 0.005,
     "random_seed": 42,
-    "low_risk_threshold": 0.2,
-    "high_risk_threshold": 0.8
+    "low_risk_threshold": 0.4,
+    "high_risk_threshold": 0.90
   },
-  "local_model_type": "bow",
+  "local_model_type": "fasttext",
   "bow_training": {
-    "min_samples": 200,
-    "retrain_interval_minutes": 60,
-    "max_samples": 50000,
-    "max_features": 8000,
+    "min_samples": 30,
+    "retrain_interval_minutes": 600,
+    "max_samples": 500,
+    "max_features": 5000,
     "use_char_ngram": true,
     "char_ngram_range": [2, 3],
     "use_word_ngram": true,
     "word_ngram_range": [1, 2],
     "model_type": "sgd_logistic",
-    "batch_size": 2000,
-    "max_seconds": 300,
-    "max_db_items": 100000,
+    "batch_size": 200,
+    "max_seconds": 60,
+    "max_db_items": 10000,
     "use_layered_vocab": true,
     "vocab_buckets": [
       {"name": "high_freq", "min_doc_ratio": 0.05, "max_doc_ratio": 0.6, "limit": 1200},
@@ -38,19 +38,18 @@
     ]
   },
   "fasttext_training": {
-    "min_samples": 200,
-    "retrain_interval_minutes": 60,
-    "max_samples": 50000,
-    "max_db_items": 100000,
+    "min_samples": 30,
     "use_jieba": false,
-    "use_tiktoken": false,
-    "tiktoken_model": "cl100k_base",
-    "dim": 64,
-    "lr": 0.1,
-    "epoch": 5,
+    "use_tiktoken": true,
+    "retrain_interval_minutes": 600,
+    "max_samples": 5000,
+    "max_db_items": 10000,
+    "dim": 25,
+    "lr": 0.8,
+    "epoch": 100,
     "word_ngrams": 2,
-    "minn": 2,
+    "minn": 1,
     "maxn": 4,
-    "bucket": 200000
+    "bucket": 100000
   }
 }
