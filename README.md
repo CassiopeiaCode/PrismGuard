@@ -354,6 +354,26 @@ PROXY_CONFIG_GEMINI={"basic_moderation":{"enabled":true},"smart_moderation":{"en
 
 - `local_model_type = "bow"`：默认更稳健、依赖更少
 - `local_model_type = "fasttext"`：更快/更轻，但可能受 NumPy 版本影响
+- fastText 分词支持（在 `configs/mod_profiles/{profile}/profile.json` 中配置）：
+  - `fasttext_training.use_jieba=true`：使用 jieba 分词（中文推荐）
+  - `fasttext_training.use_tiktoken=true`：使用 tiktoken 分词（实验性）
+  - 两者都为 `false`：使用字符级 n-gram（原版 fastText 路径）
+  - 两者都为 `true`：先 tiktoken 再 jieba（实验性组合）
+
+示例配置片段（仅展示 fastText 相关字段）：
+
+```json
+{
+  "local_model_type": "fasttext",
+  "fasttext_training": {
+    "use_jieba": true,
+    "use_tiktoken": false,
+    "tiktoken_model": "cl100k_base"
+  }
+}
+```
+
+> 说明：训练与预测会根据上述开关自动选择对应实现（参见 [`train_local_model()`](ai_proxy/moderation/smart/scheduler.py:42) 与 [`local_model_predict_proba()`](ai_proxy/moderation/smart/ai.py:20)）。
 
 > 注意：若使用 fastText，建议遵循项目的依赖检查提示（例如 `numpy<2.0`）。
 
