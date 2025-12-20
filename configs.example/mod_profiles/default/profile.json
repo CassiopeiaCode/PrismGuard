@@ -21,6 +21,7 @@
     "min_samples": 30,
     "retrain_interval_minutes": 600,
     "max_samples": 500,
+    "sample_loading": "balanced_undersample",
     "max_features": 5000,
     "use_char_ngram": true,
     "char_ngram_range": [2, 3],
@@ -39,6 +40,7 @@
   },
   "fasttext_training": {
     "min_samples": 30,
+    "sample_loading": "balanced_undersample",
     "use_jieba": false,
     "use_tiktoken": true,
     "retrain_interval_minutes": 600,

@@ -30,6 +30,13 @@
     "min_samples": 30,
     "retrain_interval_minutes": 600,
     "max_samples": 500,
+
+    // ⭐ 新增：训练样本加载策略（3选1）
+    // - balanced_undersample：欠采样 1:1 平衡（默认）
+    // - latest_full：取最新 max_samples（全量，不做 1:1）
+    // - random_full：随机抽 max_samples（全量随机，不做 1:1）
+    "sample_loading": "balanced_undersample",
+
     "dim": 50,
     "lr": 0.1,
     "epoch": 5,
@@ -67,6 +74,7 @@
     "min_samples": 30,
     "retrain_interval_minutes": 600,
     "max_samples": 500,
+    "sample_loading": "balanced_undersample",
     "max_features": 5000,
     "use_char_ngram": true,
     "char_ngram_range": [2, 3],
@@ -87,6 +95,7 @@
     "min_samples": 30,
     "retrain_interval_minutes": 600,
     "max_samples": 500,
+    "sample_loading": "balanced_undersample",
     "dim": 50,
     "lr": 0.1,
     "epoch": 5,

@@ -347,7 +347,10 @@ PROXY_CONFIG_GEMINI={"basic_moderation":{"enabled":true},"smart_moderation":{"en
 
 - AI 审核结果会写入 `history.db`（SQLite）
 - 会先查库去重（同文本不重复请求 AI）
-- 训练时支持欠采样保持标签平衡（不复制样本）
+- 训练数据加载支持 3 种策略（由 profile 配置决定，目标总量约为 `max_samples`）：
+  - `balanced_undersample`：随机欠采样做 1:1 平衡；每类取 `min(各类总数, max_samples/2)`，并打乱合并（实现见 [`load_balanced_samples()`](ai_proxy/moderation/smart/storage.py:246)）
+  - `latest_full`：平衡“全量模式”；每类取最新 `min(各类总数, max_samples/2)`，再打乱合并（实现见 [`load_balanced_latest_samples()`](ai_proxy/moderation/smart/storage.py:203)）
+  - `random_full`：平衡“全量随机模式”；每类随机抽 `min(各类总数, max_samples/2)`，再打乱合并（实现见 [`load_balanced_random_samples()`](ai_proxy/moderation/smart/storage.py:235)）
 - 数据库可按上限清理并 VACUUM 释放空间
 
 ### 4) 本地模型：BoW vs fastText
@@ -366,6 +369,7 @@ PROXY_CONFIG_GEMINI={"basic_moderation":{"enabled":true},"smart_moderation":{"en
 {
   "local_model_type": "fasttext",
   "fasttext_training": {
+    "sample_loading": "balanced_undersample",
     "use_jieba": true,
     "use_tiktoken": false,
     "tiktoken_model": "cl100k_base"

@@ -18,7 +18,7 @@ from collections import Counter
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from ai_proxy.moderation.smart.profile import get_profile
+from ai_proxy.moderation.smart.profile import get_profile, SampleLoadingStrategy
 from ai_proxy.moderation.smart.storage import SampleStorage
 
 
@@ -89,8 +89,21 @@ def diagnose_training_data(profile_name: str):
     print(f"3. 训练数据加载模拟")
     print(f"{'='*60}\n")
     
-    print(f"使用 load_balanced_samples({cfg.max_samples})...")
-    samples = storage.load_balanced_samples(cfg.max_samples)
+    # 训练样本加载策略（与训练代码保持一致）
+    # 规则：
+    # - balanced_undersample：欠采样随机平衡（每类<=max_samples/2）
+    # - latest_full：平衡“全量模式”，每类取最新 max_samples/2
+    # - random_full：平衡“全量随机模式”，每类随机抽 max_samples/2
+    print(f"样本加载策略: {cfg.sample_loading}")
+    if cfg.sample_loading == SampleLoadingStrategy.latest_full:
+        print(f"使用 load_balanced_latest_samples({cfg.max_samples})...")
+        samples = storage.load_balanced_latest_samples(cfg.max_samples)
+    elif cfg.sample_loading == SampleLoadingStrategy.random_full:
+        print(f"使用 load_balanced_random_samples({cfg.max_samples})...")
+        samples = storage.load_balanced_random_samples(cfg.max_samples)
+    else:
+        print(f"使用 load_balanced_samples({cfg.max_samples})...")
+        samples = storage.load_balanced_samples(cfg.max_samples)
     
     # 统计加载后的标签分布
     label_dist = Counter(s.label for s in samples)

@@ -20,7 +20,7 @@ import jieba
 import tiktoken
 from typing import Dict, Tuple, Optional, List
 from tqdm import tqdm
-from ai_proxy.moderation.smart.profile import ModerationProfile
+from ai_proxy.moderation.smart.profile import ModerationProfile, SampleLoadingStrategy
 from ai_proxy.moderation.smart.storage import SampleStorage
 
 
@@ -109,8 +109,21 @@ def train_fasttext_model_jieba(profile: ModerationProfile):
         print(f"[FastText-Jieba] 样本数不足 {cfg.min_samples}，当前={sample_count}，跳过训练")
         return
     
-    # 加载样本
-    samples = storage.load_balanced_samples(cfg.max_samples)
+    # 加载样本（根据 profile 配置决定欠采样/全量）
+    # 说明：
+    # - balanced_undersample：欠采样随机平衡（每类<=max_samples/2）
+    # - latest_full：平衡“全量模式”，每类取最新 max_samples/2
+    # - random_full：平衡“全量随机模式”，每类随机抽 max_samples/2
+    if cfg.sample_loading == SampleLoadingStrategy.latest_full:
+        samples = storage.load_balanced_latest_samples(cfg.max_samples)
+        print(f"[FastText-Jieba] 样本加载策略: latest_full (balanced latest)")
+    elif cfg.sample_loading == SampleLoadingStrategy.random_full:
+        samples = storage.load_balanced_random_samples(cfg.max_samples)
+        print(f"[FastText-Jieba] 样本加载策略: random_full (balanced random)")
+    else:
+        samples = storage.load_balanced_samples(cfg.max_samples)
+        print(f"[FastText-Jieba] 样本加载策略: balanced_undersample")
+
     print(f"[FastText-Jieba] 开始训练，共 {len(samples)} 个样本")
     
     # 统计标签分布

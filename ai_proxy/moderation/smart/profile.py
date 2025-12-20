@@ -38,12 +38,22 @@ class LocalModelType(str, Enum):
     fasttext = "fasttext"
 
 
+class SampleLoadingStrategy(str, Enum):
+    """训练时样本加载策略"""
+    balanced_undersample = "balanced_undersample"  # 欠采样（1:1）
+    latest_full = "latest_full"  # 全量（按时间倒序，最多 max_samples）
+    random_full = "random_full"  # 全量随机抽样（不做 1:1 平衡）
+
+
 class FastTextTrainingConfig(BaseModel):
     """fastText 模型训练配置"""
     min_samples: int = 200
     retrain_interval_minutes: int = 60
     max_samples: int = 50000
     max_db_items: int = 100000  # 数据库最大项目数
+
+    # 样本加载策略
+    sample_loading: SampleLoadingStrategy = SampleLoadingStrategy.balanced_undersample
     
     # 分词配置（实验性功能）
     use_jieba: bool = False      # 是否使用 jieba 分词（推荐中文使用）
@@ -79,6 +89,9 @@ class BoWTrainingConfig(BaseModel):
     min_samples: int = 200
     retrain_interval_minutes: int = 60
     max_samples: int = 50000
+
+    # 样本加载策略
+    sample_loading: SampleLoadingStrategy = SampleLoadingStrategy.balanced_undersample
     
     # 特征配置
     max_features: int = 8000

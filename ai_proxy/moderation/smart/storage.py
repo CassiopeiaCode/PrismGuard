@@ -152,30 +152,151 @@ class SampleStorage:
                 raise
     
     def load_samples(self, max_samples: int = 20000) -> List[Sample]:
-        """加载最新的样本"""
+        """加载最新的样本（按时间倒序）"""
         with self.pool.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT id, text, label, category, created_at 
-                FROM samples 
-                ORDER BY created_at DESC 
+                SELECT id, text, label, category, created_at
+                FROM samples
+                ORDER BY created_at DESC
                 LIMIT ?
                 """,
-                (max_samples,)
+                (max_samples,),
             )
             rows = cursor.fetchall()
-        
+
         return [
             Sample(
                 id=row[0],
                 text=row[1],
                 label=row[2],
                 category=row[3],
-                created_at=row[4]
+                created_at=row[4],
             )
             for row in rows
         ]
+
+    def load_random_samples(self, max_samples: int = 20000) -> List[Sample]:
+        """随机加载样本（不做 1:1 平衡，不复制样本）"""
+        if max_samples <= 0:
+            return []
+
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, text, label, category, created_at
+                FROM samples
+                ORDER BY RANDOM()
+                LIMIT ?
+                """,
+                (max_samples,),
+            )
+            rows = cursor.fetchall()
+
+        return [
+            Sample(
+                id=row[0],
+                text=row[1],
+                label=row[2],
+                category=row[3],
+                created_at=row[4],
+            )
+            for row in rows
+        ]
+
+    def load_balanced_latest_samples(self, max_samples: int = 20000) -> List[Sample]:
+        """
+        平衡加载最新样本（每类最多 max_samples/2，按时间倒序，不随机）
+        """
+        if max_samples <= 0:
+            return []
+
+        pass_count, violation_count = self.get_label_counts()
+        if pass_count == 0 or violation_count == 0:
+            print(f"[WARNING] 标签不平衡: 正常={pass_count}, 违规={violation_count}")
+            print(f"[WARNING] 无法进行平衡采样，返回空列表")
+            return []
+
+        target_per_label = max_samples // 2
+        if target_per_label <= 0:
+            return []
+
+        balanced_count = min(pass_count, violation_count, target_per_label)
+
+        print(f"[BalancedLatest] 数据库样本分布: 正常={pass_count}, 违规={violation_count}")
+        print(f"[BalancedLatest] 每类取最新 {balanced_count} 个样本（不随机）")
+
+        pass_samples = self._load_samples_by_label(0, balanced_count)
+        violation_samples = self._load_samples_by_label(1, balanced_count)
+
+        combined = pass_samples + violation_samples
+        random.shuffle(combined)
+        print(f"[BalancedLatest] 最终样本: 正常={len(pass_samples)}, 违规={len(violation_samples)}, 总计={len(combined)}")
+        return combined
+
+    def load_balanced_random_samples(self, max_samples: int = 20000) -> List[Sample]:
+        """
+        平衡随机加载样本（每类最多 max_samples/2，全库随机，不复制）
+        """
+        if max_samples <= 0:
+            return []
+
+        pass_count, violation_count = self.get_label_counts()
+        if pass_count == 0 or violation_count == 0:
+            print(f"[WARNING] 标签不平衡: 正常={pass_count}, 违规={violation_count}")
+            print(f"[WARNING] 无法进行平衡采样，返回空列表")
+            return []
+
+        target_per_label = max_samples // 2
+        if target_per_label <= 0:
+            return []
+
+        balanced_count = min(pass_count, violation_count, target_per_label)
+
+        print(f"[BalancedRandom] 数据库样本分布: 正常={pass_count}, 违规={violation_count}")
+        print(f"[BalancedRandom] 每类随机抽取 {balanced_count} 个样本（不复制）")
+
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, text, label, category, created_at
+                FROM samples
+                WHERE label = 0
+                ORDER BY RANDOM()
+                LIMIT ?
+                """,
+                (balanced_count,),
+            )
+            pass_rows = cursor.fetchall()
+
+            cursor.execute(
+                """
+                SELECT id, text, label, category, created_at
+                FROM samples
+                WHERE label = 1
+                ORDER BY RANDOM()
+                LIMIT ?
+                """,
+                (balanced_count,),
+            )
+            violation_rows = cursor.fetchall()
+
+        pass_samples = [
+            Sample(id=r[0], text=r[1], label=r[2], category=r[3], created_at=r[4])
+            for r in pass_rows
+        ]
+        violation_samples = [
+            Sample(id=r[0], text=r[1], label=r[2], category=r[3], created_at=r[4])
+            for r in violation_rows
+        ]
+
+        combined = pass_samples + violation_samples
+        random.shuffle(combined)
+        print(f"[BalancedRandom] 最终样本: 正常={len(pass_samples)}, 违规={len(violation_samples)}, 总计={len(combined)}")
+        return combined
     
     def load_balanced_samples(self, max_samples: int = 20000) -> List[Sample]:
         """
