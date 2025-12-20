@@ -42,6 +42,7 @@ def main():
     print(f"训练配置:")
     print(f"  最小样本数: {cfg.min_samples}")
     print(f"  最大样本数: {cfg.max_samples}")
+    print(f"  样本加载策略(sample_loading): {cfg.sample_loading}")
     print(f"  使用 jieba 分词: {cfg.use_jieba}")
     print(f"  使用 tiktoken 分词: {cfg.use_tiktoken}")
     if cfg.use_tiktoken:
