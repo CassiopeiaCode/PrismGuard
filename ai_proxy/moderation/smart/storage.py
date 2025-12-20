@@ -29,9 +29,21 @@ class ConnectionPool:
         self._init_db()
     
     def _init_db(self):
-        """初始化数据库表结构"""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        """初始化数据库表结构并启用 WAL 模式"""
+        conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=30.0  # 增加超时时间到 30 秒
+        )
         cursor = conn.cursor()
+        
+        # 启用 WAL 模式以提高并发性能
+        cursor.execute("PRAGMA journal_mode=WAL")
+        
+        # 设置较长的 busy_timeout
+        cursor.execute("PRAGMA busy_timeout=30000")  # 30 秒
+        
+        # 创建表
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,6 +53,13 @@ class ConnectionPool:
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # 创建文本索引以加速查询
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_samples_text
+            ON samples(text)
+        """)
+        
         conn.commit()
         conn.close()
     
@@ -52,7 +71,14 @@ class ConnectionPool:
             if self._pool:
                 conn = self._pool.pop()
             else:
-                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                conn = sqlite3.connect(
+                    self.db_path,
+                    check_same_thread=False,
+                    timeout=30.0,  # 30 秒超时
+                    isolation_level=None  # 自动提交模式,减少锁定
+                )
+                # 为新连接设置 busy_timeout
+                conn.execute("PRAGMA busy_timeout=30000")
         
         try:
             yield conn
@@ -100,14 +126,30 @@ class SampleStorage:
         self.pool = get_pool(db_path)
     
     def save_sample(self, text: str, label: int, category: Optional[str] = None):
-        """保存样本"""
-        with self.pool.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO samples (text, label, category) VALUES (?, ?, ?)",
-                (text, label, category)
-            )
-            conn.commit()
+        """保存样本（带重试机制）"""
+        max_retries = 3
+        retry_delay = 0.1  # 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                with self.pool.get_connection() as conn:
+                    cursor = conn.cursor()
+                    # 使用 INSERT OR IGNORE 避免重复插入
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO samples (text, label, category) VALUES (?, ?, ?)",
+                        (text, label, category)
+                    )
+                    if conn.isolation_level is not None:
+                        conn.commit()
+                return  # 成功则返回
+            
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    import time
+                    print(f"[WARNING] 数据库锁定,重试 {attempt + 1}/{max_retries}...")
+                    time.sleep(retry_delay * (attempt + 1))  # 指数退避
+                    continue
+                raise
     
     def load_samples(self, max_samples: int = 20000) -> List[Sample]:
         """加载最新的样本"""
@@ -269,23 +311,38 @@ class SampleStorage:
         return [samples_dict[id] for id in ids if id in samples_dict]
     
     def find_by_text(self, text: str) -> Optional[Sample]:
-        """根据文本查找样本"""
-        with self.pool.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id, text, label, category, created_at FROM samples WHERE text = ? ORDER BY created_at DESC LIMIT 1",
-                (text,)
-            )
-            row = cursor.fetchone()
+        """根据文本查找样本（带重试机制）"""
+        max_retries = 3
+        retry_delay = 0.1  # 100ms
         
-        if row:
-            return Sample(
-                id=row[0],
-                text=row[1],
-                label=row[2],
-                category=row[3],
-                created_at=row[4]
-            )
+        for attempt in range(max_retries):
+            try:
+                with self.pool.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT id, text, label, category, created_at FROM samples WHERE text = ? ORDER BY created_at DESC LIMIT 1",
+                        (text,)
+                    )
+                    row = cursor.fetchone()
+                
+                if row:
+                    return Sample(
+                        id=row[0],
+                        text=row[1],
+                        label=row[2],
+                        category=row[3],
+                        created_at=row[4]
+                    )
+                return None
+            
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    import time
+                    print(f"[WARNING] 数据库锁定,重试 {attempt + 1}/{max_retries}...")
+                    time.sleep(retry_delay * (attempt + 1))  # 指数退避
+                    continue
+                raise
+        
         return None
     
     def get_label_counts(self) -> Tuple[int, int]:
