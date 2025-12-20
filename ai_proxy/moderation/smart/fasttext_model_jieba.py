@@ -64,7 +64,9 @@ def tokenize_text(text: str, use_jieba: bool, use_tiktoken: bool, tiktoken_model
     elif use_tiktoken:
         # 仅 tiktoken
         encoder = get_tiktoken_encoder(tiktoken_model)
-        tokens = encoder.encode(text)
+        # 训练数据里可能包含类似 "<|endoftext|>" 的文本片段；tiktoken 默认会把它视为“特殊 token”并报错
+        # 这里禁用 disallowed_special 检查，把它当作普通文本编码，避免训练中断
+        tokens = encoder.encode(text, disallowed_special=())
         # 将 token ID 转为字符串（保留 ID 作为特征）
         return ' '.join([f"tk{t}" for t in tokens])
     
