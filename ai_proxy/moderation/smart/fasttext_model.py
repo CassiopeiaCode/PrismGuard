@@ -89,10 +89,39 @@ def train_fasttext_model(profile: ModerationProfile):
             verbose=2
         )
         
-        # 保存模型
+        # 保存模型（使用临时文件 + 原子替换，避免产生不完整的模型文件）
         model_path = profile.get_fasttext_model_path()
-        model.save_model(model_path)
-        print(f"[FastText] 模型已保存: {model_path}")
+        temp_model_path = model_path + ".tmp"
+        
+        # 先保存到临时文件
+        model.save_model(temp_model_path)
+        
+        # 验证临时文件
+        if not os.path.exists(temp_model_path):
+            raise RuntimeError("模型保存失败：临时文件不存在")
+        
+        temp_size = os.path.getsize(temp_model_path)
+        if temp_size < 1024:
+            os.remove(temp_model_path)
+            raise RuntimeError(f"模型保存失败：文件过小 ({temp_size} bytes)")
+        
+        # 尝试加载临时文件验证完整性
+        try:
+            test_model = fasttext.load_model(temp_model_path)
+            test_labels, _ = test_model.predict("验证测试", k=1)
+            if not test_labels:
+                raise RuntimeError("模型验证失败：预测返回空结果")
+            del test_model
+        except Exception as e:
+            os.remove(temp_model_path)
+            raise RuntimeError(f"模型验证失败：{e}")
+        
+        # 原子替换（Windows 上需要先删除目标文件）
+        if os.path.exists(model_path):
+            os.remove(model_path)
+        os.rename(temp_model_path, model_path)
+        
+        print(f"[FastText] 模型已保存: {model_path} ({temp_size / 1024:.1f} KB)")
         
         # 评估
         result = model.test(train_file)
