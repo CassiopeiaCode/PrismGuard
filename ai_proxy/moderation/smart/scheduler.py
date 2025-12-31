@@ -1,15 +1,8 @@
 """
 定时任务调度器 - 自动训练本地模型（子进程模式）
 - 训练改为启动独立子进程执行 tools/train_*.py
-- 子进程使用与主进程一致的 Python：必须用 sys.executable（兼容 conda/venv/uv 等环境）
-- 子进程继承主进程 env（API Key 等环境变量无需重复配置）
-- 主进程不再承载训练期间的峰值内存，子进程退出后由 OS 回收
-- 跨进程互斥交给训练脚本的 .train.lock（避免父进程自锁）
-
-改进：
-- 添加训练状态检查，避免加载损坏的模型
-- 锁超时从 24 小时改为 2 小时
-- 检查锁持有进程是否存活
+- 子进程使用与主进程一致的 Python
+- 锁完全由子进程处理，使用 fcntl.flock 独占锁
 """
 import os
 import sys
@@ -22,7 +15,7 @@ from typing import List, Dict, Optional
 from ai_proxy.moderation.smart.profile import ModerationProfile, LocalModelType
 from ai_proxy.moderation.smart.storage import SampleStorage
 
-# 记录每个 profile 的训练锁（进程内），避免重复训练
+# 记录每个 profile 的训练锁（进程内），避免重复调度
 _profile_locks: Dict[str, asyncio.Lock] = {}
 
 
@@ -38,54 +31,11 @@ def _training_status_path(profile: ModerationProfile) -> str:
     return os.path.join(profile.base_dir, ".train_status.json")
 
 
-def _training_lock_path(profile: ModerationProfile) -> str:
-    """训练锁文件路径"""
-    return os.path.join(profile.base_dir, ".train.lock")
-
-
-def _try_acquire_lock_for_scheduler(lock_path: str) -> bool:
-    """
-    调度器尝试获取文件锁（原子操作）
-    
-    Returns:
-        True 如果成功获取锁，False 如果锁已存在
-    """
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        try:
-            payload = f"pid={os.getpid()}\ncreated_at={int(time.time())}\ntype=scheduler\n"
-            os.write(fd, payload.encode("utf-8", errors="replace"))
-        finally:
-            os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-    except Exception as e:
-        print(f"[SCHEDULER] 获取锁失败: {e}")
-        return False
-
-
-def _release_lock(lock_path: str) -> None:
-    """释放文件锁"""
-    try:
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
-    except Exception as e:
-        print(f"[SCHEDULER] 释放锁失败: {e}")
-
-
 def get_training_status(profile: ModerationProfile) -> Optional[Dict]:
-    """
-    获取训练状态
-    
-    Returns:
-        状态字典 {'status': 'completed'|'failed'|'started', 'timestamp': int, 'error': str|None}
-        如果状态文件不存在返回 None
-    """
+    """获取训练状态"""
     status_path = _training_status_path(profile)
     if not os.path.exists(status_path):
         return None
-    
     try:
         with open(status_path, 'r', encoding='utf-8') as f:
             return json.load(f)
@@ -93,81 +43,7 @@ def get_training_status(profile: ModerationProfile) -> Optional[Dict]:
         return None
 
 
-def check_stale_lock(profile: ModerationProfile, stale_seconds: int = 2 * 3600) -> bool:
-    """
-    检查并清理过期的锁文件
-    
-    改进：
-    1. 默认超时从 24 小时改为 2 小时
-    2. 检查锁持有进程是否存活
-    
-    Returns:
-        True 如果锁被清理或不存在，False 如果锁有效
-    """
-    lock_path = _training_lock_path(profile)
-    
-    if not os.path.exists(lock_path):
-        return True
-    
-    try:
-        # 读取锁文件内容
-        with open(lock_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        lock_info = {}
-        for line in content.strip().split('\n'):
-            if '=' in line:
-                key, value = line.split('=', 1)
-                lock_info[key.strip()] = value.strip()
-        
-        lock_pid = int(lock_info.get('pid', 0))
-        lock_created = int(lock_info.get('created_at', 0))
-        
-        # 检查锁是否过期
-        if lock_created > 0 and (time.time() - lock_created) > stale_seconds:
-            print(f"[SCHEDULER] 锁已过期 ({(time.time() - lock_created) / 3600:.1f} 小时)，清理中...")
-            os.remove(lock_path)
-            return True
-        
-        # 检查持有锁的进程是否存活
-        if lock_pid > 0:
-            try:
-                if sys.platform == 'win32':
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    handle = kernel32.OpenProcess(0x1000, False, lock_pid)
-                    if handle:
-                        kernel32.CloseHandle(handle)
-                        # 进程存活，锁有效
-                        return False
-                    # 进程不存在
-                    print(f"[SCHEDULER] 锁持有进程 (PID={lock_pid}) 已不存在，清理中...")
-                    os.remove(lock_path)
-                    return True
-                else:
-                    os.kill(lock_pid, 0)
-                    # 进程存活，锁有效
-                    return False
-            except (OSError, ProcessLookupError):
-                # 进程不存在
-                print(f"[SCHEDULER] 锁持有进程 (PID={lock_pid}) 已不存在，清理中...")
-                os.remove(lock_path)
-                return True
-            except Exception:
-                pass
-        
-        return False
-        
-    except Exception as e:
-        print(f"[SCHEDULER] 检查锁状态时出错: {e}")
-        return False
-
-
 def _project_root_dir() -> str:
-    """
-    返回项目根目录（包含 tools/ 与 ai_proxy/ 的目录）
-    scheduler.py 位于 ai_proxy/moderation/smart/
-    """
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
@@ -274,75 +150,40 @@ async def train_all_profiles():
     print(f"[SCHEDULER] 扫描到 {len(profiles)} 个配置: {', '.join(profiles)}")
 
     for profile_name in profiles:
-        lock_path = None
         try:
             profile = ModerationProfile(profile_name)
 
-            # 检查并清理过期锁（只清理死锁，不影响正常锁）
-            check_stale_lock(profile)
-            
-            # 尝试获取文件锁（原子操作，防止竞态条件）
-            lock_path = _training_lock_path(profile)
-            if not _try_acquire_lock_for_scheduler(lock_path):
-                print(f"[SCHEDULER] {profile_name} 文件锁已存在，跳过本次调度")
-                continue
-
-            # 成功获取锁后，检查是否需要训练
             if not should_train(profile):
-                # 不需要训练，释放锁
-                _release_lock(lock_path)
-                lock_path = None
-                storage = SampleStorage(profile.get_db_path())
-                sample_count = storage.get_sample_count()
-                print(f"[SCHEDULER] 跳过训练: {profile_name} (样本数={sample_count})")
                 continue
 
             lock = get_profile_lock(profile_name)
             if lock.locked():
-                # 进程内已有训练，释放文件锁
-                _release_lock(lock_path)
-                lock_path = None
-                print(f"[SCHEDULER] {profile_name} 正在训练中（进程内锁），跳过本次调度")
+                print(f"[SCHEDULER] {profile_name} 正在调度中，跳过")
                 continue
 
-            # 检查上次训练状态
+            # 检查上次训练状态（冷却期）
             last_status = get_training_status(profile)
             if last_status and last_status.get('status') == 'failed':
                 last_time = last_status.get('timestamp', 0)
                 if time.time() - last_time < 30 * 60:
-                    _release_lock(lock_path)
-                    lock_path = None
                     print(f"[SCHEDULER] {profile_name} 上次训练失败，等待冷却期...")
                     continue
 
             model_type = profile.config.local_model_type
             print(f"[SCHEDULER] 开始训练: {profile_name} (模型类型={model_type.value})")
 
-            # 调度器已持有文件锁，子进程会检测到锁存在并以 exit code=2 退出
-            # 这是预期行为，因为我们用调度器的锁来保证互斥
-            # 子进程需要修改为：如果锁的 PID 是父进程，则继续执行
-            
             async with lock:
                 rc = await _run_training_subprocess(profile)
-
-            # 训练完成后释放锁
-            _release_lock(lock_path)
-            lock_path = None
 
             if rc == 0:
                 print(f"[SCHEDULER] 训练完成: {profile_name}")
             elif rc == 2:
-                # 这不应该发生了，因为调度器持有锁
-                print(f"[SCHEDULER] {profile_name} 子进程检测到文件锁（异常情况）")
+                print(f"[SCHEDULER] {profile_name} 已有训练在进行中，跳过")
             else:
                 print(f"[SCHEDULER] 训练失败: {profile_name} (exit_code={rc})")
 
         except Exception as e:
-            print(f"[SCHEDULER] 训练失败: {profile_name} - {e}")
-        finally:
-            # 确保锁被释放
-            if lock_path:
-                _release_lock(lock_path)
+            print(f"[SCHEDULER] 训练异常: {profile_name} - {e}")
 
 
 async def scheduler_loop(check_interval_minutes: int = 10):
