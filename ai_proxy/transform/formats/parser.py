@@ -214,6 +214,7 @@ def detect_and_parse(
         candidates = [f for f in PARSERS.keys() if f not in tool_only_formats]
     
     # 3. 按顺序尝试解析
+    parse_errors = []  # 记录解析错误
     for name in candidates:
         parser = PARSERS.get(name)
         if parser is None:
@@ -235,7 +236,9 @@ def detect_and_parse(
                 
                 return name, internal, None
         except Exception as e:
-            # 解析失败，继续尝试下一个
+            # 解析失败，记录错误并继续尝试下一个
+            error_detail = f"{name}: {type(e).__name__}: {e}"
+            parse_errors.append(error_detail)
             print(f"[WARN] Failed to parse as {name}: {e}")
             continue
     
@@ -267,6 +270,9 @@ def detect_and_parse(
                 f"but only [{expected_str}] is allowed. "
                 f"Please check your 'from' configuration or update it to include the detected format."
             )
+            # 如果有解析错误，附加到错误消息中
+            if parse_errors:
+                error_msg += f" Parse errors: {'; '.join(parse_errors)}"
             return None, None, error_msg
         else:
             # 没有任何格式可以解析
