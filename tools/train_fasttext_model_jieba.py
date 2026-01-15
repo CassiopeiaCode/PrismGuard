@@ -54,6 +54,7 @@ class FDTee:
         self.pipe_write = None
         self.reader_thread = None
         self.running = False
+        self.last_cr_log_time = 0  # 上次记录含 \r 内容的时间
     
     def start(self):
         import threading
@@ -81,10 +82,23 @@ class FDTee:
                     break
                 # 写入原始输出（控制台）
                 os.write(self.original_fd, data)
-                # 写入日志文件
+                # 写入日志文件（对含 \r 的高频输出限流）
                 try:
-                    self.log_file.write(data.decode('utf-8', errors='replace'))
-                    self.log_file.flush()
+                    text = data.decode('utf-8', errors='replace')
+                    current_time = time.time()
+                    
+                    # 检查是否包含 \r（高频刷新的进度输出）
+                    if '\r' in text and '\n' not in text:
+                        # 含 \r 但不含 \n 的输出，每秒最多记录一次
+                        if current_time - self.last_cr_log_time >= 1.0:
+                            # 将 \r 替换为 \n 以便在日志中可读
+                            self.log_file.write(text.replace('\r', '\n'))
+                            self.log_file.flush()
+                            self.last_cr_log_time = current_time
+                    else:
+                        # 正常输出，直接写入
+                        self.log_file.write(text)
+                        self.log_file.flush()
                 except Exception:
                     pass
             except Exception:
