@@ -23,7 +23,6 @@ import fasttext
 import jieba
 import tiktoken
 from typing import Dict, Tuple, Optional, List
-from tqdm import tqdm
 from ai_proxy.moderation.smart.profile import ModerationProfile, SampleLoadingStrategy
 from ai_proxy.moderation.smart.storage import SampleStorage
 from ai_proxy.utils.memory_guard import release_memory
@@ -256,11 +255,14 @@ def _prepare_training_file_jieba(samples, profile: ModerationProfile) -> str:
         mode_desc = "无分词（不应该到这里）"
     
     print(f"[FastText-Advanced] 开始分词: {mode_desc}")
+    
+    import time
+    total = len(samples)
+    start_time = time.time()
+    last_print_time = start_time
+    
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        # 使用 tqdm 显示分词进度
-        # 显式传入 file=sys.stderr 确保使用重定向后的 stderr
-        # 设置 disable=False 确保在非 TTY 环境下也输出进度
-        for sample in tqdm(samples, desc=mode_desc, unit="样本", file=sys.stderr, disable=False):
+        for i, sample in enumerate(samples):
             # 预处理文本
             text = sample.text.replace('\n', ' ').replace('\r', ' ')
             
@@ -270,6 +272,16 @@ def _prepare_training_file_jieba(samples, profile: ModerationProfile) -> str:
             # fastText 格式: __label__<类别> <分词后的文本>
             label = sample.label  # 0 或 1
             f.write(f"__label__{label} {segmented_text}\n")
+            
+            # 每 500 条或每 5 秒输出一次进度
+            current_time = time.time()
+            if (i + 1) % 500 == 0 or (current_time - last_print_time) >= 5 or (i + 1) == total:
+                elapsed = current_time - start_time
+                rate = (i + 1) / elapsed if elapsed > 0 else 0
+                eta = (total - i - 1) / rate if rate > 0 else 0
+                print(f"  分词进度: {i + 1}/{total} ({(i + 1) / total * 100:.1f}%) | "
+                      f"速度: {rate:.1f} 样本/秒 | ETA: {eta:.1f}s")
+                last_print_time = current_time
     
     print(f"[FastText-Advanced] 训练文件已生成: {train_file}")
     return train_file
