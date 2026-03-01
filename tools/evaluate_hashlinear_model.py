@@ -119,6 +119,50 @@ def evaluate_hashlinear_model(profile_name: str, sample_size: int = 100):
     print(f"F1 分数 (F1 Score): {f1:.4f}")
     print(f"\n✅ 评估完成: {len(y_pred)}/{len(samples)} 条成功")
 
+    print(f"\n{'='*60}")
+    print("阈值分析（细粒度）")
+    print(f"{'='*60}\n")
+
+    thresholds = [i / 100 for i in range(5, 100, 5)]  # 0.05 .. 0.95
+    print(f"{'阈值':<8} {'准确率':<12} {'精确率':<12} {'召回率':<12} {'F1分数':<12} {'FPR':<10} {'FNR':<10}")
+    print(f"{'-'*78}")
+
+    best_threshold = 0.5
+    best_f1 = -1.0
+
+    for threshold in thresholds:
+        y_pred_t = [1 if p >= threshold else 0 for p in y_proba]
+
+        tp_t = sum(1 for t, p in zip(y_true, y_pred_t) if t == 1 and p == 1)
+        tn_t = sum(1 for t, p in zip(y_true, y_pred_t) if t == 0 and p == 0)
+        fp_t = sum(1 for t, p in zip(y_true, y_pred_t) if t == 0 and p == 1)
+        fn_t = sum(1 for t, p in zip(y_true, y_pred_t) if t == 1 and p == 0)
+
+        acc_t = (tp_t + tn_t) / len(y_pred_t) if len(y_pred_t) > 0 else 0.0
+        prec_t = tp_t / (tp_t + fp_t) if (tp_t + fp_t) > 0 else 0.0
+        rec_t = tp_t / (tp_t + fn_t) if (tp_t + fn_t) > 0 else 0.0
+        f1_t = 2 * (prec_t * rec_t) / (prec_t + rec_t) if (prec_t + rec_t) > 0 else 0.0
+        fpr_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0.0
+        fnr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0.0
+
+        if f1_t > best_f1:
+            best_f1 = f1_t
+            best_threshold = threshold
+
+        print(
+            f"{threshold:<8.2f} "
+            f"{acc_t:<12.4f} "
+            f"{prec_t:<12.4f} "
+            f"{rec_t:<12.4f} "
+            f"{f1_t:<12.4f} "
+            f"{fpr_t:<10.4f} "
+            f"{fnr_t:<10.4f}"
+        )
+
+    print(f"\n{'='*80}")
+    print(f"🎯 最佳阈值: {best_threshold:.2f} (F1 分数: {best_f1:.4f})")
+    print(f"{'='*80}\n")
+
 
 def main():
     parser = argparse.ArgumentParser()
