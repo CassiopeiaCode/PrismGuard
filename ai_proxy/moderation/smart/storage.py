@@ -462,10 +462,19 @@ class SampleStorage:
         text_hash = _hash_text(text)
         with self._lock:
             sid_raw = self.db.get(_text_latest_key(text_hash))
-            if sid_raw is not None:
+            # Requirement: if pointer doesn't exist, do NOT full-scan the DB.
+            if sid_raw is None:
+                return None
+
+            try:
                 if isinstance(sid_raw, bytes):
                     sid_raw = sid_raw.decode("utf-8")
-                sample = self._load_sample_by_id(int(sid_raw))
+                sid = int(sid_raw)
+            except Exception:
+                sid = -1
+
+            if sid > 0:
+                sample = self._load_sample_by_id(sid)
                 if sample is not None and sample.text == text:
                     return sample
 
