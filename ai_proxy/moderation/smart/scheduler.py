@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 from ai_proxy.moderation.smart.profile import ModerationProfile, LocalModelType
-from ai_proxy.moderation.smart.storage import SampleStorage
+from ai_proxy.moderation.smart.sample_store_service import get_async_sample_storage
 
 # 记录每个 profile 的训练锁（进程内），避免重复调度
 _profile_locks: Dict[str, asyncio.Lock] = {}
@@ -88,7 +88,7 @@ def _max_db_items_for_profile(profile: ModerationProfile) -> int:
     return int(profile.config.bow_training.max_db_items)
 
 
-def _cleanup_samples_before_training(profile: ModerationProfile) -> None:
+async def _cleanup_samples_before_training(profile: ModerationProfile) -> None:
     """
     训练前清理样本库（写操作），在主进程执行一次。
 
@@ -98,8 +98,8 @@ def _cleanup_samples_before_training(profile: ModerationProfile) -> None:
     max_db_items = _max_db_items_for_profile(profile)
     if max_db_items <= 0:
         return
-    storage = SampleStorage(profile.get_db_path(), read_only=False)
-    storage.cleanup_excess_samples(max_db_items)
+    storage = get_async_sample_storage(profile.profile_name, profile.get_db_path())
+    await storage.cleanup_excess_samples(max_db_items)
 
 
 async def _run_training_subprocess(profile: ModerationProfile) -> int:
@@ -135,7 +135,7 @@ async def _run_training_subprocess(profile: ModerationProfile) -> int:
     return await proc.wait()
 
 
-def should_train(profile: ModerationProfile) -> bool:
+async def should_train(profile: ModerationProfile) -> bool:
     """判断是否需要训练"""
     model_type = profile.config.local_model_type
 
@@ -151,8 +151,8 @@ def should_train(profile: ModerationProfile) -> bool:
         model_path = profile.get_model_path()
 
     # 检查样本数量
-    storage = SampleStorage(profile.get_db_path())
-    sample_count = storage.get_sample_count()
+    storage = get_async_sample_storage(profile.profile_name, profile.get_db_path())
+    sample_count = await storage.get_sample_count()
 
     if sample_count < cfg.min_samples:
         return False
@@ -182,7 +182,7 @@ async def train_all_profiles():
         try:
             profile = ModerationProfile(profile_name)
 
-            if not should_train(profile):
+            if not await should_train(profile):
                 continue
 
             lock = get_profile_lock(profile_name)
@@ -203,7 +203,7 @@ async def train_all_profiles():
 
             async with lock:
                 # 训练前做一次数据库清理（主进程写入）
-                _cleanup_samples_before_training(profile)
+                await _cleanup_samples_before_training(profile)
                 rc = await _run_training_subprocess(profile)
 
             if rc == 0:

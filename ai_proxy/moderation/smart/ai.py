@@ -14,7 +14,6 @@ from openai import AsyncOpenAI
 
 from ai_proxy.config import settings
 from ai_proxy.moderation.smart.profile import get_profile, ModerationProfile
-from ai_proxy.moderation.smart.storage import SampleStorage
 from ai_proxy.utils.memory_guard import track_container, check_container
 
 
@@ -281,10 +280,14 @@ async def run_ai_moderation_and_log(text: str, profile: ModerationProfile) -> Mo
     Raises:
         LLMConcurrencyExceeded: 当并发数超过限制时（不计入数据库）
     """
-    storage = SampleStorage(profile.get_db_path())
+    # IMPORTANT: Online request path must not open RocksDB directly.
+    # All RocksDB reads/writes are serialized through the per-profile async service (with IPC in multi-worker mode).
+    from ai_proxy.moderation.smart.sample_store_service import get_async_sample_storage
+
+    storage = get_async_sample_storage(profile.profile_name, profile.get_db_path())
     
     # 先查数据库，如果已有记录则直接返回
-    existing_sample = storage.find_by_text(text)
+    existing_sample = await storage.find_by_text(text)
     if existing_sample:
         print(f"[DEBUG] 数据库命中: 文本已审核过")
         result = ModerationResult(
@@ -303,7 +306,7 @@ async def run_ai_moderation_and_log(text: str, profile: ModerationProfile) -> Mo
     
     # 只有成功完成审核才保存到数据库
     label = 1 if result.violation else 0
-    storage.save_sample(text, label, result.category)
+    await storage.save_sample(text, label, result.category)
     print(f"[DEBUG] 审核结果已保存到数据库")
     
     return result

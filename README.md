@@ -437,6 +437,24 @@ PROXY_CONFIG_GEMINI={"basic_moderation":{"enabled":true},"smart_moderation":{"en
 3. **数据隐私**：审核历史包含用户输入，定期清理过期数据
 4. **监控告警**：定期检查误判率，调整阈值
 
+### 4) RocksDB 多 worker（避免 LOCK 竞争）
+
+PrismGuard 的审核样本库使用 RocksDB（`history.rocks/`）。RocksDB 在**同一 DB 路径**上只允许一个进程持有写锁，否则会出现：
+
+`IO error: While lock file: <profile>/history.rocks/LOCK: Resource temporarily unavailable`
+
+为彻底避免多进程争抢写锁，本项目在多 worker 部署时采用 **“单 writer + 其它 worker 走 IPC 代理”**：
+
+- 仅一个 worker 会以 read-write 打开 RocksDB，并启动本地 IPC 服务
+- 其它 worker **不会本地 open RocksDB**，所有读/写都转发给 writer（因此不会触发 LOCK 竞争）
+- 模型训练调度器也只在 writer worker 启动，避免重复调度
+
+可选环境变量：
+
+- `AI_PROXY_ROCKS_IPC_HOST`（默认 `127.0.0.1`）
+- `AI_PROXY_ROCKS_IPC_PORT`（默认 `51234`）
+- `AI_PROXY_ROCKS_WRITER_LOCK`（默认 `configs/mod_profiles/.rocks_writer.lock`）
+
 ---
 
 ## 工具与脚本（Tools）

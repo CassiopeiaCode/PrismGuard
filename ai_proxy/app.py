@@ -61,10 +61,19 @@ async def startup_event():
         sys.exit(1) # 这在某些服务器上可能无法正常工作，但对于开发模式是有效的
     
     # 防止重复启动调度器（reload模式下可能多次触发）
-    if not _scheduler_started:
+    # Initialize RocksDB service early to avoid request-path opens and to elect the single writer worker.
+    from ai_proxy.moderation.smart.sample_store_service import init_sample_store_service
+
+    rocks_svc = await init_sample_store_service()
+
+    # IMPORTANT (multi-worker): only the elected writer worker starts the scheduler,
+    # otherwise multiple workers would schedule training concurrently.
+    if rocks_svc.is_writer and not _scheduler_started:
         start_scheduler(check_interval_minutes=10)
         _scheduler_started = True
-        print("[INFO] 模型训练调度器已启动")
+        print("[INFO] 模型训练调度器已启动 (writer worker)")
+    elif not rocks_svc.is_writer:
+        print("[INFO] 当前为非 writer worker：不启动训练调度器")
     
     # 启动内存守护后台任务（每30秒检查一次）
     _memory_guard_task = asyncio.create_task(memory_guard_loop())
@@ -122,6 +131,9 @@ async def shutdown_event():
     print("[INFO] OpenAI 客户端池已清理")
     
     # 清理数据库连接池
+    from ai_proxy.moderation.smart.sample_store_service import shutdown_sample_store_service
+    await shutdown_sample_store_service()
+
     from ai_proxy.moderation.smart.storage import cleanup_pools
     cleanup_pools()
     print("[INFO] 数据库连接池已清理")

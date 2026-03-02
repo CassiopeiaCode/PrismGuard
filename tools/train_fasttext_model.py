@@ -141,7 +141,9 @@ def main():
         sys.stdout.flush()
         
         cfg = profile.config.fasttext_training
-        storage = SampleStorage(profile.get_db_path())
+        # Training subprocess must open sample DB in read-only mode to avoid RocksDB LOCK contention
+        # with the online service writer process.
+        storage = SampleStorage(profile.get_db_path(), read_only=True)
         sample_count = storage.get_sample_count()
         
         print(f"样本数: {sample_count}, 最小要求: {cfg.min_samples}")
