@@ -533,6 +533,7 @@ class SampleStorage:
         return out
 
     def _refresh_text_latest_after_delete(self, text_hash: str, deleted_id: int) -> None:
+        # Slow path kept for compatibility; cleanup uses a bulk refresh to avoid O(k*N) scans.
         latest = self.db.get(_text_latest_key(text_hash))
         if latest is None:
             return
@@ -543,58 +544,168 @@ class SampleStorage:
 
         sid = self._next_id() - 1
         while sid > 0:
-            sample = self._load_sample_by_id(sid)
-            if sample is not None:
-                raw = self.db.get(_sample_key(sid))
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-                if raw is not None and json_loads(raw).get("text_hash") == text_hash:
+            raw = self.db.get(_sample_key(sid))
+            if raw is not None:
+                try:
+                    data = orjson.loads(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else json_loads(raw)
+                except Exception:
+                    data = None
+                if isinstance(data, dict) and data.get("text_hash") == text_hash:
                     self.db[_text_latest_key(text_hash)] = str(sid)
                     return
             sid -= 1
         del self.db[_text_latest_key(text_hash)]
+
+    def _bulk_refresh_text_latest_after_deletes(self, affected_hashes: set[str]) -> None:
+        """
+        Refresh `text_latest:{hash}` for a batch of hashes after deletions.
+
+        Old logic updated one hash at a time and did a full tail scan per hash -> O(k*N).
+        This scans the DB tail at most once and fixes all affected hashes -> O(N) worst-case.
+        """
+        if not affected_hashes:
+            return
+
+        remaining = set(affected_hashes)
+        sid = self._next_id() - 1
+        while sid > 0 and remaining:
+            raw = self.db.get(_sample_key(sid))
+            if raw is not None:
+                try:
+                    data = orjson.loads(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else json_loads(raw)
+                except Exception:
+                    data = None
+                if isinstance(data, dict):
+                    th = data.get("text_hash")
+                    if th in remaining:
+                        self.db[_text_latest_key(th)] = str(sid)
+                        remaining.remove(th)
+            sid -= 1
+
+        for th in remaining:
+            try:
+                del self.db[_text_latest_key(th)]
+            except KeyError:
+                pass
 
     def _delete_random_samples(self, label: int, count: int) -> int:
         if count <= 0:
             return 0
 
         with self._lock:
-            candidates: List[int] = []
-            sid = self._next_id() - 1
-            while sid > 0:
-                sample = self._load_sample_by_id(sid)
-                if sample is not None and sample.label == label:
-                    candidates.append(sid)
-                sid -= 1
-
-            if not candidates:
+            # Fast path: random probing to avoid a full DB scan when the DB is dense enough.
+            # Falls back to a full scan if we can't find enough matches within a bounded number of attempts.
+            max_sid = self._next_id() - 1
+            if max_sid <= 0:
                 return 0
-            if len(candidates) <= count:
-                to_delete = candidates
-            else:
-                to_delete = random.sample(candidates, count)
+
+            picked: Dict[int, Tuple[int, str]] = {}  # sid -> (label, text_hash)
+            attempts = 0
+            max_attempts = max(2000, count * 80)
+
+            while len(picked) < count and attempts < max_attempts:
+                attempts += 1
+                sid = random.randint(1, max_sid)
+                if sid in picked:
+                    continue
+                raw = self.db.get(_sample_key(sid))
+                if raw is None:
+                    continue
+                try:
+                    data = orjson.loads(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else json_loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                sample_label = int(data.get("label", 0))
+                if sample_label != label:
+                    continue
+                text_hash = str(data.get("text_hash", "") or "")
+                picked[sid] = (sample_label, text_hash)
+
+            if len(picked) < count:
+                # Fallback: single full scan, but avoid Pydantic Sample construction.
+                reservoir: List[int] = []
+                seen = 0
+                sid = max_sid
+                while sid > 0:
+                    raw = self.db.get(_sample_key(sid))
+                    if raw is not None:
+                        try:
+                            data = orjson.loads(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else json_loads(raw)
+                        except Exception:
+                            data = None
+                        if isinstance(data, dict) and int(data.get("label", 0)) == label:
+                            seen += 1
+                            if len(reservoir) < count:
+                                reservoir.append(sid)
+                            else:
+                                j = random.randint(1, seen)
+                                if j <= count:
+                                    reservoir[j - 1] = sid
+                    sid -= 1
+
+                if not reservoir:
+                    return 0
+
+                picked.clear()
+                for sid in reservoir:
+                    raw = self.db.get(_sample_key(sid))
+                    if raw is None:
+                        continue
+                    try:
+                        data = orjson.loads(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else json_loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    sample_label = int(data.get("label", 0))
+                    text_hash = str(data.get("text_hash", "") or "")
+                    picked[sid] = (sample_label, text_hash)
+
+            to_delete = list(picked.keys())
+            if not to_delete:
+                return 0
 
             count_0 = self._get_label_count(0)
             count_1 = self._get_label_count(1)
             total = self._get_count()
+            affected_hashes: set[str] = set()
+            latest_cache: Dict[str, Optional[int]] = {}
 
             for sid in to_delete:
-                raw = self.db.get(_sample_key(sid))
-                if raw is None:
+                meta = picked.get(sid)
+                if meta is None:
                     continue
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-                data = json_loads(raw)
-                text_hash = data.get("text_hash", "")
-                sample_label = int(data.get("label", 0))
-                del self.db[_sample_key(sid)]
+                sample_label, text_hash = meta
+                try:
+                    del self.db[_sample_key(sid)]
+                except KeyError:
+                    continue
                 if sample_label == 0:
                     count_0 = max(0, count_0 - 1)
                 else:
                     count_1 = max(0, count_1 - 1)
                 total = max(0, total - 1)
                 if text_hash:
-                    self._refresh_text_latest_after_delete(text_hash, sid)
+                    # Only refresh pointer if we deleted the current latest for this hash.
+                    latest_id = latest_cache.get(text_hash)
+                    if latest_id is None and text_hash not in latest_cache:
+                        latest_raw = self.db.get(_text_latest_key(text_hash))
+                        if latest_raw is None:
+                            latest_id = None
+                        else:
+                            if isinstance(latest_raw, bytes):
+                                latest_raw = latest_raw.decode("utf-8")
+                            try:
+                                latest_id = int(latest_raw)
+                            except Exception:
+                                latest_id = None
+                        latest_cache[text_hash] = latest_id
+                    if latest_id == sid:
+                        affected_hashes.add(text_hash)
 
+            # Refresh all affected hashes in one scan.
+            self._bulk_refresh_text_latest_after_deletes(affected_hashes)
             self._set_counts(total, count_0, count_1)
             return len(to_delete)
