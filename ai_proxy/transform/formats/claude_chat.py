@@ -265,7 +265,9 @@ def to_claude_chat(req: InternalChatRequest) -> Dict[str, Any]:
                 })
         
         if content:
-            role = "user" if m.role == "user" else "assistant"
+            # Claude tool_result blocks must be sent as part of a "user" message.
+            # Internally, tool results may appear under role="tool" (e.g. when converting from OpenAI Chat).
+            role = "user" if m.role in {"user", "tool"} else "assistant"
             claude_msgs.append({"role": role, "content": content})
     
     body["messages"] = claude_msgs

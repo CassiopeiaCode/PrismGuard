@@ -82,7 +82,7 @@ class UpstreamClient:
             if "alt=sse" not in url:
                 separator = "&" if "?" in url else "?"
                 url = f"{url}{separator}alt=sse"
-                print(f"[UPSTREAM] ✅ Added alt=sse parameter for Gemini streaming: {url}")
+                print(f"[UPSTREAM] OK Added alt=sse parameter for Gemini streaming: {url}")
         
         try:
             if is_stream:
@@ -259,10 +259,10 @@ class UpstreamClient:
                     # 使用 alt=sse 参数后，上游应该返回 text/event-stream
                     if target_format == "gemini_chat":
                         if pass_headers.get("content-type") != "text/event-stream":
-                            print(f"[UPSTREAM] ⚠️  Setting Content-Type to text/event-stream for Gemini SSE format")
+                            print(f"[UPSTREAM] WARN Setting Content-Type to text/event-stream for Gemini SSE format")
                             pass_headers["content-type"] = "text/event-stream"
                         else:
-                            print(f"[UPSTREAM] ✅ Content-Type is already text/event-stream")
+                            print(f"[UPSTREAM] OK Content-Type is already text/event-stream")
                     
                     print(f"[UPSTREAM] Passing headers (after filtering): {pass_headers}")
                     
@@ -294,10 +294,10 @@ class UpstreamClient:
                     # 🔥 确保 Gemini SSE 格式的 Content-Type 正确
                     if target_format == "gemini_chat":
                         if pass_headers.get("content-type") != "text/event-stream":
-                            print(f"[UPSTREAM] ⚠️  Setting Content-Type to text/event-stream for Gemini SSE format")
+                            print(f"[UPSTREAM] WARN Setting Content-Type to text/event-stream for Gemini SSE format")
                             pass_headers["content-type"] = "text/event-stream"
                         else:
-                            print(f"[UPSTREAM] ✅ Content-Type is already text/event-stream")
+                            print(f"[UPSTREAM] OK Content-Type is already text/event-stream")
 
                     # ✅ 即使不启用 delay_stream_header，也要支持流式响应格式转换
                     # 这里必须使用自定义生成器来确保 aclose() 被调用，并且可做 SSE 转换。
@@ -418,7 +418,7 @@ class UpstreamClient:
         use_gzip: bool = False
     ) -> AsyncIterator[bytes]:
         """创建组合生成器（无转换）"""
-        print(f"[UPSTREAM] ⚡ Generator started! (gzip={use_gzip})")
+        print(f"[UPSTREAM] STREAM Generator started (gzip={use_gzip})")
         
         if not use_gzip:
             # 不使用 gzip，直接透传
@@ -437,7 +437,7 @@ class UpstreamClient:
                 except StopAsyncIteration:
                     print(f"[UPSTREAM] Stream completed")
             except Exception as e:
-                print(f"[UPSTREAM] ❌ Generator exception: {e}")
+                print(f"[UPSTREAM] ERROR Generator exception: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
@@ -479,7 +479,7 @@ class UpstreamClient:
                     yield final_compressed
                     
             except Exception as e:
-                print(f"[UPSTREAM] ❌ Generator exception: {e}")
+                print(f"[UPSTREAM] ERROR Generator exception: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
@@ -497,17 +497,17 @@ class UpstreamClient:
         use_gzip: bool = False
     ) -> AsyncIterator[bytes]:
         """创建组合生成器（带格式转换）"""
-        print(f"[UPSTREAM] ⚡ Transform generator started: {from_format} -> {to_format} (gzip={use_gzip})")
+        print(f"[UPSTREAM] STREAM Transform generator started: {from_format} -> {to_format} (gzip={use_gzip})")
 
         if use_gzip:
-            print("[UPSTREAM] ⚠️  gzip 流无法转换，降级为透传")
+            print("[UPSTREAM] WARN gzip stream cannot be transformed; passthrough")
             async for chunk in self._create_combined_generator(buffer, aiter, response, use_gzip):
                 yield chunk
             return
 
         transformer = create_stream_transformer(from_format, to_format)
         if transformer is None:
-            print("[UPSTREAM] ℹ️  未找到匹配的流式转换器，透传响应")
+            print("[UPSTREAM] INFO no matching stream transformer; passthrough")
             async for chunk in self._create_combined_generator(buffer, aiter, response, use_gzip):
                 yield chunk
             return

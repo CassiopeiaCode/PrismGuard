@@ -78,15 +78,22 @@ def from_openai_responses(body: Dict[str, Any]) -> InternalChatRequest:
 
     tools = []
     for tool in body.get("tools", []):
-        if tool.get("type") == "function":
-            fn = tool.get("function", {})
-            tools.append(
-                InternalTool(
-                    name=fn.get("name", ""),
-                    description=fn.get("description"),
-                    input_schema=fn.get("parameters") or {},
-                )
+        if tool.get("type") != "function":
+            continue
+        # Support both:
+        # - {"type":"function","function":{"name":...,"parameters":...}}
+        # - {"type":"function","name":...,"parameters":...}
+        fn = tool.get("function", {}) if isinstance(tool.get("function"), dict) else {}
+        name = tool.get("name") or fn.get("name") or ""
+        description = tool.get("description") if "description" in tool else fn.get("description")
+        parameters = tool.get("parameters") if "parameters" in tool else fn.get("parameters")
+        tools.append(
+            InternalTool(
+                name=name,
+                description=description,
+                input_schema=parameters or {},
             )
+        )
 
     extra_keys = {
         "model",
@@ -137,7 +144,7 @@ def to_openai_responses(req: InternalChatRequest) -> Dict[str, Any]:
             normal_messages.append(msg)
 
     body: Dict[str, Any] = {}
-    body.update(req.extra)
+    body.update(_normalize_extra_for_openai_responses(req.extra))
     body["model"] = req.model
     body["stream"] = req.stream
 
@@ -154,17 +161,15 @@ def to_openai_responses(req: InternalChatRequest) -> Dict[str, Any]:
         body["tools"] = [
             {
                 "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                },
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
             }
             for tool in req.tools
         ]
 
     if req.tool_choice is not None:
-        body["tool_choice"] = req.tool_choice
+        body["tool_choice"] = _normalize_tool_choice_for_openai_responses(req.tool_choice)
 
     return body
 
@@ -252,7 +257,9 @@ def internal_to_openai_responses_resp(resp: InternalChatResponse) -> Dict[str, A
     }
     if usage:
         response["usage"] = usage
-    response.update({k: v for k, v in resp.extra.items() if k not in {"created_at"}})
+    # Never allow extra to override required top-level fields.
+    reserved = {"created_at", "object", "id", "model", "output", "status", "usage"}
+    response.update({k: v for k, v in resp.extra.items() if k not in reserved})
     return response
 
 
@@ -424,7 +431,7 @@ def _message_to_input_item(msg: InternalMessage) -> Dict[str, Any]:
     item: Dict[str, Any] = {
         "type": "message",
         "role": msg.role,
-        "content": {"items": []},
+        "content": [],
     }
 
     items: List[Dict[str, Any]] = []
@@ -432,7 +439,9 @@ def _message_to_input_item(msg: InternalMessage) -> Dict[str, Any]:
         if block.type == "text" and block.text is not None:
             items.append(
                 {
-                    "type": "output_text" if msg.role == "assistant" else "input_text",
+                    # Request-side input content uses input_* parts, regardless of message role.
+                    # (Responses API allows role=user/assistant/system/developer for input messages.)
+                    "type": "input_text",
                     "text": block.text,
                 }
             )
@@ -447,9 +456,11 @@ def _message_to_input_item(msg: InternalMessage) -> Dict[str, Any]:
         elif block.type == "tool_call" and block.tool_call:
             return {
                 "type": "function_call",
+                "id": block.tool_call.id or "",
                 "call_id": block.tool_call.id,
                 "name": block.tool_call.name,
                 "arguments": json_dumps_text(block.tool_call.arguments),
+                "status": "completed",
             }
         elif block.type == "tool_result" and block.tool_result:
             return {
@@ -457,12 +468,13 @@ def _message_to_input_item(msg: InternalMessage) -> Dict[str, Any]:
                 "call_id": block.tool_result.call_id,
                 "name": block.tool_result.name,
                 "output": block.tool_result.output,
+                "status": "completed",
             }
 
     if not items:
-        item["content"] = {"items": [{"type": "input_text", "text": ""}]}
+        item["content"] = [{"type": "input_text", "text": ""}]
     else:
-        item["content"]["items"] = items
+        item["content"] = items
     return item
 
 
@@ -486,7 +498,7 @@ def _message_to_output_items(msg: InternalMessage) -> List[Dict[str, Any]]:
                     "detail": block.image_url.detail,
                 }
             )
-        items.append({"type": "message", "role": msg.role, "content": {"items": content_items}})
+        items.append({"type": "message", "role": msg.role, "content": content_items})
 
     for block in msg.content:
         if block.type == "tool_call" and block.tool_call:
@@ -510,7 +522,7 @@ def _message_to_output_items(msg: InternalMessage) -> List[Dict[str, Any]]:
 
     if not items:
         items.append(
-            {"type": "message", "role": msg.role, "content": {"items": [{"type": "output_text", "text": ""}]}}
+            {"type": "message", "role": msg.role, "content": [{"type": "output_text", "text": ""}]}
         )
     return items
 
@@ -534,3 +546,96 @@ def _safe_json_loads(data: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _normalize_tool_choice_for_openai_responses(tool_choice: Any) -> Any:
+    """
+    Convert common tool_choice shapes from other APIs into Responses-compatible shapes.
+
+    Examples:
+    - ChatCompletions: {"type":"function","function":{"name":"x"}} -> {"type":"function","name":"x"}
+    - Claude: {"type":"tool","name":"x"} -> {"type":"function","name":"x"}
+    """
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+
+    t = tool_choice.get("type")
+    if t == "function":
+        fn = tool_choice.get("function")
+        if isinstance(fn, dict) and fn.get("name") and "name" not in tool_choice:
+            return {"type": "function", "name": fn.get("name")}
+        if "name" in tool_choice:
+            return {"type": "function", "name": tool_choice.get("name")}
+        return tool_choice
+
+    if t == "tool" and tool_choice.get("name"):
+        return {"type": "function", "name": tool_choice.get("name")}
+
+    return tool_choice
+
+
+def _normalize_extra_for_openai_responses(extra: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ChatCompletions -> Responses param normalization.
+
+    We do NOT attempt a strict allowlist here (to avoid breaking newer parameters),
+    but we drop or rewrite a few known-incompatible fields that frequently cause 400s.
+    """
+    if not isinstance(extra, dict) or not extra:
+        return {}
+
+    out = dict(extra)
+
+    # max_tokens (ChatCompletions) -> max_output_tokens (Responses)
+    if "max_output_tokens" not in out:
+        if isinstance(out.get("max_tokens"), int):
+            out["max_output_tokens"] = out.pop("max_tokens")
+        elif isinstance(out.get("max_completion_tokens"), int):
+            out["max_output_tokens"] = out.pop("max_completion_tokens")
+
+    # response_format (ChatCompletions) -> text.format (Responses)
+    # ChatCompletions: {"type":"json_schema","json_schema":{"name":...,"schema":...,"strict":...}}
+    # Responses:       {"type":"json_schema","name":...,"schema":...,"description":...,"strict":...}
+    rf = out.pop("response_format", None)
+    if rf is not None and "text" not in out:
+        fmt = None
+        if isinstance(rf, dict) and rf.get("type") == "json_schema":
+            js = rf.get("json_schema") if isinstance(rf.get("json_schema"), dict) else {}
+            fmt = {
+                "type": "json_schema",
+                "name": js.get("name") or "response",
+                "schema": js.get("schema") or {},
+            }
+            if "description" in js:
+                fmt["description"] = js.get("description")
+            if "strict" in js:
+                fmt["strict"] = js.get("strict")
+        elif isinstance(rf, dict) and rf.get("type") in {"json_object", "text"}:
+            fmt = {"type": rf.get("type")}
+
+        if fmt is not None:
+            out["text"] = {"format": fmt}
+
+    # stream_options.include_usage exists on ChatCompletions; Responses has different stream_options fields.
+    so = out.get("stream_options")
+    if isinstance(so, dict) and ("include_usage" in so):
+        so = dict(so)
+        so.pop("include_usage", None)
+        if so:
+            out["stream_options"] = so
+        else:
+            out.pop("stream_options", None)
+
+    # Drop known ChatCompletions-only keys that commonly break Responses.
+    for k in [
+        "messages",
+        "n",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+        "logit_bias",
+        "logprobs",
+    ]:
+        out.pop(k, None)
+
+    return out

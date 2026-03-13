@@ -47,16 +47,32 @@ def can_parse_openai_chat(path: str, headers: Dict[str, str], body: Dict[str, An
         messages = body.get("messages", [])
         if messages and isinstance(messages, list):
             for msg in messages:
-                if isinstance(msg, dict):
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        # 检查是否有 cache_control 字段（Claude Chat Prompt Caching 特性）
-                        has_cache_control = any(
-                            isinstance(block, dict) and "cache_control" in block
-                            for block in content
-                        )
-                        if has_cache_control:
-                            return False
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    # 检查是否有 cache_control 字段（Claude Chat Prompt Caching 特性）
+                    has_cache_control = any(
+                        isinstance(block, dict) and "cache_control" in block
+                        for block in content
+                    )
+                    if has_cache_control:
+                        return False
+
+    # 排斥 Claude Messages/Claude Code 风格：
+    # - 顶层 system 字段（Claude Messages 使用独立 system，而 OpenAI Chat 没有该字段）
+    # - thinking 字段（Claude extended thinking）
+    # - tools 里出现 input_schema（Anthropic tools 定义）
+    if "system" in body:
+        return False
+    if isinstance(body.get("thinking"), dict):
+        return False
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        if any(isinstance(t, dict) and "input_schema" in t for t in tools):
+            return False
+    if "anthropic_version" in body:
+        return False
     
     # 检查路径
     if "/chat/completions" in path:

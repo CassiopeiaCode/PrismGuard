@@ -203,7 +203,9 @@ class _OpenAIChatSink(_InternalStreamSink):
 
     @staticmethod
     def _tool_call_delta(call_id: str, name: str, arguments: str) -> dict:
-        return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+        # `ChoiceDeltaToolCall.index` is required by OpenAI Python SDK models for streaming chunks.
+        # We only support the common case (single tool call at index=0) here.
+        return {"index": 0, "id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
 
     def _build_chunk(self, delta: dict, finish_reason: Optional[str] = None, usage: Optional[dict] = None) -> bytes:
         chunk = {
@@ -224,6 +226,12 @@ class _ResponsesSink(_InternalStreamSink):
         self.model: Optional[str] = None
         self.created_at: Optional[int] = None
         self.started = False
+        self._text_buf: List[str] = []
+        self._tool_calls: Dict[str, Dict[str, str]] = {}  # call_id -> {"name": str, "arguments": str}
+        self._seq = 0
+        self._msg_item_id = "msg_stream_0"
+        self._msg_content_index = 0
+        self._tool_item_ids: Dict[str, str] = {}  # call_id -> item_id
 
     def on_start(self, meta: Dict[str, Any]) -> List[bytes]:
         self.response_id = meta.get("id") or self.response_id or ""
@@ -233,28 +241,138 @@ class _ResponsesSink(_InternalStreamSink):
             return []
         self.started = True
         resp = self._response_stub(status="in_progress")
-        return [
-            _encode_json({"type": "response.created", "response": resp}),
-            _encode_json({"type": "response.in_progress", "response": resp}),
-        ]
+
+        # Compatibility target:
+        # - official OpenAI Python SDK `ResponseStreamState` accumulator
+        # - formatpack docs (response.output_item.added -> response.content_part.added -> response.output_text.delta)
+        outs: List[bytes] = []
+        for payload in [
+            {"type": "response.created", "sequence_number": self._next_seq(), "response": resp},
+            {"type": "response.in_progress", "sequence_number": self._next_seq(), "response": resp},
+            {
+                "type": "response.output_item.added",
+                "sequence_number": self._next_seq(),
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": self._msg_item_id,
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                },
+            },
+            {
+                "type": "response.content_part.added",
+                "sequence_number": self._next_seq(),
+                "output_index": 0,
+                "item_id": self._msg_item_id,
+                "content_index": self._msg_content_index,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+        ]:
+            outs.append(_encode_json(payload, event=payload["type"]))
+        return outs
 
     def on_text_delta(self, text: str) -> List[bytes]:
         if not text:
             return []
-        return [_encode_json({"type": "response.output_text.delta", "delta": text, "output_index": 0})]
+        self._text_buf.append(text)
+        return [
+            _encode_json(
+                {
+                    "type": "response.output_text.delta",
+                    "sequence_number": self._next_seq(),
+                    "output_index": 0,
+                    "item_id": self._msg_item_id,
+                    "content_index": self._msg_content_index,
+                    "delta": text,
+                }
+                ,
+                event="response.output_text.delta",
+            )
+        ]
 
     def on_tool_call_start(self, call_id: str, name: str) -> List[bytes]:
-        return [_encode_json({"type": "response.output_item.added", "item": {"type": "function_call", "call_id": call_id, "name": name}})]
+        if call_id:
+            self._tool_calls.setdefault(call_id, {"name": name or "", "arguments": ""})
+            if name:
+                self._tool_calls[call_id]["name"] = name
+            self._tool_item_ids.setdefault(call_id, f"fc_{len(self._tool_item_ids)}")
+        item_id = self._tool_item_ids.get(call_id, f"fc_{len(self._tool_item_ids)}")
+        self._tool_item_ids[call_id] = item_id
+        return [
+            _encode_json(
+                {
+                    "type": "response.output_item.added",
+                    "sequence_number": self._next_seq(),
+                    "output_index": 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": item_id,
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                }
+                ,
+                event="response.output_item.added",
+            )
+        ]
 
     def on_tool_call_args_delta(self, call_id: str, name: str, delta: str) -> List[bytes]:
         if not delta:
             return []
-        return [_encode_json({"type": "response.function_call_arguments.delta", "call_id": call_id, "name": name, "delta": delta})]
+        if call_id:
+            self._tool_calls.setdefault(call_id, {"name": name or "", "arguments": ""})
+            if name:
+                self._tool_calls[call_id]["name"] = name
+            self._tool_calls[call_id]["arguments"] = self._tool_calls[call_id].get("arguments", "") + (delta or "")
+        item_id = self._tool_item_ids.get(call_id, "")
+        return [
+            _encode_json(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": self._next_seq(),
+                    "output_index": 1,
+                    "item_id": item_id,
+                    "delta": delta,
+                }
+                ,
+                event="response.function_call_arguments.delta",
+            )
+        ]
 
     def on_final(self, meta: Dict[str, Any]) -> List[bytes]:
         finish_reason = meta.get("finish_reason") or "stop"
         status = {"stop": "completed", "length": "incomplete", "error": "failed"}.get(finish_reason, "completed")
         resp = self._response_stub(status=status)
+
+        output: List[dict] = []
+        # Emit tool calls as output items (best-effort).
+        for call_id, entry in self._tool_calls.items():
+            output.append(
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": entry.get("name") or "",
+                    "arguments": entry.get("arguments") or "",
+                    "id": self._tool_item_ids.get(call_id),
+                    "status": "completed",
+                }
+            )
+
+        full_text = "".join(self._text_buf)
+        output.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "id": self._msg_item_id,
+                "status": "completed",
+                "content": [{"type": "output_text", "text": full_text, "annotations": []}],
+            }
+        )
+        resp["output"] = output
 
         usage = meta.get("usage")
         if usage and isinstance(usage, dict):
@@ -273,7 +391,7 @@ class _ResponsesSink(_InternalStreamSink):
                 "total_tokens": int(total_tokens or 0),
             }
 
-        return [_encode_json({"type": "response.completed", "response": resp})]
+        return [_encode_json({"type": "response.completed", "sequence_number": self._next_seq(), "response": resp}, event="response.completed")]
 
     def on_done(self) -> List[bytes]:
         return [_encode_sse("[DONE]")]
@@ -286,7 +404,16 @@ class _ResponsesSink(_InternalStreamSink):
             "created_at": self.created_at or int(time.time()),
             "status": status,
             "output": [],
+            # Required by OpenAI Responses schema / official SDK.
+            "parallel_tool_calls": False,
+            "tool_choice": None,
+            "tools": [],
         }
+
+    def _next_seq(self) -> int:
+        n = int(self._seq)
+        self._seq += 1
+        return n
 
 
 class _GeminiSink(_InternalStreamSink):
@@ -515,6 +642,7 @@ def _decode_to_internal(
         if not etype:
             return []
         resp = event.get("response") or {}
+        item_map = seen_tool_calls.setdefault("__responses_item_id_map__", {})
         if etype in {"response.created", "response.in_progress"}:
             meta["id"] = resp.get("id", meta.get("id"))
             meta["model"] = resp.get("model", meta.get("model"))
@@ -531,21 +659,27 @@ def _decode_to_internal(
         if etype == "response.output_item.added":
             item = event.get("item") or {}
             if item.get("type") == "function_call":
-                call_id = item.get("call_id") or item.get("id") or ""
+                item_id = item.get("id") or ""
+                call_id = item.get("call_id") or item_id or ""
                 name = item.get("name") or ""
                 if call_id and call_id not in seen_tool_calls:
                     seen_tool_calls[call_id] = {"name": name}
                     outs.append({"type": "tool_call_start", "id": call_id, "name": name})
+                if item_id and isinstance(item_map, dict):
+                    item_map[item_id] = call_id
             return outs
 
-        if etype in {"response.function_call_arguments.delta", "response.function_call.delta"}:
-            call_id = event.get("call_id") or ""
-            name = event.get("name") or seen_tool_calls.get(call_id, {}).get("name") or ""
+        if etype in {"response.function_call_arguments.delta", "response.function_call_arguments.done", "response.function_call.delta"}:
+            item_id = event.get("item_id") or ""
+            call_id = ""
+            if item_id and isinstance(item_map, dict):
+                call_id = item_map.get(item_id, "") or ""
+            name = seen_tool_calls.get(call_id, {}).get("name") or ""
             delta_args = event.get("delta") or event.get("arguments") or ""
             if call_id and call_id not in seen_tool_calls:
                 seen_tool_calls[call_id] = {"name": name}
                 outs.append({"type": "tool_call_start", "id": call_id, "name": name})
-            if delta_args:
+            if delta_args and call_id:
                 outs.append({"type": "tool_call_args_delta", "id": call_id, "name": name, "delta": delta_args})
             return outs
 
