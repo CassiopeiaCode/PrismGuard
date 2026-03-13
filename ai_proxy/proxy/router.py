@@ -3,6 +3,7 @@
 """
 
 import hashlib
+import gzip
 import orjson
 import threading
 import urllib.parse
@@ -298,8 +299,22 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
     # 获取请求体
     try:
         body = await request.json() if request.method in ["POST", "PUT"] else {}
-    except:
-        body = {}
+    except Exception:
+        # Some clients may send:
+        # - gzip-compressed request bodies (Content-Encoding: gzip)
+        # - non-JSON content-type (or otherwise fail JSON parsing)
+        # In those cases, FastAPI's request.json() can fail; fall back to bytes parsing.
+        try:
+            raw = await request.body()
+            if raw:
+                enc = (request.headers.get("content-encoding") or "").lower()
+                if enc == "gzip":
+                    raw = gzip.decompress(raw)
+                body = json_loads(raw)
+            else:
+                body = {}
+        except Exception:
+            body = {}
 
     # 使用从 upstream_full 解析出的路径
     path = upstream_path
