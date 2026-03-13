@@ -262,7 +262,7 @@ def detect_and_parse(
             error_msg = (
                 f"Format mismatch: Request appears to be in format [{detected_str}], "
                 f"but only [{expected_str}] is allowed. "
-                f"Please check your 'from' configuration or update it to include the detected format."
+                f"You may switch between Kilo Code(Cherry Studio), Codex, or Claude Code to find the one that matches."
             )
             # 如果有解析错误，附加到错误消息中
             if parse_errors:
