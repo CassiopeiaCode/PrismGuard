@@ -158,32 +158,53 @@ def _from_claude_chat(body: Dict[str, Any]) -> InternalChatRequest:
         if isinstance(content_parts, str):
             blocks.append(InternalContentBlock(type="text", text=content_parts))
         else:
+            # Normal Claude Messages: content is a list of blocks.
+            # Some wrappers send a single block object (dict) instead of list; normalize it.
+            if isinstance(content_parts, dict):
+                content_parts = [content_parts]
+            if not isinstance(content_parts, list):
+                content_parts = []
+
             for c in content_parts:
+                if not isinstance(c, dict):
+                    continue
                 ctype = c.get("type", "")
                 if ctype == "text":
                     blocks.append(InternalContentBlock(type="text", text=c.get("text", "")))
+                elif ctype == "thinking":
+                    # Best-effort: internal model currently has no dedicated thinking blocks.
+                    # Keep it parseable and allow downstream policies/converters to decide how to render it.
+                    blocks.append(InternalContentBlock(type="text", text=c.get("thinking", "")))
                 elif ctype == "tool_use":
-                    blocks.append(InternalContentBlock(
-                        type="tool_call",
-                        tool_call=InternalToolCall(
-                            id=c.get("id", ""),
-                            name=c.get("name", ""),
-                            arguments=c.get("input", {}) if isinstance(c.get("input"), dict) else {}
+                    blocks.append(
+                        InternalContentBlock(
+                            type="tool_call",
+                            tool_call=InternalToolCall(
+                                id=c.get("id", ""),
+                                name=c.get("name", ""),
+                                arguments=c.get("input", {}) if isinstance(c.get("input"), dict) else {},
+                            ),
                         )
-                    ))
+                    )
                 elif ctype == "tool_result":
                     output = c.get("content", "")
                     if isinstance(output, list):
-                        texts = [item.get("text", "") for item in output if item.get("type") == "text"]
+                        texts = [
+                            item.get("text", "")
+                            for item in output
+                            if isinstance(item, dict) and item.get("type") == "text"
+                        ]
                         output = "\n".join(texts)
-                    blocks.append(InternalContentBlock(
-                        type="tool_result",
-                        tool_result=InternalToolResult(
-                            call_id=c.get("tool_use_id", ""),
-                            name=None,
-                            output=output
+                    blocks.append(
+                        InternalContentBlock(
+                            type="tool_result",
+                            tool_result=InternalToolResult(
+                                call_id=c.get("tool_use_id", ""),
+                                name=None,
+                                output=output,
+                            ),
                         )
-                    ))
+                    )
         
         if not blocks:
             blocks.append(InternalContentBlock(type="text", text=""))
