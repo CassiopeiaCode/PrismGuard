@@ -4,6 +4,7 @@
 
 import hashlib
 import gzip
+import zlib
 import orjson
 import threading
 import urllib.parse
@@ -310,6 +311,20 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
                 enc = (request.headers.get("content-encoding") or "").lower()
                 if enc == "gzip":
                     raw = gzip.decompress(raw)
+                elif enc == "deflate":
+                    raw = zlib.decompress(raw)
+                elif enc == "br":
+                    # Brotli is optional; only attempt if available.
+                    try:
+                        import brotli  # type: ignore
+                    except Exception:
+                        brotli = None
+                    if brotli is None:
+                        try:
+                            import brotlicffi as brotli  # type: ignore
+                        except Exception as e:
+                            raise RuntimeError("Brotli decompressor not available") from e
+                    raw = brotli.decompress(raw)
                 body = json_loads(raw)
             else:
                 body = {}

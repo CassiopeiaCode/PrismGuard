@@ -275,6 +275,8 @@ def detect_and_parse(
                 f"Unable to parse request format. Expected format: {expected_str}. "
                 f"Please verify your request body structure matches the expected format."
             )
+            if parse_errors:
+                error_msg += f" Parse errors: {'; '.join(parse_errors)}"
             return None, None, error_msg
     
     # 非严格模式：返回 None 表示无法识别（将透传）
