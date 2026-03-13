@@ -570,8 +570,42 @@ class _ClaudeSink(_InternalStreamSink):
             outs.append(_encode_json({"type": "content_block_stop", "index": idx}, event="content_block_stop"))
         self.open_blocks = []
 
-        stop_reason = meta.get("finish_reason") or "end_turn"
-        outs.append(_encode_json({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}}, event="message_delta"))
+        finish_reason = meta.get("finish_reason")
+        # Map OpenAI-style finish reasons to Anthropic stop_reason values.
+        # Anthropic: end_turn | max_tokens | tool_use | stop_sequence | ...
+        stop_reason = "end_turn"
+        if finish_reason in (None, "", "stop"):
+            stop_reason = "end_turn"
+        elif finish_reason in ("tool_calls", "function_call"):
+            stop_reason = "tool_use"
+        elif finish_reason in ("length",):
+            stop_reason = "max_tokens"
+        else:
+            # Best-effort passthrough if already Anthropic-like.
+            stop_reason = str(finish_reason)
+
+        usage = meta.get("usage")
+        usage_obj: Optional[dict] = None
+        if isinstance(usage, dict):
+            # Anthropic streams report cumulative output_tokens in message_delta.
+            # We may not have exact token counts here; use any known fields, else 0.
+            out_toks = usage.get("output_tokens")
+            if out_toks is None and "completion_tokens" in usage:
+                out_toks = usage.get("completion_tokens")
+            if out_toks is None and "total_tokens" in usage and "input_tokens" in usage:
+                try:
+                    out_toks = int(usage["total_tokens"]) - int(usage["input_tokens"])
+                except Exception:
+                    out_toks = None
+            try:
+                usage_obj = {"output_tokens": int(out_toks or 0)}
+            except Exception:
+                usage_obj = {"output_tokens": 0}
+        else:
+            usage_obj = {"output_tokens": 0}
+
+        delta_payload: dict = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": usage_obj}
+        outs.append(_encode_json(delta_payload, event="message_delta"))
         outs.append(_encode_json({"type": "message_stop"}, event="message_stop"))
         return outs
 
