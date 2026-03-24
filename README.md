@@ -219,8 +219,10 @@ configs/mod_profiles/{profile}/
 ├── profile.json         # 审核参数配置
 ├── ai_prompt.txt        # AI 审核提示词
 ├── history.db           # 审核历史数据库（自动生成）
-├── bow_model.pkl        # 词袋模型（自动生成）
-└── bow_vectorizer.pkl   # TF-IDF 向量化器（自动生成）
+├── hashlinear_model.pkl # HashLinear 模型（主推，本地审核默认推荐）
+├── bow_model.pkl        # BoW 模型（可选）
+├── bow_vectorizer.pkl   # BoW 向量化器（可选）
+└── fasttext_model.bin   # fastText 模型（可选）
 ```
 
 ### 3) “内部格式”（InternalChatRequest）
@@ -339,7 +341,7 @@ PROXY_CONFIG_GEMINI={"basic_moderation":{"enabled":true},"smart_moderation":{"en
 
 1. LRU 缓存命中：直接返回
 2. 随机抽样：按 `ai_review_rate` 直接走 AI 审核并记录（用于持续产生标注）
-3. 本地模型：BoW / fastText 预测违规概率
+3. 本地模型：HashLinear / BoW / fastText 预测违规概率
    - `p < low_risk_threshold`：低风险放行
    - `p > high_risk_threshold`：高风险拒绝
    - 中间区域：交给 AI 复核
@@ -357,17 +359,33 @@ PROXY_CONFIG_GEMINI={"basic_moderation":{"enabled":true},"smart_moderation":{"en
 - full 模式的核心约束：**每类都有独立上限 `max_samples/2`，不会被另一类挤占**；因此当分布为 正=25/负=75 且 `max_samples=100` 时，训练集会是 `25 正 + 50 负 = 75`（不会去补满到 100）。
 - 数据库可按上限清理并 VACUUM 释放空间
 
-### 4) 本地模型：BoW vs fastText
+### 4) 本地模型：优先推荐 HashLinear
 
-- `local_model_type = "bow"`：默认更稳健、依赖更少
-- `local_model_type = "fasttext"`：更快/更轻，但可能受 NumPy 版本影响
+- `local_model_type = "hashlinear"`：主推方案，模型小、常量内存、推理稳定，适合作为线上默认选择
+- HashLinear 可配合 Rust 扩展加速推理；扩展不可用时会自动回退到 Python 实现
+- `local_model_type = "bow"`：兼容型备选，便于已有 BoW 数据继续沿用
+- `local_model_type = "fasttext"`：轻量备选，但需要关注 NumPy / fastText 兼容性
 - fastText 分词支持（在 `configs/mod_profiles/{profile}/profile.json` 中配置）：
   - `fasttext_training.use_jieba=true`：使用 jieba 分词（中文推荐）
   - `fasttext_training.use_tiktoken=true`：使用 tiktoken 分词（实验性）
   - 两者都为 `false`：使用字符级 n-gram（原版 fastText 路径）
   - 两者都为 `true`：先 tiktoken 再 jieba（实验性组合）
 
-示例配置片段（仅展示 fastText 相关字段）：
+推荐配置片段（HashLinear）：
+
+```json
+{
+  "local_model_type": "hashlinear",
+  "hashlinear_training": {
+    "sample_loading": "balanced_undersample",
+    "analyzer": "char",
+    "ngram_range": [2, 4],
+    "n_features": 1048576
+  }
+}
+```
+
+fastText 配置片段（仅在需要时启用）：
 
 ```json
 {
@@ -439,7 +457,8 @@ AI 审核配置片段示例：
 | 操作 | 耗时 |
 |------|------|
 | 关键词过滤 | <1ms |
-| 词袋模型预测 | 3-5ms |
+| HashLinear 推理 | 1-3ms |
+| HashLinear 推理（Rust） | 更低延迟，取决于机器与构建方式 |
 | AI 审核 | 500-2000ms |
 | 格式转换 | <2ms |
 | 缓存命中 | <0.1ms |
@@ -483,10 +502,11 @@ PrismGuard 的审核样本库使用 RocksDB（`history.rocks/`）。RocksDB 在*
 ### 1) 手动训练模型
 
 ```bash
-# 训练指定 profile 的模型（BoW）
-python tools/train_bow_model.py default
+# 训练指定 profile 的模型（HashLinear，推荐）
+python tools/train_hashlinear_model.py default
 
-# 或使用 fastText（需要额外配置）
+# 或使用 BoW / fastText（兼容方案）
+python tools/train_bow_model.py default
 python tools/train_fasttext_model.py default
 ```
 
@@ -503,10 +523,11 @@ python tools/query_moderation_log.py default --label 1
 ### 3) 测试模型
 
 ```bash
-# 测试词袋模型
-python tools/test_bow_model.py default "测试文本"
+# 测试 HashLinear 模型
+python tools/verify_hashlinear_runtime.py default
 
-# 测试 fastText 模型
+# 测试 BoW / fastText 模型
+python tools/test_bow_model.py default "测试文本"
 python tools/test_fasttext_model.py default "测试文本"
 ```
 
@@ -522,6 +543,7 @@ python tools/build_hashlinear_rust.py
 说明：
 
 - 该脚本依赖本机已有 `cargo`、`rustc`、`maturin`
+- 若已启用 `local_model_type = "hashlinear"`，构建 Rust 扩展后线上审核会优先使用 Rust 加速推理
 - 若缺少 Rust 工具链，脚本会明确报错退出，服务仍可继续走 Python fallback
 - 可通过环境变量 `HASHLINEAR_USE_RUST=0` 显式禁用 Rust 加速
 - 可通过 `HASHLINEAR_USE_RUST=1` 强制尝试加载；若扩展不存在或导入失败，仍会告警后回退
