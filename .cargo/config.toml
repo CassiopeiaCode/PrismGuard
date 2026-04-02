@@ -1,0 +1,6 @@
+[build]
+jobs = 2
+
+[env]
+LIBCLANG_PATH = "/usr/lib/llvm-16/lib"
+ROCKSDB_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
