@@ -313,7 +313,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                 if let Some(usage) = payload
                     .get("response")
                     .and_then(|response| response.get("usage"))
-                    .cloned()
+                    .and_then(normalize_stream_usage)
                 {
                     chunk["usage"] = usage;
                 }
@@ -338,6 +338,15 @@ fn ensure_created(created: &mut i64) {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
+}
+
+fn normalize_stream_usage(usage: &Value) -> Option<Value> {
+    let usage = usage.as_object()?;
+    Some(json!({
+        "input_tokens": usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0)),
+        "output_tokens": usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0)),
+        "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0)),
+    }))
 }
 
 fn emit_chat_start_chunk(
