@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -68,6 +69,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
                 }
+                ensure_created(&mut created);
                 emit_chat_start_chunk(
                     &mut out,
                     &mut started,
@@ -96,10 +98,11 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                         created = response
                             .get("created_at")
                             .or_else(|| response.get("created"))
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0);
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0);
                     }
                 }
+                ensure_created(&mut created);
                 emit_chat_start_chunk(
                     &mut out,
                     &mut started,
@@ -116,6 +119,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                 if delta.is_empty() {
                     continue;
                 }
+                ensure_created(&mut created);
                 let chunk = json!({
                     "id": response_id,
                     "object": "chat.completion.chunk",
@@ -165,6 +169,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                     call_names.insert(call_id.clone(), name.clone());
                 }
 
+                ensure_created(&mut created);
                 emit_chat_start_chunk(
                     &mut out,
                     &mut started,
@@ -234,6 +239,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                     .or_else(|| call_names.get(&call_id).cloned())
                     .unwrap_or_default();
 
+                ensure_created(&mut created);
                 emit_chat_start_chunk(
                     &mut out,
                     &mut started,
@@ -285,6 +291,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                     Some("response.incomplete") => "length",
                     _ => "stop",
                 };
+                ensure_created(&mut created);
                 emit_chat_start_chunk(
                     &mut out,
                     &mut started,
@@ -320,6 +327,17 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
     }
 
     out.into_bytes()
+}
+
+fn ensure_created(created: &mut i64) {
+    if *created != 0 {
+        return;
+    }
+
+    *created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
 }
 
 fn emit_chat_start_chunk(
