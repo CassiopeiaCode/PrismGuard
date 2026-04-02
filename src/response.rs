@@ -28,8 +28,7 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
     let created = object
         .get("created_at")
         .cloned()
-        .or_else(|| object.get("created").cloned())
-        .unwrap_or_else(|| json!(0));
+        .or_else(|| object.get("created").cloned());
 
     let output_items = object
         .get("output")
@@ -143,7 +142,6 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
     let mut response = json!({
         "id": id,
         "object": "chat.completion",
-        "created": created,
         "model": model,
         "choices": [{
             "index": 0,
@@ -151,6 +149,10 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
             "finish_reason": map_finish_reason(object.get("status").and_then(Value::as_str))
         }]
     });
+
+    if let Some(created) = created {
+        response["created"] = created;
+    }
 
     if let Some(usage) = object.get("usage").and_then(Value::as_object) {
         response["usage"] = json!({

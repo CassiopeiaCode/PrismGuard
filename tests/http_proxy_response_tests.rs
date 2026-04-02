@@ -318,6 +318,53 @@ async fn upstream_openai_responses_without_status_keeps_chat_finish_reason_null(
 }
 
 #[tokio::test]
+async fn upstream_openai_responses_without_created_does_not_emit_zero_created_field() {
+    let upstream_base = spawn_json_upstream(json!({
+        "id": "resp_no_created",
+        "object": "response",
+        "model": "gpt-4.1-mini",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "partial"
+            }]
+        }]
+    }))
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["choices"][0]["message"]["content"], "partial");
+    assert_eq!(body.get("created"), None);
+}
+
+#[tokio::test]
 async fn upstream_openai_responses_extra_fields_are_preserved_in_chat_response() {
     let upstream_body = json!({
         "id": "resp_extra",

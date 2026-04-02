@@ -356,6 +356,40 @@ async fn responses_function_call_delta_arguments_field_maps_to_chat_tool_call_de
     assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
 }
 
+#[tokio::test]
+async fn responses_stream_without_created_does_not_emit_zero_created_field() {
+    let upstream_base = spawn_missing_created_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"content\":\"hello\""), "{body}");
+    assert!(!body.contains("\"created\":0"), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+}
+
 async fn spawn_sse_upstream() -> String {
     let payload = concat!(
         "event: response.created\n",
@@ -675,6 +709,43 @@ async fn spawn_function_call_delta_sse_upstream() -> String {
             .serve(app.into_make_service())
             .await
             .expect("function call delta upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_missing_created_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_no_created\",\"model\":\"gpt-4.1-mini\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_no_created\",\"model\":\"gpt-4.1-mini\",\"status\":\"completed\"}}\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("missing created sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind missing created upstream");
+    let addr = listener.local_addr().expect("missing created upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("missing created upstream server");
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
