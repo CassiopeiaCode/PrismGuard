@@ -1,4 +1,5 @@
 mod config;
+mod format;
 mod profile;
 mod proxy;
 mod routes;
