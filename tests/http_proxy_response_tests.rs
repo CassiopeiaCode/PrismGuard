@@ -936,6 +936,49 @@ async fn upstream_openai_responses_reasoning_item_maps_to_chat_text_content() {
 }
 
 #[tokio::test]
+async fn upstream_openai_responses_empty_output_keeps_empty_assistant_message_shape() {
+    let upstream_base = spawn_json_upstream(json!({
+        "id": "resp_empty_output",
+        "object": "response",
+        "model": "gpt-4.1-mini",
+        "status": "completed",
+        "output": []
+    }))
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert!(body["choices"][0]["message"]["content"].is_null(), "{body}");
+    assert!(body["choices"][0]["message"]["tool_calls"].is_null(), "{body}");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body.get("usage"), Some(&Value::Null));
+}
+
+#[tokio::test]
 async fn non_json_success_response_is_passed_through_as_text_body() {
     let upstream_base = spawn_fixed_upstream(
         StatusCode::OK,
