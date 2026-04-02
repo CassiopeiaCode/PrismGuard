@@ -10,6 +10,7 @@ use futures_util::TryStreamExt;
 use hyper::body::to_bytes;
 use serde_json::Value;
 
+use crate::format::{process_request, RequestProcessError};
 use crate::routes::{parse_url_config, ApiError, AppState};
 
 const HEADER_DENYLIST: &[&str] = &[
@@ -42,18 +43,17 @@ pub async fn proxy_entry(
         .with_error_type("config_error")
     })?;
 
-    let upstream_base = format!(
-        "{}://{}",
-        upstream.scheme(),
-        upstream
-            .host_str()
-            .ok_or_else(|| {
-                ApiError::new(StatusCode::BAD_REQUEST, "upstream host is missing")
-                    .with_code("CONFIG_PARSE_ERROR")
-                    .with_error_type("config_error")
-            })?
-    );
-    let final_url = upstream.to_string();
+    let upstream_host = upstream
+        .host_str()
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_REQUEST, "upstream host is missing")
+                .with_code("CONFIG_PARSE_ERROR")
+                .with_error_type("config_error")
+        })?;
+    let upstream_base = match upstream.port() {
+        Some(port) => format!("{}://{}:{}", upstream.scheme(), upstream_host, port),
+        None => format!("{}://{}", upstream.scheme(), upstream_host),
+    };
     let path = if upstream.path().is_empty() {
         "/".to_string()
     } else {
@@ -65,11 +65,25 @@ pub async fn proxy_entry(
         .await
         .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("failed to read body: {e}")))?;
     let request_json = parse_request_json(&parts.method, &parts.headers, &raw_body)?;
-    let is_stream = request_json
-        .as_ref()
-        .and_then(|value| value.get("stream"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let mut request_body = request_json.clone().unwrap_or_else(|| Value::Object(Default::default()));
+    let header_pairs = parts
+        .headers
+        .iter()
+        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str().to_string(), value.to_string())))
+        .collect::<Vec<_>>();
+    let request_plan =
+        process_request(&parsed.config, &path, &header_pairs, request_body.clone()).map_err(|error| {
+            match error {
+                RequestProcessError::StrictParse(message) | RequestProcessError::Transform(message) => {
+                    ApiError::new(StatusCode::BAD_REQUEST, message)
+                        .with_code("MODERATION_BLOCKED")
+                        .with_error_type("moderation_error")
+                }
+            }
+        })?;
+    let final_url = format!("{}{}", upstream_base, request_plan.path);
+    let is_stream = request_plan.stream;
+    request_body = request_plan.body;
 
     let mut upstream_request = state
         .http_client
@@ -77,7 +91,13 @@ pub async fn proxy_entry(
         .headers(filtered_request_headers(&parts.headers));
 
     if !raw_body.is_empty() {
-        upstream_request = upstream_request.body(raw_body.clone());
+        if request_json.is_some() {
+            upstream_request = upstream_request.body(serde_json::to_vec(&request_body).map_err(|e| {
+                ApiError::new(StatusCode::BAD_REQUEST, format!("failed to encode transformed body: {e}"))
+            })?);
+        } else {
+            upstream_request = upstream_request.body(raw_body.clone());
+        }
     }
 
     let upstream_response = upstream_request.send().await.map_err(|e| {
@@ -92,8 +112,10 @@ pub async fn proxy_entry(
     tracing::info!(
         method = %parts.method,
         upstream_base,
-        upstream_path = %path,
+        upstream_path = %request_plan.path,
         stream = is_stream,
+        src_format = request_plan.source_format.map(|f| f.as_str()).unwrap_or("unknown"),
+        target_format = request_plan.target_format.map(|f| f.as_str()).unwrap_or("none"),
         status = upstream_response.status().as_u16(),
         config_source = %parsed.source,
         "proxied request"
@@ -115,9 +137,11 @@ fn parse_request_json(
         return Ok(None);
     }
 
-    let decoded = decompress_body(headers, raw_body)?;
-    match serde_json::from_slice::<Value>(&decoded) {
-        Ok(value) => Ok(Some(value)),
+    match decompress_body(headers, raw_body) {
+        Ok(decoded) => match serde_json::from_slice::<Value>(&decoded) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(None),
+        },
         Err(_) => Ok(None),
     }
 }
