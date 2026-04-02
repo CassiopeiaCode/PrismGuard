@@ -424,6 +424,40 @@ async fn responses_stream_usage_is_reduced_to_chat_usage_shape() {
     assert!(!body.contains("\"output_token_details\""), "{body}");
 }
 
+#[tokio::test]
+async fn responses_in_progress_event_can_start_chat_stream_without_created() {
+    let upstream_base = spawn_in_progress_only_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"role\":\"assistant\""), "{body}");
+    assert!(body.contains("\"content\":\"hello\""), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+}
+
 async fn spawn_sse_upstream() -> String {
     let payload = concat!(
         "event: response.created\n",
@@ -817,6 +851,43 @@ async fn spawn_usage_shape_sse_upstream() -> String {
             .serve(app.into_make_service())
             .await
             .expect("usage shape upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_in_progress_only_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.in_progress\n",
+        "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_in_progress\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_in_progress\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("in progress only sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind in progress only upstream");
+    let addr = listener.local_addr().expect("in progress only upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("in progress only upstream server");
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
