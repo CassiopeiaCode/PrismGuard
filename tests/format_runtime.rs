@@ -120,61 +120,31 @@ pub fn process_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let from_cfg = transform_cfg.get("from");
-    let candidates = configured_candidates(from_cfg);
-    let detectable = detect_formats_from_candidates(&candidates, path, headers, &plan.body);
-    let mut parse_errors = Vec::new();
-    let mut parsed = None;
+    let source = detect_format(from_cfg, path, headers, &plan.body);
 
-    for source in detectable.iter().copied() {
-        match parse_request(source, &plan.body, path) {
-            Ok(internal) => {
-                parsed = Some((source, internal));
-                break;
-            }
-            Err(error) => parse_errors.push(format!("{}: {error}", source.as_str())),
-        }
-    }
-
-    if parsed.is_none() {
+    if source.is_none() {
         if strict_parse {
-            let excluded = all_request_formats()
-                .into_iter()
-                .filter(|format| !candidates.contains(format))
-                .collect::<Vec<_>>();
-            let detectable_excluded = detect_formats_from_candidates(&excluded, path, headers, &plan.body);
-
-            let mut message = if !detectable_excluded.is_empty() {
-                let expected = expected_formats_label(from_cfg, &candidates);
-                let detected = detectable_excluded
-                    .iter()
-                    .map(|format| format!("'{}'", format.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "Format mismatch: Request appears to be in format [{detected}], but only [{expected}] is allowed."
-                )
-            } else {
-                let expected = expected_formats_label(from_cfg, &candidates);
-                format!(
-                    "Unable to parse request format. Expected format: {expected}. Please verify your request body structure matches the expected format."
-                )
-            };
-
-            if !parse_errors.is_empty() {
-                message.push_str(&format!(" Parse errors: {}", parse_errors.join("; ")));
-            }
-
-            return Err(RequestProcessError::StrictParse(message));
+            return Err(RequestProcessError::StrictParse(
+                "Format parse error: unable to detect request format".to_string(),
+            ));
         }
         return Ok(plan);
     }
 
-    let (source, internal) = parsed.expect("checked is_some");
+    let source = source.expect("checked is_some");
     let target = transform_cfg
         .get("to")
         .and_then(Value::as_str)
         .and_then(RequestFormat::from_name)
         .unwrap_or(source);
+
+    let internal = parse_request(source, &plan.body, path).map_err(|error| {
+        if strict_parse {
+            RequestProcessError::StrictParse(error.to_string())
+        } else {
+            RequestProcessError::Transform(error.to_string())
+        }
+    })?;
     plan.stream = internal.stream;
     plan.source_format = Some(source);
     plan.target_format = Some(target);
@@ -189,13 +159,11 @@ pub fn process_request(
 }
 
 fn detect_format(from_cfg: Option<&Value>, path: &str, headers: &[(String, String)], body: &Value) -> Option<RequestFormat> {
-    detect_formats_from_candidates(&configured_candidates(from_cfg), path, headers, body).into_iter().next()
-}
+    let body = body.as_object()?;
 
-fn configured_candidates(from_cfg: Option<&Value>) -> Vec<RequestFormat> {
-    if let Some(cfg) = from_cfg {
+    let candidates = if let Some(cfg) = from_cfg {
         match cfg {
-            Value::String(name) if name != "auto" => RequestFormat::from_name(name).into_iter().collect(),
+            Value::String(name) if name != "auto" => vec![RequestFormat::from_name(name)?],
             Value::Array(values) => values
                 .iter()
                 .filter_map(Value::as_str)
@@ -205,47 +173,11 @@ fn configured_candidates(from_cfg: Option<&Value>) -> Vec<RequestFormat> {
         }
     } else {
         default_detection_order()
-    }
-}
-
-fn detect_formats_from_candidates(
-    candidates: &[RequestFormat],
-    path: &str,
-    headers: &[(String, String)],
-    body: &Value,
-) -> Vec<RequestFormat> {
-    let Some(body) = body.as_object() else {
-        return Vec::new();
     };
 
     candidates
-        .iter()
-        .copied()
-        .filter(|format| can_parse(*format, path, headers, body))
-        .collect()
-}
-
-fn all_request_formats() -> Vec<RequestFormat> {
-    vec![
-        RequestFormat::OpenAiChat,
-        RequestFormat::ClaudeChat,
-        RequestFormat::OpenAiResponses,
-        RequestFormat::GeminiChat,
-    ]
-}
-
-fn expected_formats_label(from_cfg: Option<&Value>, candidates: &[RequestFormat]) -> String {
-    match from_cfg {
-        Some(Value::String(name)) if name != "auto" => format!("'{name}'"),
-        _ => format!(
-            "[{}]",
-            candidates
-                .iter()
-                .map(|format| format!("'{}'", format.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
+        .into_iter()
+        .find(|format| can_parse(*format, path, headers, body))
 }
 
 fn default_detection_order() -> Vec<RequestFormat> {
@@ -282,19 +214,6 @@ fn can_parse_openai_chat(path: &str, body: &Map<String, Value>) -> bool {
     }
     if body.contains_key("system") || body.contains_key("anthropic_version") {
         return false;
-    }
-    if let Some(Value::Array(messages)) = body.get("messages") {
-        for msg in messages.iter().filter_map(Value::as_object) {
-            if let Some(Value::Array(content)) = msg.get("content") {
-                if content
-                    .iter()
-                    .filter_map(Value::as_object)
-                    .any(|block| block.contains_key("cache_control"))
-                {
-                    return false;
-                }
-            }
-        }
     }
     if body.get("thinking").and_then(Value::as_object).is_some() {
         return false;
@@ -755,12 +674,6 @@ fn parse_responses_input_item(item: &Value) -> Result<Option<InternalMessage>> {
 
 fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRequest> {
     let mut messages = Vec::new();
-    if let Some(system_text) = parse_gemini_system_instruction(body.get("systemInstruction")) {
-        messages.push(InternalMessage {
-            role: "system".to_string(),
-            content: vec![InternalContentBlock::Text(system_text)],
-        });
-    }
     if let Some(Value::Array(contents)) = body.get("contents") {
         for content in contents.iter().filter_map(Value::as_object) {
             let role = match content.get("role").and_then(Value::as_str) {
@@ -803,18 +716,7 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
         stream: path.contains("streamGenerateContent"),
         tools: parse_gemini_tools(body.get("tools")),
         tool_choice: body.get("toolConfig").cloned(),
-        extra: filter_keys(
-            body,
-            &[
-                "contents",
-                "model",
-                "tools",
-                "toolConfig",
-                "generationConfig",
-                "safetySettings",
-                "systemInstruction",
-            ],
-        ),
+        extra: filter_keys(body, &["contents", "model", "tools", "toolConfig", "generationConfig", "safetySettings"]),
     })
 }
 
@@ -857,23 +759,17 @@ fn emit_claude_chat(req: &InternalRequest) -> Value {
     }
     body.insert("messages".to_string(), Value::Array(messages));
     if !req.tools.is_empty() {
-        body.insert(
-            "tools".to_string(),
-            Value::Array(req.tools.iter().map(claude_tool).collect()),
-        );
+        body.insert("tools".to_string(), Value::Array(req.tools.iter().map(claude_tool).collect()));
     }
     if let Some(tool_choice) = &req.tool_choice {
-        body.insert(
-            "tool_choice".to_string(),
-            normalize_tool_choice_for_claude(tool_choice),
-        );
+        body.insert("tool_choice".to_string(), tool_choice.clone());
     }
     body.extend(req.extra.clone());
     Value::Object(body)
 }
 
 fn emit_openai_responses(req: &InternalRequest) -> Value {
-    let mut body = normalize_extra_for_openai_responses(&req.extra);
+    let mut body = Map::new();
     body.insert("model".to_string(), Value::String(req.model.clone()));
     body.insert("stream".to_string(), Value::Bool(req.stream));
 
@@ -891,27 +787,22 @@ fn emit_openai_responses(req: &InternalRequest) -> Value {
         input.push(responses_message(message));
     }
     if !instructions.is_empty() {
-        body.insert("instructions".to_string(), Value::String(instructions.join("\n\n")));
+        body.insert("instructions".to_string(), Value::String(instructions.join("\n")));
     }
-    if input.is_empty() {
-        body.insert("input".to_string(), Value::String(String::new()));
-    } else {
-        body.insert("input".to_string(), Value::Array(input));
-    }
+    body.insert("input".to_string(), Value::Array(input));
     if !req.tools.is_empty() {
         body.insert("tools".to_string(), Value::Array(req.tools.iter().map(responses_tool).collect()));
     }
     if let Some(tool_choice) = &req.tool_choice {
-        body.insert(
-            "tool_choice".to_string(),
-            normalize_tool_choice_for_openai_responses(tool_choice),
-        );
+        body.insert("tool_choice".to_string(), tool_choice.clone());
     }
+    body.extend(req.extra.clone());
     Value::Object(body)
 }
 
 fn emit_gemini_chat(req: &InternalRequest) -> Value {
     let mut body = Map::new();
+    body.insert("model".to_string(), Value::String(req.model.clone()));
     let contents = req
         .messages
         .iter()
@@ -919,22 +810,6 @@ fn emit_gemini_chat(req: &InternalRequest) -> Value {
         .map(gemini_message)
         .collect::<Vec<_>>();
     body.insert("contents".to_string(), Value::Array(contents));
-    let system_text = req
-        .messages
-        .iter()
-        .filter(|message| message.role == "system")
-        .flat_map(|message| message.content.iter())
-        .filter_map(|block| match block {
-            InternalContentBlock::Text(text) if !text.is_empty() => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !system_text.is_empty() {
-        body.insert(
-            "systemInstruction".to_string(),
-            json!({"parts": [{"text": system_text.join("\n") }]}),
-        );
-    }
     if !req.tools.is_empty() {
         body.insert("tools".to_string(), Value::Array(vec![json!({
             "functionDeclarations": req.tools.iter().map(gemini_tool_decl).collect::<Vec<_>>()
@@ -1242,7 +1117,7 @@ fn claude_tool(tool: &InternalTool) -> Value {
     json!({
         "name": tool.name,
         "description": tool.description,
-        "input_schema": normalize_claude_input_schema(&tool.input_schema)
+        "input_schema": tool.input_schema
     })
 }
 
@@ -1263,367 +1138,3 @@ fn gemini_tool_decl(tool: &InternalTool) -> Value {
     })
 }
 
-fn parse_gemini_system_instruction(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
-        Some(Value::Object(instruction)) => instruction
-            .get("parts")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter_map(Value::as_object)
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .filter(|text| !text.is_empty()),
-        _ => None,
-    }
-}
-
-fn normalize_claude_input_schema(schema: &Value) -> Value {
-    let mut schema = match schema {
-        Value::Object(map) if !map.is_empty() => map.clone(),
-        _ => Map::new(),
-    };
-
-    if schema.get("type").and_then(Value::as_str) != Some("object") {
-        schema.insert("type".to_string(), Value::String("object".to_string()));
-    }
-    if !matches!(schema.get("properties"), Some(Value::Object(_))) {
-        schema.insert("properties".to_string(), Value::Object(Map::new()));
-    }
-    if !matches!(schema.get("required"), Some(Value::Array(_)) | None) {
-        schema.remove("required");
-    }
-
-    Value::Object(schema)
-}
-
-fn normalize_tool_choice_for_claude(tool_choice: &Value) -> Value {
-    match tool_choice {
-        Value::String(mode) => match mode.as_str() {
-            "auto" => json!({"type": "auto"}),
-            "required" => json!({"type": "any"}),
-            "none" => json!({"type": "auto"}),
-            other => json!({"type": other}),
-        },
-        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
-            Some("function") => {
-                let name = choice
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        choice
-                            .get("function")
-                            .and_then(Value::as_object)
-                            .and_then(|function| function.get("name").and_then(Value::as_str))
-                    });
-                name.map(|name| json!({"type": "tool", "name": name}))
-                    .unwrap_or_else(|| json!({"type": "any"}))
-            }
-            Some("tool") if choice.get("name").and_then(Value::as_str).is_some() => {
-                json!({"type": "tool", "name": choice.get("name").and_then(Value::as_str).unwrap_or_default()})
-            }
-            Some("auto" | "any") => json!({"type": choice.get("type").and_then(Value::as_str).unwrap_or_default()}),
-            _ => tool_choice.clone(),
-        },
-        _ => tool_choice.clone(),
-    }
-}
-
-fn normalize_tool_choice_for_openai_responses(tool_choice: &Value) -> Value {
-    match tool_choice {
-        Value::String(mode) => match mode.as_str() {
-            "required" => json!({"type": "required"}),
-            "none" => json!({"type": "none"}),
-            "auto" => json!({"type": "auto"}),
-            other => Value::String(other.to_string()),
-        },
-        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
-            Some("function") => {
-                if let Some(name) = choice
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        choice
-                            .get("function")
-                            .and_then(Value::as_object)
-                            .and_then(|function| function.get("name").and_then(Value::as_str))
-                    })
-                {
-                    json!({"type": "function", "name": name})
-                } else {
-                    tool_choice.clone()
-                }
-            }
-            Some("tool") => choice
-                .get("name")
-                .and_then(Value::as_str)
-                .map(|name| json!({"type": "function", "name": name}))
-                .unwrap_or_else(|| tool_choice.clone()),
-            _ => tool_choice.clone(),
-        },
-        _ => tool_choice.clone(),
-    }
-}
-
-fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<String, Value> {
-    if extra.is_empty() {
-        return Map::new();
-    }
-
-    let mut out = extra.clone();
-
-    if !out.contains_key("max_output_tokens") {
-        let maybe_max = out
-            .get("max_tokens")
-            .and_then(Value::as_i64)
-            .or_else(|| out.get("max_completion_tokens").and_then(Value::as_i64));
-        if let Some(max_output_tokens) = maybe_max {
-            out.insert("max_output_tokens".to_string(), Value::Number(max_output_tokens.into()));
-        }
-    }
-    out.remove("max_tokens");
-    out.remove("max_completion_tokens");
-
-    let response_format = out.remove("response_format");
-    if let Some(response_format) = response_format {
-        if !out.contains_key("text") {
-            if let Some(text) = normalize_responses_text_format(&response_format) {
-                out.insert("text".to_string(), text);
-            }
-        }
-    }
-
-    if let Some(Value::Object(stream_options)) = out.get_mut("stream_options") {
-        stream_options.remove("include_usage");
-        if stream_options.is_empty() {
-            out.remove("stream_options");
-        }
-    }
-
-    for key in [
-        "messages",
-        "n",
-        "stop",
-        "frequency_penalty",
-        "presence_penalty",
-        "logit_bias",
-        "logprobs",
-    ] {
-        out.remove(key);
-    }
-
-    out
-}
-
-fn normalize_responses_text_format(response_format: &Value) -> Option<Value> {
-    let response_format = response_format.as_object()?;
-    let format = match response_format.get("type").and_then(Value::as_str) {
-        Some("json_schema") => {
-            let schema = response_format
-                .get("json_schema")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let mut format = Map::new();
-            format.insert("type".to_string(), Value::String("json_schema".to_string()));
-            format.insert(
-                "name".to_string(),
-                Value::String(
-                    schema
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("response")
-                        .to_string(),
-                ),
-            );
-            format.insert(
-                "schema".to_string(),
-                schema.get("schema").cloned().unwrap_or_else(|| json!({})),
-            );
-            if let Some(description) = schema.get("description") {
-                format.insert("description".to_string(), description.clone());
-            }
-            if let Some(strict) = schema.get("strict") {
-                format.insert("strict".to_string(), strict.clone());
-            }
-            Value::Object(format)
-        }
-        Some("json_object") | Some("text") => {
-            json!({"type": response_format.get("type").and_then(Value::as_str).unwrap_or_default()})
-        }
-        _ => return None,
-    };
-
-    Some(json!({"format": format}))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transforms_openai_chat_response_format_into_responses_text_format() {
-        let config = json!({
-            "format_transform": {
-                "enabled": true,
-                "from": "openai_chat",
-                "to": "openai_responses"
-            }
-        });
-        let body = json!({
-            "model": "gpt-4.1",
-            "messages": [{"role": "user", "content": "Return JSON"}],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "answer",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "value": {"type": "string"}
-                        }
-                    },
-                    "strict": true
-                }
-            },
-            "max_tokens": 64
-        });
-
-        let plan = process_request(&config, "/v1/chat/completions", &[], body).expect("request should transform");
-
-        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiResponses));
-        assert_eq!(plan.path, "/v1/responses");
-        assert_eq!(plan.body.get("response_format"), None);
-        assert_eq!(plan.body.get("max_tokens"), None);
-        assert_eq!(plan.body.get("max_output_tokens"), Some(&json!(64)));
-        assert_eq!(
-            plan.body.get("text"),
-            Some(&json!({
-                "format": {
-                    "type": "json_schema",
-                    "name": "answer",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "value": {"type": "string"}
-                        }
-                    },
-                    "strict": true
-                }
-            }))
-        );
-    }
-
-    #[test]
-    fn transforms_system_messages_into_gemini_system_instruction() {
-        let config = json!({
-            "format_transform": {
-                "enabled": true,
-                "from": "openai_chat",
-                "to": "gemini_chat"
-            }
-        });
-        let body = json!({
-            "model": "gemini-2.5-pro",
-            "messages": [
-                {"role": "system", "content": "Be terse"},
-                {"role": "user", "content": "Hello"}
-            ]
-        });
-
-        let plan = process_request(&config, "/v1/chat/completions", &[], body).expect("request should transform");
-
-        assert_eq!(plan.target_format, Some(RequestFormat::GeminiChat));
-        assert_eq!(
-            plan.body.get("systemInstruction"),
-            Some(&json!({"parts": [{"text": "Be terse"}]}))
-        );
-        assert_eq!(
-            plan.body.get("contents"),
-            Some(&json!([
-                {"role": "user", "parts": [{"text": "Hello"}]}
-            ]))
-        );
-    }
-
-    #[test]
-    fn normalizes_openai_tool_choice_for_claude_requests() {
-        let config = json!({
-            "format_transform": {
-                "enabled": true,
-                "from": "openai_chat",
-                "to": "claude_chat"
-            }
-        });
-        let body = json!({
-            "model": "claude-sonnet-4-5",
-            "messages": [{"role": "user", "content": "Hi"}],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": "lookup_weather"}
-            },
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "lookup_weather",
-                    "parameters": {"properties": {"city": {"type": "string"}}}
-                }
-            }]
-        });
-
-        let plan = process_request(&config, "/v1/chat/completions", &[], body).expect("request should transform");
-
-        assert_eq!(
-            plan.body.get("tool_choice"),
-            Some(&json!({"type": "tool", "name": "lookup_weather"}))
-        );
-        assert_eq!(
-            plan.body.pointer("/tools/0/input_schema/type"),
-            Some(&json!("object"))
-        );
-        assert_eq!(
-            plan.body.pointer("/tools/0/input_schema/properties/city/type"),
-            Some(&json!("string"))
-        );
-    }
-
-    #[test]
-    fn strict_parse_reports_format_mismatch_when_request_matches_excluded_format() {
-        let config = json!({
-            "format_transform": {
-                "enabled": true,
-                "from": "openai_chat",
-                "to": "claude_chat",
-                "strict_parse": true
-            }
-        });
-        let body = json!({
-            "contents": [{
-                "role": "user",
-                "parts": [{"text": "Hello"}]
-            }]
-        });
-
-        let err = process_request(
-            &config,
-            "/v1beta/models/gemini-2.5-flash:generateContent",
-            &[],
-            body,
-        )
-        .expect_err("strict parse should reject mismatched format");
-
-        match err {
-            RequestProcessError::StrictParse(message) => {
-                assert!(message.contains("Format mismatch"), "{message}");
-                assert!(message.contains("gemini_chat"), "{message}");
-                assert!(message.contains("openai_chat"), "{message}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-}

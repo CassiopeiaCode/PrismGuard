@@ -63,8 +63,12 @@ pub async fn proxy_entry(
     let (parts, body) = request.into_parts();
     let raw_body = to_bytes(body)
         .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, format!("failed to read body: {e}")))?;
+        .map_err(|e| {
+            ApiError::new(StatusCode::BAD_REQUEST, format!("failed to read body: {e}"))
+                .with_code("PROXY_ERROR")
+        })?;
     let request_json = parse_request_json(&parts.method, &parts.headers, &raw_body)?;
+    let source_format_hint = detect_source_format(&path, request_json.as_ref()).map(str::to_string);
     let mut request_body = request_json.clone().unwrap_or_else(|| Value::Object(Default::default()));
     let header_pairs = parts
         .headers
@@ -75,9 +79,12 @@ pub async fn proxy_entry(
         process_request(&parsed.config, &path, &header_pairs, request_body.clone()).map_err(|error| {
             match error {
                 RequestProcessError::StrictParse(message) | RequestProcessError::Transform(message) => {
+                    let moderation_details = moderation_details_for_message(&message);
                     ApiError::new(StatusCode::BAD_REQUEST, message)
                         .with_code("MODERATION_BLOCKED")
                         .with_error_type("moderation_error")
+                        .with_source_format(source_format_hint.clone())
+                        .with_moderation_details(moderation_details)
                 }
             }
         })?;
@@ -94,6 +101,7 @@ pub async fn proxy_entry(
         if request_json.is_some() {
             upstream_request = upstream_request.body(serde_json::to_vec(&request_body).map_err(|e| {
                 ApiError::new(StatusCode::BAD_REQUEST, format!("failed to encode transformed body: {e}"))
+                    .with_code("PROXY_ERROR")
             })?);
         } else {
             upstream_request = upstream_request.body(raw_body.clone());
@@ -239,7 +247,10 @@ fn build_response(
     }
     response
         .body(body)
-        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, format!("failed to build response: {e}")))
+        .map_err(|e| {
+            ApiError::new(StatusCode::BAD_GATEWAY, format!("failed to build response: {e}"))
+                .with_code("PROXY_ERROR")
+        })
 }
 
 fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
@@ -265,4 +276,76 @@ fn is_stream_response(headers: &reqwest::header::HeaderMap) -> bool {
 
 fn map_stream_error(error: reqwest::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, error)
+}
+
+fn detect_source_format(path: &str, body: Option<&Value>) -> Option<&'static str> {
+    let object = body.and_then(Value::as_object);
+
+    if path.contains("/v1/messages")
+        || object.is_some_and(|body| body.contains_key("anthropic_version"))
+    {
+        return Some("claude_chat");
+    }
+
+    if path.contains("/v1/responses")
+        || object.is_some_and(|body| {
+            body.get("object").and_then(Value::as_str) == Some("response")
+                || body.contains_key("input")
+        })
+    {
+        return Some("openai_responses");
+    }
+
+    if path.contains("/v1beta/models/")
+        || object.is_some_and(|body| body.contains_key("contents"))
+    {
+        return Some("gemini_chat");
+    }
+
+    if path.contains("/v1/chat/completions")
+        || object.is_some_and(|body| body.contains_key("messages"))
+    {
+        return Some("openai_chat");
+    }
+
+    None
+}
+
+fn moderation_details_for_message(message: &str) -> Option<Value> {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("concurrency") {
+        return Some(serde_json::json!({
+            "source": "concurrency_limit"
+        }));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn detect_source_format_uses_path_and_body_hints() {
+        assert_eq!(
+            detect_source_format(
+                "/v1/messages",
+                Some(&json!({
+                    "messages": []
+                }))
+            ),
+            Some("claude_chat")
+        );
+        assert_eq!(
+            detect_source_format(
+                "/proxy",
+                Some(&json!({
+                    "object": "response",
+                    "output": []
+                }))
+            ),
+            Some("openai_responses")
+        );
+    }
 }

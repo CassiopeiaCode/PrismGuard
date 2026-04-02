@@ -216,6 +216,8 @@ pub struct ApiError {
     message: String,
     code: &'static str,
     error_type: &'static str,
+    source_format: Option<String>,
+    moderation_details: Option<Value>,
 }
 
 impl ApiError {
@@ -225,6 +227,8 @@ impl ApiError {
             message: message.into(),
             code: "INTERNAL_ERROR",
             error_type: "proxy_error",
+            source_format: None,
+            moderation_details: None,
         }
     }
 
@@ -237,17 +241,31 @@ impl ApiError {
         self.error_type = error_type;
         self
     }
+
+    pub(crate) fn with_source_format(mut self, source_format: Option<impl Into<String>>) -> Self {
+        self.source_format = source_format.map(Into::into);
+        self
+    }
+
+    pub(crate) fn with_moderation_details(mut self, moderation_details: Option<Value>) -> Self {
+        self.moderation_details = moderation_details;
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let body = Json(json!({
-            "error": {
-                "code": self.code,
-                "message": self.message,
-                "type": self.error_type,
-            }
-        }));
+        let mut error = serde_json::Map::new();
+        error.insert("code".to_string(), Value::String(self.code.to_string()));
+        error.insert("message".to_string(), Value::String(self.message));
+        error.insert("type".to_string(), Value::String(self.error_type.to_string()));
+        if let Some(source_format) = self.source_format {
+            error.insert("source_format".to_string(), Value::String(source_format));
+        }
+        if let Some(moderation_details) = self.moderation_details {
+            error.insert("moderation_details".to_string(), moderation_details);
+        }
+        let body = Json(json!({ "error": Value::Object(error) }));
         (self.status, body).into_response()
     }
 }
@@ -255,5 +273,30 @@ impl IntoResponse for ApiError {
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, format!("{value:#}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::body::to_bytes;
+
+    #[tokio::test]
+    async fn api_error_includes_optional_proxy_metadata() {
+        let response = ApiError::new(StatusCode::BAD_REQUEST, "blocked")
+            .with_code("MODERATION_BLOCKED")
+            .with_error_type("moderation_error")
+            .with_source_format(Some("claude_chat"))
+            .with_moderation_details(Some(json!({
+                "source": "concurrency_limit"
+            })))
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body()).await.expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error"]["source_format"], "claude_chat");
+        assert_eq!(payload["error"]["moderation_details"]["source"], "concurrency_limit");
     }
 }

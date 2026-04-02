@@ -1,297 +1,310 @@
-# Rust HTTP Parity Design
+# Rust HTTP 一致性设计
 
-**Date:** 2026-04-03
-**Target:** `/services/apps/Prismguand-Rust`
-**Reference implementation:** `/services/apps/GuardianBridge-UV`
+**日期：** 2026-04-03  
+**目标项目：** `/services/apps/Prismguand-Rust`  
+**参考实现：** `/services/apps/GuardianBridge-UV`
 
-## Goal
+## 目标
 
-Continue the GuardianBridge Python-to-Rust rewrite with one acceptance criterion above all others: external HTTP behavior must match the Python implementation as closely as possible. Internal implementation details may differ, but request handling, response payloads, status codes, path rewriting, and stream behavior should be aligned with the Python service.
+继续推进 GuardianBridge 从 Python 到 Rust 的重构，并以“外部 HTTP 行为一致性”作为最高验收标准。  
+内部实现可以不同，但请求处理、响应结构、路径改写、流式输出和错误响应都必须满足客户端协议预期，并尽量与 Python 版保持行为一致。
 
-## Non-Goals
+## 非目标
 
-- Reproducing Python internals line-for-line
-- Large structural refactors before compatibility gaps are covered
-- Premature cleanup of Rust modules that are already functional
-- Introducing new user-visible behavior beyond parity with Python
+- 不要求逐行复刻 Python 内部实现
+- 不在补齐兼容性之前做大规模结构重构
+- 不为了“代码更优雅”而改变现有可用逻辑
+- 不主动引入任何超出 Python 版能力范围的用户可见行为
 
-## Acceptance Criteria
+## 验收标准
 
-The Rust service is considered aligned for a covered scenario when:
+当某个场景被纳入覆盖范围后，Rust 版本满足以下条件即可视为通过：
 
-1. The same incoming request shape produces the same effective upstream request semantics as Python.
-2. The same failure mode produces the same HTTP status code and near-identical JSON error structure.
-3. The same upstream response shape produces the same downstream non-stream or stream protocol shape.
-4. Path rewriting preserves business prefixes in the same way Python does.
-5. Compatibility is verified through black-box HTTP tests, not only internal unit tests.
+1. 相同输入请求会生成与 Python 版等价的上游请求语义。
+2. 相同失败场景会返回符合客户端协议格式的错误响应，不要求与 Python 完全相同。
+3. 相同上游响应会生成等价的下游普通响应或流式响应语义。
+4. 路径改写行为与 Python 一致，尤其是业务前缀保留规则。
+5. 一致性由黑盒 HTTP 测试验证，而不仅是内部单元测试。
 
-## Required Execution Constraint
+## 强制执行约束
 
-This repository has a local Rust environment, but any heavy operation must run inside a constrained `systemd-run` context capped at at most `2x` CPU cores.
+当前机器具备本地 Rust 运行环境，但所有重操作都必须放在 `systemd-run` 的受限环境中执行，并限制为最多 `2x` CPU 核心。
 
-This is a hard execution rule for:
+这是一条硬约束，适用于：
 
 - `cargo build`
 - `cargo test`
-- any heavy integration test runs
-- any compile-like or CPU-heavy verification command
+- 重型集成测试
+- 任何编译型或明显吃 CPU 的验证命令
 
-Lightweight read-only inspection commands may run normally. The implementation plan must embed this restriction directly into every heavy verification step.
+轻量级只读检查可以直接运行。后续 implementation plan 必须把这条约束直接写进每个重操作的执行步骤中，而不是临时口头遵守。
 
-## Current State Summary
+## 当前状态摘要
 
-The Rust project already covers a subset of the Python proxy behavior:
+Rust 项目目前已经覆盖了一部分 Python 代理行为：
 
-- URL config parsing exists
-- request format detection and request transformation exist
-- upstream forwarding exists
-- basic streamed passthrough exists
+- 已有 URL 配置解析
+- 已有请求格式识别和请求体转换
+- 已有上游请求转发
+- 已有基础的流式透传能力
 
-The main gaps against Python are:
+与 Python 版相比，主要差距仍然在：
 
-- request body decode and JSON fallback behavior are less complete
-- request decision logic is narrower than Python
-- upstream error passthrough is less precise
-- non-stream response conversion is missing or incomplete
-- stream protocol conversion and delayed-header validation are not yet parity-complete
+- 请求体解压和 JSON 失败回退行为还不完整
+- 请求处理决策链路比 Python 版更窄
+- 上游错误透传细节不足
+- 非流式响应格式转换仍缺失或不完整
+- 流式协议转换和延迟发送响应头校验尚未补齐
 
-## Compatibility Model
+## 一致性模型
 
-The project should optimize for behavioral parity, not structural symmetry. The Rust implementation may keep its current modules, but the end-to-end proxy path must behave like the Python version.
+本项目优化目标是“行为一致”，不是“结构对称”。  
+Rust 可以保留现有模块边界，但最终对外暴露出来的 HTTP 行为必须满足 Python 版本替代要求。
 
-The proxy path is defined as four compatibility stages:
+整个代理主链路拆分为四个兼容阶段：
 
-1. Request normalization
-2. Request decision and transformation
-3. Upstream forwarding
-4. Response adaptation
+1. 请求规范化
+2. 请求决策与转换
+3. 上游转发
+4. 响应适配
 
-Each stage should expose behavior that is observable from HTTP clients and tests.
+每个阶段的设计都要以“客户端能否观察到差异”为准。
 
-## Stage 1: Request Normalization
+## 阶段一：请求规范化
 
-Responsibilities:
+### 职责
 
-- parse `{config}${upstream}` URLs
-- support `!ENV_KEY${upstream}` config loading
-- preserve Python-compatible config parse error messages where practical
-- read request bodies for supported methods
-- handle compressed request bodies for `gzip`, `deflate`, and `br`
-- recover from JSON parse failures using Python-compatible fallback behavior
-- preserve the original upstream path and prefix information for later rewriting
+- 解析 `{config}${upstream}` 形式的 URL
+- 支持 `!ENV_KEY${upstream}` 形式的环境变量配置读取
+- 读取支持方法上的请求体
+- 处理 `gzip`、`deflate`、`br` 压缩请求体
+- 在 JSON 解析失败时执行与 Python 兼容的回退行为
+- 保留原始上游路径和前缀信息，供后续路径改写使用
 
-Required parity details:
+### 一致性要求
 
-- malformed config input should map to `CONFIG_PARSE_ERROR`-style responses
-- compressed JSON requests should be accepted when Python accepts them
-- unsupported or undecodable content-encoding failures should align with Python-visible error behavior
-- requests that Python treats as empty-object or passthrough should not become Rust-only hard failures
+- 非法配置输入要映射到明确的配置解析错误响应
+- Python 能接受的压缩 JSON 请求，Rust 也必须能接受
+- 不支持或解码失败的 `content-encoding` 要产生稳定、可预测的客户端错误
+- Python 视为“空对象”或“透传”的请求，Rust 不能无故变成更严格的失败
 
-## Stage 2: Request Decision And Transformation
+## 阶段二：请求决策与转换
 
-Responsibilities:
+### 职责
 
-- execute request format detection with Python-compatible precedence
-- enforce `strict_parse` behavior and error strings closely aligned with Python
-- honor `from`, `to`, and `auto`
-- support `disable_tools` compatibility behavior
-- build an internal request plan that captures:
-  - source format
-  - target format
-  - transformed body
-  - transformed path
-  - stream intent
-- surface source format and moderation-style metadata in Python-compatible error envelopes
+- 按 Python 兼容的优先级执行请求格式识别
+- 实现 `strict_parse` 行为，并对调用方返回协议正确的错误响应
+- 正确处理 `from`、`to`、`auto`
+- 支持 `disable_tools` 的兼容行为
+- 构造统一的内部请求计划，至少包含：
+  - 源格式
+  - 目标格式
+  - 转换后的 body
+  - 转换后的 path
+  - 是否流式
+- 在合适场景下携带 `source_format`、审核详情等结构化元数据
 
-Required parity details:
+### 一致性要求
 
-- undetected requests in non-strict mode must pass through unchanged
-- strict parse failures must produce Python-compatible error semantics
-- transformed paths must target the same endpoint families as Python
-- source format metadata should be present in error responses when Python includes it
+- 非严格模式下，无法识别的请求必须原样透传
+- 严格解析失败时，必须返回属于正确协议族的错误结构
+- 路径改写必须命中与 Python 相同的目标 API 端点族
+- `source_format` 等元数据只在对目标协议格式兼容时返回
 
-## Stage 3: Upstream Forwarding
+## 阶段三：上游转发
 
-Responsibilities:
+### 职责
 
-- filter request headers using Python-compatible deny/allow rules
-- force `Accept-Encoding: identity` where Python does
-- add Gemini `alt=sse` for streaming Gemini requests
-- forward request body in raw or transformed form as required
-- preserve upstream path prefixes when a transformed endpoint replaces only the API suffix
-- distinguish stream and non-stream upstream handling
+- 按 Python 兼容语义过滤请求头
+- 在需要时强制 `Accept-Encoding: identity`
+- 对 Gemini 流式请求补齐 `alt=sse`
+- 根据是否转换决定发送原始 body 还是转换后的 body
+- 在路径转换时保留业务前缀，仅替换 API 端点部分
+- 区分流式和非流式上游转发逻辑
 
-Required parity details:
+### 一致性要求
 
-- non-200 upstream responses must be passed through with matching status code and raw body semantics
-- content type should be preserved where Python preserves it
-- response header filtering should follow Python behavior for security- and transport-related headers
-- upstream transport failures should map to Python-style `UPSTREAM_ERROR` or `PROXY_ERROR` envelopes
+- 非 200 上游响应要保留状态码和原始响应语义
+- Python 保留的 `content-type`，Rust 也应保留
+- 安全类、传输类响应头的过滤行为要与 Python 保持同类语义
+- 上游传输错误必须映射为符合客户端协议的错误响应
 
-## Stage 4: Response Adaptation
+## 阶段四：响应适配
 
-Responsibilities:
+### 职责
 
-- support non-stream response conversion when source and target formats differ
-- support stream protocol conversion between:
+- 在源格式和目标格式不同的情况下支持非流式响应转换
+- 支持以下四类协议之间的流式协议转换：
   - `openai_chat`
   - `openai_responses`
   - `claude_chat`
   - `gemini_chat`
-- preserve pass-through behavior when no conversion is required
-- support delayed stream header behavior before committing an SSE response
-- surface pre-stream validation failures as normal JSON errors if headers were not yet sent
+- 在无需转换时保留透传语义
+- 支持延迟发送流式响应头
+- 在响应头尚未发出前，把预读失败或内容校验失败转换成普通错误响应
 
-Required parity details:
+### 一致性要求
 
-- non-stream JSON responses should be convertible from upstream format back to client format
-- non-JSON upstream responses should still pass through as Python does
-- transformed streams must remain incrementally consumable
-- delayed-header validation must fail early in the same class of cases as Python
-- once stream headers are committed, behavior must remain streaming and cannot degrade into a late JSON error
+- 非流式 JSON 响应应能从上游格式转换回客户端格式
+- 非 JSON 上游响应仍要按 Python 的思路进行透传
+- 转换后的流必须保持增量可消费，不能先完整缓存再吐出
+- `delay_stream_header` 的失败边界要与 Python 属于同一类语义
+- 一旦流式响应头已经发出，就不能再退化成普通 JSON 错误响应
 
-## Error Model
+## 错误模型
 
-Rust should normalize externally visible failures into Python-compatible envelopes:
+Rust 的错误响应不需要逐字逐句复刻 Python。  
+真正的要求是：错误响应必须符合当前客户端面对的那一种协议规范。
 
-```json
-{
-  "error": {
-    "code": "SOME_CODE",
-    "message": "Human-readable message",
-    "type": "some_error_type"
-  }
-}
-```
+本项目支持的四类客户端协议为：
 
-Additional fields should be included when Python includes them, especially:
+1. `openai_chat`
+2. `openai_responses`
+3. `claude_chat`
+4. `gemini_chat`
+
+### 设计规则
+
+- 错误响应必须是目标客户端协议可接受的合法结构
+- 顶层字段形状必须符合该协议族习惯
+- 必须包含稳定的机器可读错误码
+- 必须包含人类可读错误信息
+- Rust 可以使用自己的错误文案，也允许使用与 Python 不完全相同的状态码，只要协议正确且语义稳定
+
+### 内部错误分类
+
+实现层内部仍应区分以下失败类别，便于统一映射：
+
+1. 配置解析失败
+2. 请求解析或严格解析失败
+3. 审核失败
+4. 代理或上游传输失败
+5. 流式预读失败或流式内容校验失败
+
+### 结构化元数据
+
+在不破坏目标协议错误结构的前提下，Rust 可以附带这些结构化信息：
 
 - `source_format`
-- `moderation_details`
+- 审核详情
+- 其他有助于调试或兼容的元数据
 
-Priority compatibility targets:
+但前提是这些字段符合目标协议的错误响应承载方式，不能为了保留 Python 风格字段而破坏协议兼容性。
 
-1. `CONFIG_PARSE_ERROR`
-2. `MODERATION_BLOCKED`
-3. `PROXY_ERROR`
-4. `UPSTREAM_ERROR`
-5. stream pre-read / upstream stream validation failures
+## 路径改写规则
 
-Absolute string identity is not required for every message, but status code, top-level error shape, and field presence must be kept as close as practical.
+路径改写必须遵循 Python 的语义：
 
-## Path Rewriting Rules
+- 如果上游 URL 只有 API 端点，则直接替换为转换后的端点
+- 如果上游 URL 是“业务前缀 + API 端点”，则只替换 API 端点部分，保留业务前缀
+- 如果找不到可识别的 API 端点后缀，则直接使用转换后的路径
 
-Path rewriting must match Python semantics:
-
-- if the upstream URL is only an API endpoint, replace it directly with the transformed endpoint
-- if the upstream URL contains a business prefix plus an API endpoint, retain the prefix and replace only the API endpoint suffix
-- if no recognizable API suffix exists, use the transformed path directly
-
-Examples:
+### 示例
 
 - `/v1/messages` -> `/v1/chat/completions`
 - `/secret_endpoint/v1/messages` -> `/secret_endpoint/v1/chat/completions`
-- `/proxy/google/v1beta/models/gemini-2.5-flash:streamGenerateContent` -> `/proxy/google/v1/chat/completions` when converting Gemini request format to OpenAI Chat
+- `/proxy/google/v1beta/models/gemini-2.5-flash:streamGenerateContent` 在 Gemini 请求转 OpenAI Chat 时，应改写为 `/proxy/google/v1/chat/completions`
 
-## Recommended Delivery Order
+## 推荐交付顺序
 
-Implementation should proceed in three batches:
+实现建议分成三个批次推进：
 
-### Batch 1: High-Value HTTP Parity
+### 批次一：高价值 HTTP 一致性
 
-- request normalization parity
-- path rewriting parity
-- upstream non-200 passthrough
-- Python-style error envelope alignment
+- 请求规范化补齐
+- 路径改写补齐
+- 上游非 200 透传补齐
+- 各协议错误响应映射补齐
 
-This batch should maximize compatibility gains for ordinary request/response traffic with minimal structural churn.
+这一批优先覆盖普通请求和普通失败路径，兼容收益最高，改动风险最低。
 
-### Batch 2: Non-Stream Response Parity
+### 批次二：非流式响应一致性
 
-- response body parsing parity
-- non-stream format conversion
-- non-JSON passthrough behavior
+- 响应体解析补齐
+- 非流式响应格式转换补齐
+- 非 JSON 透传补齐
 
-This batch should complete most ordinary API compatibility scenarios before tackling stream complexity.
+这一批完成后，绝大多数普通 API 调用路径应能达到可替换水平。
 
-### Batch 3: Stream Parity
+### 批次三：流式一致性
 
-- SSE protocol conversion
-- delayed stream header validation
-- Gemini streaming quirks
-- pre-read failure behavior
+- SSE 协议转换
+- 延迟发送响应头校验
+- Gemini 流式特殊处理
+- 预读失败处理
 
-This batch is intentionally isolated because it has the highest complexity and regression risk.
+这一批复杂度最高，应该单独收尾，避免和普通响应逻辑混杂修改。
 
-## Testing Strategy
+## 测试策略
 
-Behavioral parity must be validated with black-box tests first, then supported with lower-level unit coverage.
+一致性验证以黑盒 HTTP 测试为主，内部单元测试为辅。
 
-### Test Types
+### 测试类型
 
-1. Request-processing unit tests
-   Cover detection order, strict parse behavior, path rewriting, and transformed request bodies.
+1. 请求处理单元测试  
+   覆盖格式识别顺序、严格解析、路径改写、请求体转换等纯逻辑行为。
 
-2. Proxy-level integration tests with a fake upstream
-   Cover:
-   - non-200 passthrough
-   - non-JSON passthrough
-   - request transformation across supported formats
-   - non-stream response conversion
-   - stream protocol conversion
-   - delayed-header validation failures
+2. 代理级集成测试  
+   通过本地假上游覆盖：
+   - 非 200 透传
+   - 非 JSON 透传
+   - 多格式请求转换
+   - 非流式响应转换
+   - 流式协议转换
+   - 延迟发送响应头失败场景
 
-3. Regression cases copied from Python-observed behavior
-   When a Python/Rust mismatch is found, add a test that captures the external HTTP delta before fixing Rust.
+3. 回归测试  
+   只要发现 Python 与 Rust 的外部 HTTP 行为不一致，就先补一个黑盒回归用例，再修实现。
 
-### Test Standard
+### 测试原则
 
-For each compatibility gap:
+每一个兼容性缺口都按以下顺序处理：
 
-1. write a failing test against Rust behavior
-2. verify the test fails for the expected reason
-3. implement the minimal fix
-4. re-run the constrained verification command
+1. 先写失败测试
+2. 确认测试以预期原因失败
+3. 用最小改动修复实现
+4. 用受限的 `systemd-run` 命令重新验证
 
-## Design Decisions
+## 关键设计决策
 
-### Decision 1: Favor compatibility wrappers over big refactors
+### 决策一：先做兼容层，不先做大重构
 
-Rust should keep its current module layout unless a boundary actively blocks parity work. The project needs parity first, elegance second.
+除非当前模块边界已经直接阻碍兼容性实现，否则优先保留现有 Rust 结构。当前目标是替代可用性，不是代码美学。
 
-### Decision 2: Use Python as the behavioral oracle
+### 决策二：Python 是行为参考，不是错误响应模板
 
-When Rust behavior and Python behavior differ, Python wins unless the difference is clearly accidental or harmful. The primary objective is replacement compatibility.
+对于请求转发、路径改写、普通响应和流式响应，Python 仍然是主要行为参考。  
+但错误响应只要求协议正确，不要求逐字照搬 Python。
 
-### Decision 3: Separate non-stream and stream work
+### 决策三：流式和非流式分开交付
 
-Stream behavior has materially different failure boundaries and output guarantees. It should not be coupled to the simpler non-stream conversion work.
+流式输出在缓冲、 framing、工具调用增量和失败边界上都更复杂，因此必须单独成批处理。
 
-### Decision 4: Preserve black-box observability
+### 决策四：以黑盒可观察行为为准
 
-Tests should validate what clients actually receive, not only internal request plans. This prevents false confidence from internal equivalence that does not produce the same HTTP behavior.
+一致性不能只看内部 `request plan` 或转换结果，还必须验证客户端最终收到的 HTTP 输出。
 
-## Risks
+## 风险
 
-1. Overfitting to current Python bugs
-   Some Python behavior may be incidental rather than desirable. For this project, compatibility still takes precedence unless the user explicitly chooses to diverge.
+1. 对 Python 行为过拟合  
+   某些 Python 细节可能只是偶然实现，不一定是理想行为。当前阶段兼容优先，但错误响应部分已明确允许合理偏离。
 
-2. Stream complexity
-   SSE conversion can fail in subtle ways around framing, buffering, and tool-call deltas. This is why stream parity is deferred to its own batch.
+2. 流式转换复杂度高  
+   SSE 协议转换在 framing、缓冲和工具调用增量处理上都容易出边界问题，因此必须后置。
 
-3. Dirty worktree interaction
-   The current Rust repository already contains unrelated local changes. Implementation work must avoid reverting or trampling those edits.
+3. 当前工作区已有未完成改动  
+   Rust 仓库现在不是干净工作区，后续实现必须避免覆盖或回退已有本地修改。
 
-4. Verification cost
-   Rust compile-and-test cycles can be expensive, so the `systemd-run` CPU cap is mandatory and must be baked into the plan rather than applied ad hoc.
+4. 验证成本高  
+   Rust 编译和测试比较重，因此 CPU 限制必须内建到执行计划中，而不能依赖临时自觉。
 
-## Open Implementation Constraint
+## 下一步
 
-The next step is not implementation. The next step is a concrete implementation plan that maps this design into:
+下一步不是直接改实现，而是把这份设计展开成一份可执行的 implementation plan，内容至少包括：
 
-- exact files to modify or create
-- exact tests to write first
-- exact constrained verification commands
-- a batch order that preserves a working tree throughout
+- 需要新建或修改的准确文件路径
+- 每一步要先写的失败测试
+- 每一步对应的受限验证命令
+- 保持工作区稳定推进的批次拆分方式
 
-That plan should use TDD and assume zero prior context for the executor.
+implementation plan 必须遵循 TDD，并假设执行者对当前代码库几乎没有上下文。
