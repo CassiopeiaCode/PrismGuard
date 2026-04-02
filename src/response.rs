@@ -151,7 +151,7 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
         }]
     });
 
-    if let Some(created) = created {
+    if let Some(created) = created.filter(|value| !value.is_null()) {
         response["created"] = created;
     }
 
