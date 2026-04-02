@@ -103,6 +103,10 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
                 }
             }
             Some("function_call") => {
+                let arguments = last_item
+                    .get("arguments")
+                    .map(stringify_function_arguments)
+                    .unwrap_or_else(|| json!(""));
                 message.insert(
                     "tool_calls".to_string(),
                     json!([{
@@ -114,10 +118,7 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
                         "type": "function",
                         "function": {
                             "name": last_item.get("name").cloned().unwrap_or_else(|| json!("")),
-                            "arguments": last_item
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or_else(|| json!(""))
+                            "arguments": arguments
                         }
                     }]),
                 );
@@ -180,6 +181,13 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
     }
 
     Ok(response)
+}
+
+fn stringify_function_arguments(arguments: &Value) -> Value {
+    match arguments {
+        Value::String(_) => arguments.clone(),
+        _ => Value::String(serde_json::to_string(arguments).unwrap_or_else(|_| String::new())),
+    }
 }
 
 fn map_finish_reason(status: Option<&str>) -> Value {
