@@ -41,20 +41,42 @@
 
 ## 当前状态摘要
 
-Rust 项目目前已经覆盖了一部分 Python 代理行为：
+Rust 项目目前已经覆盖了 HTTP 协议一致性的主体链路，且关键路径已经被黑盒测试锁住：
 
 - 已有 URL 配置解析
 - 已有请求格式识别和请求体转换
 - 已有上游请求转发
-- 已有基础的流式透传能力
+- 已有流式协议转换与延迟发送响应头校验
+- 已有 `openai_chat -> openai_responses` 请求归一化黑盒覆盖
+- 已有 `openai_responses -> openai_chat` 非流/流式响应转换黑盒覆盖
 
-与 Python 版相比，主要差距仍然在：
+截至当前 checkpoint，已完成的高价值一致性包括：
 
-- 请求体解压和 JSON 失败回退行为还不完整
-- 请求处理决策链路比 Python 版更窄
-- 上游错误透传细节不足
-- 非流式响应格式转换仍缺失或不完整
-- 流式协议转换和延迟发送响应头校验尚未补齐
+- 压缩 JSON 请求体解码
+- 业务前缀路径保留
+- `!ENV_KEY${upstream}` 配置 URL
+- Gemini 流式请求自动追加 `?alt=sse`
+- 上游非 200 JSON 原样透传
+- `response_format`、`max_tokens/max_completion_tokens`、`stream_options.include_usage`、`tool_choice` 等请求参数按 Python 语义归一
+- 非流 `responses -> chat` 的文本、工具调用、图片、reasoning、usage、finish_reason、额外字段透传
+- 流式 `responses -> chat` 的文本 delta、工具调用 delta、`arguments` 缓冲回放、终态补尾和 usage 规整
+- `created` / `usage` / `finish_reason` 等空值与缺失字段行为按 Python 基线收紧
+
+当前剩余差距已经明显下降，更多集中在极低收益的字段存在性边角，而不是主链路缺失。
+
+## 最新验证基线
+
+截至当前文档更新时，以下黑盒测试基线已经稳定通过：
+
+- `http_proxy_request_tests`: `21/21`
+- `http_proxy_response_tests`: `26/26`
+- `http_proxy_stream_tests`: `18/18`
+
+所有重型验证命令都通过以下前缀执行：
+
+```bash
+systemd-run --scope -p AllowedCPUs=0,1
+```
 
 ## 一致性模型
 
@@ -293,7 +315,7 @@ Rust 的错误响应不需要逐字逐句复刻 Python。
    SSE 协议转换在 framing、缓冲和工具调用增量处理上都容易出边界问题，因此必须后置。
 
 3. 当前工作区已有未完成改动  
-   Rust 仓库现在不是干净工作区，后续实现必须避免覆盖或回退已有本地修改。
+   该风险在当前阶段已下降。最近几轮 checkpoint 后工作区保持干净，但后续继续补功能时仍要避免误回退用户改动。
 
 4. 验证成本高  
    Rust 编译和测试比较重，因此 CPU 限制必须内建到执行计划中，而不能依赖临时自觉。

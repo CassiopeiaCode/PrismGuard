@@ -8,6 +8,40 @@
 
 **Tech Stack:** Rust 2021、axum、reqwest、tokio、serde_json、hyper、brotli、flate2
 
+## 执行进展
+
+截至当前计划更新时，HTTP 一致性主链路已经基本完成，计划中的高价值部分已经落地并通过黑盒验证。
+
+当前稳定基线：
+
+- `http_proxy_request_tests`: `21/21`
+- `http_proxy_response_tests`: `26/26`
+- `http_proxy_stream_tests`: `18/18`
+
+已经稳定实现并锁定的行为包括：
+
+- 请求侧：
+  - 压缩 JSON 请求体解码
+  - 业务前缀路径保留
+  - `!ENV_KEY${upstream}` 配置 URL
+  - Gemini 流式 `?alt=sse`
+  - 上游非 200 JSON 原样透传
+  - `openai_chat -> openai_responses` 的 `response_format`、`max_tokens/max_completion_tokens`、`stream_options.include_usage`、`tool_choice` 等参数归一
+- 非流响应：
+  - `openai_responses -> openai_chat` 的文本、工具调用、图片、reasoning、usage、finish_reason 和额外字段透传
+  - `function_call.arguments` 对象转 JSON 字符串
+  - `created` / `usage` 的缺失与 `null` 行为按 Python 基线收紧
+- 流响应：
+  - 文本 delta
+  - 工具调用增量
+  - 参数先到后补名字/`output_item.added` 的缓冲回放
+  - `response.in_progress` 起始
+  - `response.completed/failed/incomplete/error` 的终态映射
+  - 最终 chunk 的 usage 规整
+  - 缺失 created 时的非零时间戳补齐
+
+当前剩余工作更偏向低收益边角审计，而不是主功能缺失。后续继续沿本计划执行时，应优先补文档和极少数未被黑盒锁住的字段存在性细节，而不是再做大块重构。
+
 ---
 
 ## 文件结构
