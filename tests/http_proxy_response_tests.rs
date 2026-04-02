@@ -124,6 +124,55 @@ async fn upstream_openai_responses_function_call_is_transformed_back_to_chat_too
 }
 
 #[tokio::test]
+async fn upstream_openai_responses_function_call_object_arguments_are_stringified_for_chat() {
+    let upstream_base = spawn_json_upstream(json!({
+        "id": "resp_tool_object_args",
+        "object": "response",
+        "model": "gpt-4.1-mini",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "lookup_weather",
+            "arguments": {
+                "city": "Paris"
+            }
+        }]
+    }))
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "weather?"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Paris\"}"
+    );
+}
+
+#[tokio::test]
 async fn upstream_openai_responses_usage_is_preserved_in_chat_response() {
     let upstream_body = json!({
         "id": "resp_usage",
