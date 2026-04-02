@@ -471,6 +471,205 @@ async fn openai_chat_request_normalizes_text_response_format_for_responses_upstr
     );
 }
 
+#[tokio::test]
+async fn openai_chat_request_normalizes_json_object_response_format_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_object"
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.json_body.get("response_format"), None);
+    assert_eq!(
+        request.json_body["text"],
+        json!({
+            "format": {
+                "type": "json_object"
+            }
+        })
+    );
+}
+
+#[tokio::test]
+async fn openai_chat_request_keeps_string_tool_choice_auto_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "auto"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.json_body["tool_choice"], "auto");
+}
+
+#[tokio::test]
+async fn openai_chat_request_keeps_string_tool_choice_none_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "none"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.json_body["tool_choice"], "none");
+}
+
+#[tokio::test]
+async fn openai_chat_request_keeps_string_tool_choice_required_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.json_body["tool_choice"], "required");
+}
+
+#[tokio::test]
+async fn openai_chat_request_normalizes_tool_tool_choice_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {
+                "type": "tool",
+                "name": "lookup_weather"
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(
+        request.json_body["tool_choice"],
+        json!({
+            "type": "function",
+            "name": "lookup_weather"
+        })
+    );
+}
+
 async fn spawn_upstream_echo_server() -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
     let state = UpstreamState {
         seen: Arc::new(Mutex::new(Vec::new())),

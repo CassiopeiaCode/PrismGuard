@@ -176,10 +176,11 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
     Ok(response)
 }
 
-fn map_finish_reason(status: Option<&str>) -> &'static str {
-    match status.unwrap_or_default().to_ascii_lowercase().as_str() {
-        "incomplete" => "length",
-        "failed" => "error",
-        _ => "stop",
+fn map_finish_reason(status: Option<&str>) -> Value {
+    match status.map(str::to_ascii_lowercase).as_deref() {
+        Some("completed") => json!("stop"),
+        Some("incomplete") => json!("length"),
+        Some("failed") => json!("error"),
+        _ => Value::Null,
     }
 }

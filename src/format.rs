@@ -1336,12 +1336,7 @@ fn normalize_tool_choice_for_claude(tool_choice: &Value) -> Value {
 
 fn normalize_tool_choice_for_openai_responses(tool_choice: &Value) -> Value {
     match tool_choice {
-        Value::String(mode) => match mode.as_str() {
-            "required" => json!({"type": "required"}),
-            "none" => json!({"type": "none"}),
-            "auto" => json!({"type": "auto"}),
-            other => Value::String(other.to_string()),
-        },
+        Value::String(_) => tool_choice.clone(),
         Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
             Some("function") => {
                 if let Some(name) = choice
