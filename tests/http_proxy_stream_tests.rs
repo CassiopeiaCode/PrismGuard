@@ -185,6 +185,39 @@ async fn responses_incomplete_event_maps_to_chat_length_finish_reason() {
 }
 
 #[tokio::test]
+async fn responses_error_event_maps_to_chat_error_finish_reason() {
+    let upstream_base = spawn_error_event_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"finish_reason\":\"error\""), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test]
 async fn responses_completed_event_emits_done_even_without_upstream_done_marker() {
     let upstream_base = spawn_completed_without_done_sse_upstream().await;
     let proxy_base = spawn_proxy_server().await;
@@ -283,6 +316,41 @@ async fn responses_tool_call_arguments_buffer_until_output_item_added() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.expect("sse body");
     assert!(body.contains("\"id\":\"call_buf_1\""), "{body}");
+    assert!(body.contains("\"name\":\"lookup_weather\""), "{body}");
+    assert!(body.contains("\\\"city\\\":\\\"Paris\\\""), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+}
+
+#[tokio::test]
+async fn responses_function_call_delta_arguments_field_maps_to_chat_tool_call_delta() {
+    let upstream_base = spawn_function_call_delta_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "weather?"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"id\":\"call_delta_1\""), "{body}");
     assert!(body.contains("\"name\":\"lookup_weather\""), "{body}");
     assert!(body.contains("\\\"city\\\":\\\"Paris\\\""), "{body}");
     assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
@@ -426,6 +494,41 @@ async fn spawn_incomplete_sse_upstream() -> String {
     format!("http://{}", addr)
 }
 
+async fn spawn_error_event_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_error_event\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"message\":\"boom\"}\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("error event sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind error event upstream");
+    let addr = listener.local_addr().expect("error event upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("error event upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
 async fn spawn_completed_without_done_sse_upstream() -> String {
     let payload = concat!(
         "event: response.created\n",
@@ -533,6 +636,45 @@ async fn spawn_buffered_tool_call_sse_upstream() -> String {
             .serve(app.into_make_service())
             .await
             .expect("buffered tool call upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_function_call_delta_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_delta\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_delta_1\",\"call_id\":\"call_delta_1\",\"name\":\"lookup_weather\"}}\n\n",
+        "event: response.function_call.delta\n",
+        "data: {\"type\":\"response.function_call.delta\",\"call_id\":\"call_delta_1\",\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_delta\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("function call delta sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind function call delta upstream");
+    let addr = listener.local_addr().expect("function call delta upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("function call delta upstream server");
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 

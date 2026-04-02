@@ -243,6 +243,234 @@ async fn env_backed_proxy_config_is_accepted_in_url() {
     assert_eq!(request.json_body["messages"][0]["content"], "hello");
 }
 
+#[tokio::test]
+async fn openai_chat_request_normalizes_response_format_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string"}
+                        }
+                    },
+                    "strict": true
+                }
+            },
+            "max_tokens": 64
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(request.json_body.get("response_format"), None);
+    assert_eq!(request.json_body["max_output_tokens"], 64);
+    assert_eq!(request.json_body["text"]["format"]["type"], "json_schema");
+    assert_eq!(request.json_body["text"]["format"]["name"], "answer");
+    assert_eq!(request.json_body["text"]["format"]["strict"], true);
+}
+
+#[tokio::test]
+async fn openai_chat_request_normalizes_max_completion_tokens_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "max_completion_tokens": 77
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(request.json_body.get("max_completion_tokens"), None);
+    assert_eq!(request.json_body["max_output_tokens"], 77);
+}
+
+#[tokio::test]
+async fn openai_chat_request_strips_stream_include_usage_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream_options": {
+                "include_usage": true,
+                "test_marker": 1
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(request.json_body["stream"], true);
+    assert_eq!(request.json_body["stream_options"].get("include_usage"), None);
+    assert_eq!(request.json_body["stream_options"]["test_marker"], 1);
+}
+
+#[tokio::test]
+async fn openai_chat_request_normalizes_function_tool_choice_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather"
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(
+        request.json_body["tool_choice"],
+        json!({
+            "type": "function",
+            "name": "lookup_weather"
+        })
+    );
+}
+
+#[tokio::test]
+async fn openai_chat_request_normalizes_text_response_format_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "text"
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.json_body.get("response_format"), None);
+    assert_eq!(
+        request.json_body["text"],
+        json!({
+            "format": {
+                "type": "text"
+            }
+        })
+    );
+}
+
 async fn spawn_upstream_echo_server() -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
     let state = UpstreamState {
         seen: Arc::new(Mutex::new(Vec::new())),
