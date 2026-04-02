@@ -11,7 +11,9 @@ use hyper::body::to_bytes;
 use serde_json::Value;
 
 use crate::format::{process_request, RequestProcessError};
+use crate::response::maybe_transform_json_response;
 use crate::routes::{parse_url_config, ApiError, AppState};
+use crate::streaming::maybe_transform_sse;
 
 const HEADER_DENYLIST: &[&str] = &[
     "content-length",
@@ -88,8 +90,13 @@ pub async fn proxy_entry(
                 }
             }
         })?;
-    let final_url = format!("{}{}", upstream_base, request_plan.path);
     let is_stream = request_plan.stream;
+    let final_url = build_upstream_url(
+        &upstream_base,
+        &request_plan.path,
+        request_plan.target_format,
+        is_stream,
+    );
     request_body = request_plan.body;
 
     let mut upstream_request = state
@@ -129,7 +136,21 @@ pub async fn proxy_entry(
         "proxied request"
     );
 
-    build_proxy_response(upstream_response).await
+    let delay_stream_header = parsed
+        .config
+        .get("format_transform")
+        .and_then(Value::as_object)
+        .and_then(|cfg| cfg.get("delay_stream_header"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    build_proxy_response(
+        upstream_response,
+        request_plan.source_format,
+        request_plan.target_format,
+        delay_stream_header,
+    )
+    .await
 }
 
 fn parse_request_json(
@@ -216,20 +237,75 @@ fn filtered_request_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-async fn build_proxy_response(upstream_response: reqwest::Response) -> Result<Response, ApiError> {
+fn build_upstream_url(
+    upstream_base: &str,
+    path: &str,
+    target_format: Option<crate::format::RequestFormat>,
+    is_stream: bool,
+) -> String {
+    let mut url = format!("{upstream_base}{path}");
+    if target_format == Some(crate::format::RequestFormat::GeminiChat)
+        && is_stream
+        && path.contains("streamGenerateContent")
+        && !url.contains("alt=sse")
+    {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        url.push(separator);
+        url.push_str("alt=sse");
+    }
+    url
+}
+
+async fn build_proxy_response(
+    upstream_response: reqwest::Response,
+    client_format: Option<crate::format::RequestFormat>,
+    upstream_format: Option<crate::format::RequestFormat>,
+    delay_stream_header: bool,
+) -> Result<Response, ApiError> {
     let status = upstream_response.status();
     let headers = filtered_response_headers(upstream_response.headers());
 
     if is_stream_response(upstream_response.headers()) {
-        let stream = upstream_response.bytes_stream().map_err(map_stream_error);
-        let body = boxed(StreamBody::new(stream));
-        build_response(status, &headers, body)
+        let body = upstream_response
+            .bytes()
+            .await
+            .context("failed to read upstream stream body")
+            .map_err(ApiError::from)?;
+        if delay_stream_header && body.iter().all(u8::is_ascii_whitespace) {
+            return Err(
+                ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Stream disconnected before valid content: Stream ended without any content",
+                )
+                .with_code("UPSTREAM_STREAM_ERROR")
+                .with_error_type("upstream_stream_error"),
+            );
+        }
+        if let Some(transformed) = maybe_transform_sse(&body, upstream_format, client_format) {
+            build_response(status, &headers, boxed(Body::from(transformed)))
+        } else {
+            build_response(status, &headers, boxed(Body::from(body)))
+        }
     } else {
         let body = upstream_response
             .bytes()
             .await
             .context("failed to read upstream body")
             .map_err(ApiError::from)?;
+        if status.is_success() {
+            if let Ok(json_body) = serde_json::from_slice::<Value>(&body) {
+                let transformed =
+                    maybe_transform_json_response(json_body, upstream_format, client_format)?;
+                let encoded = serde_json::to_vec(&transformed).map_err(|e| {
+                    ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("failed to encode transformed response body: {e}"),
+                    )
+                    .with_code("PROXY_ERROR")
+                })?;
+                return build_response(status, &headers, boxed(Body::from(encoded)));
+            }
+        }
         build_response(status, &headers, boxed(Body::from(body)))
     }
 }

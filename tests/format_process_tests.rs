@@ -140,6 +140,56 @@ fn strict_parse_returns_error_when_detection_fails() {
 }
 
 #[test]
+fn strict_parse_reports_detected_but_disallowed_format() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_chat"
+        }
+    });
+
+    let error = process_request(
+        &config,
+        "/v1/messages",
+        &[("anthropic-version".to_string(), "2023-06-01".to_string())],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "anthropic_version": "2023-06-01",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .expect_err("strict mode should reject mismatched formats");
+
+    match error {
+        RequestProcessError::StrictParse(message) => {
+            assert!(message.contains("Format mismatch"));
+            assert!(message.contains("claude_chat"));
+            assert!(message.contains("openai_chat"));
+        }
+        other => panic!("expected strict parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn preserves_business_prefix_when_rewriting_path() {
+    let plan = process_request(
+        &transform_config(true, "openai_chat"),
+        "/secret_endpoint/v1/messages",
+        &[("anthropic-version".to_string(), "2023-06-01".to_string())],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "anthropic_version": "2023-06-01",
+            "messages": [{"role": "user", "content": "hello"}]
+        }),
+    )
+    .expect("request should transform");
+
+    assert_eq!(plan.path, "/secret_endpoint/v1/chat/completions");
+}
+
+#[test]
 fn non_strict_mode_preserves_request_when_detection_fails() {
     let original_body = json!({
         "foo": "bar"

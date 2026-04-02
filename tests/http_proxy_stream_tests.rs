@@ -1,0 +1,583 @@
+#[path = "../src/config.rs"]
+mod config;
+#[path = "../src/format.rs"]
+mod format;
+#[path = "../src/profile.rs"]
+mod profile;
+#[path = "../src/proxy.rs"]
+mod proxy;
+#[path = "../src/response.rs"]
+mod response;
+#[path = "../src/routes.rs"]
+mod routes;
+#[path = "../src/storage.rs"]
+mod storage;
+#[path = "../src/streaming.rs"]
+mod streaming;
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::body::Body;
+use axum::http::{header::CONTENT_TYPE, StatusCode};
+use axum::response::Response;
+use axum::routing::post;
+use axum::Router;
+use config::Settings;
+use routes::{router as proxy_router, AppState};
+use serde_json::json;
+
+#[tokio::test]
+async fn openai_responses_sse_is_transformed_back_to_openai_chat_sse() {
+    let upstream_base = spawn_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("chat.completion.chunk"), "{body}");
+    assert!(body.contains("\"role\":\"assistant\""), "{body}");
+    assert!(body.contains("\"content\":\"hello\""), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+    assert!(
+        body.contains("\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}"),
+        "{body}"
+    );
+    assert!(body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test]
+async fn delay_stream_header_returns_json_error_before_committing_empty_stream() {
+    let upstream_base = spawn_empty_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert!(body["error"]["message"].as_str().unwrap().contains("Stream"));
+}
+
+#[tokio::test]
+async fn responses_failed_event_maps_to_chat_error_finish_reason() {
+    let upstream_base = spawn_failed_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"finish_reason\":\"error\""), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test]
+async fn responses_incomplete_event_maps_to_chat_length_finish_reason() {
+    let upstream_base = spawn_incomplete_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"finish_reason\":\"length\""), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test]
+async fn responses_completed_event_emits_done_even_without_upstream_done_marker() {
+    let upstream_base = spawn_completed_without_done_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
+}
+
+#[tokio::test]
+async fn responses_function_call_events_map_to_chat_tool_call_deltas() {
+    let upstream_base = spawn_tool_call_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "weather?"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"tool_calls\":[{"), "{body}");
+    assert!(body.contains("\"id\":\"call_1\""), "{body}");
+    assert!(body.contains("\"name\":\"lookup_weather\""), "{body}");
+    assert!(body.contains("\\\"city\\\":\\\"Paris\\\""), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+}
+
+#[tokio::test]
+async fn responses_tool_call_arguments_buffer_until_output_item_added() {
+    let upstream_base = spawn_buffered_tool_call_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "weather?"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"id\":\"call_buf_1\""), "{body}");
+    assert!(body.contains("\"name\":\"lookup_weather\""), "{body}");
+    assert!(body.contains("\\\"city\\\":\\\"Paris\\\""), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+}
+
+async fn spawn_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_123\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_empty_sse_upstream() -> String {
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(Vec::<u8>::new()))
+                .expect("empty sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind empty upstream");
+    let addr = listener.local_addr().expect("empty upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("empty upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_failed_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"failed\"}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("failed sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failed upstream");
+    let addr = listener.local_addr().expect("failed upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("failed upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_incomplete_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_incomplete\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.incomplete\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"incomplete\"}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("incomplete sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind incomplete upstream");
+    let addr = listener.local_addr().expect("incomplete upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("incomplete upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_completed_without_done_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_no_done\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_no_done\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("completed without done sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind completed without done upstream");
+    let addr = listener.local_addr().expect("completed without done upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("completed without done upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_tool_call_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"lookup_weather\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("tool call sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tool call upstream");
+    let addr = listener.local_addr().expect("tool call upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("tool call upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_buffered_tool_call_sse_upstream() -> String {
+    let payload = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_buf\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_buf_1\",\"delta\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_buf_1\",\"call_id\":\"call_buf_1\",\"name\":\"lookup_weather\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool_buf\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("buffered tool call sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind buffered tool call upstream");
+    let addr = listener.local_addr().expect("buffered tool call upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("buffered tool call upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_proxy_server() -> String {
+    let app = proxy_router(AppState {
+        settings: Arc::new(test_settings()),
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client"),
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("proxy server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+fn test_settings() -> Settings {
+    Settings {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        debug: true,
+        log_level: "info".to_string(),
+        access_log_file: "logs/access.log".to_string(),
+        moderation_log_file: "logs/moderation.log".to_string(),
+        training_log_file: "logs/training.log".to_string(),
+        root_dir: PathBuf::from("/services/apps/Prismguand-Rust"),
+        env_map: HashMap::new(),
+    }
+}
+
+fn percent_encode(input: &str) -> String {
+    url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
+}

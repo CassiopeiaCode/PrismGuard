@@ -120,31 +120,62 @@ pub fn process_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let from_cfg = transform_cfg.get("from");
-    let source = detect_format(from_cfg, path, headers, &plan.body);
+    let candidates = configured_candidates(from_cfg);
+    let detectable = detect_formats_from_candidates(&candidates, path, headers, &plan.body);
+    let mut parse_errors = Vec::new();
+    let mut parsed = None;
 
-    if source.is_none() {
+    for source in detectable.iter().copied() {
+        match parse_request(source, &plan.body, path) {
+            Ok(internal) => {
+                parsed = Some((source, internal));
+                break;
+            }
+            Err(error) => parse_errors.push(format!("{}: {error}", source.as_str())),
+        }
+    }
+
+    if parsed.is_none() {
         if strict_parse {
-            return Err(RequestProcessError::StrictParse(
-                "Format parse error: unable to detect request format".to_string(),
-            ));
+            let excluded = all_request_formats()
+                .into_iter()
+                .filter(|format| !candidates.contains(format))
+                .collect::<Vec<_>>();
+            let detectable_excluded =
+                detect_formats_from_candidates(&excluded, path, headers, &plan.body);
+
+            let mut message = if !detectable_excluded.is_empty() {
+                let expected = expected_formats_label(from_cfg, &candidates);
+                let detected = detectable_excluded
+                    .iter()
+                    .map(|format| format!("'{}'", format.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Format mismatch: Request appears to be in format [{detected}], but only [{expected}] is allowed."
+                )
+            } else {
+                let expected = expected_formats_label(from_cfg, &candidates);
+                format!(
+                    "Unable to parse request format. Expected format: {expected}. Please verify your request body structure matches the expected format."
+                )
+            };
+
+            if !parse_errors.is_empty() {
+                message.push_str(&format!(" Parse errors: {}", parse_errors.join("; ")));
+            }
+
+            return Err(RequestProcessError::StrictParse(message));
         }
         return Ok(plan);
     }
 
-    let source = source.expect("checked is_some");
+    let (source, internal) = parsed.expect("checked is_some");
     let target = transform_cfg
         .get("to")
         .and_then(Value::as_str)
         .and_then(RequestFormat::from_name)
         .unwrap_or(source);
-
-    let internal = parse_request(source, &plan.body, path).map_err(|error| {
-        if strict_parse {
-            RequestProcessError::StrictParse(error.to_string())
-        } else {
-            RequestProcessError::Transform(error.to_string())
-        }
-    })?;
     plan.stream = internal.stream;
     plan.source_format = Some(source);
     plan.target_format = Some(target);
@@ -159,11 +190,15 @@ pub fn process_request(
 }
 
 fn detect_format(from_cfg: Option<&Value>, path: &str, headers: &[(String, String)], body: &Value) -> Option<RequestFormat> {
-    let body = body.as_object()?;
+    detect_formats_from_candidates(&configured_candidates(from_cfg), path, headers, body)
+        .into_iter()
+        .next()
+}
 
-    let candidates = if let Some(cfg) = from_cfg {
+fn configured_candidates(from_cfg: Option<&Value>) -> Vec<RequestFormat> {
+    if let Some(cfg) = from_cfg {
         match cfg {
-            Value::String(name) if name != "auto" => vec![RequestFormat::from_name(name)?],
+            Value::String(name) if name != "auto" => RequestFormat::from_name(name).into_iter().collect(),
             Value::Array(values) => values
                 .iter()
                 .filter_map(Value::as_str)
@@ -173,11 +208,47 @@ fn detect_format(from_cfg: Option<&Value>, path: &str, headers: &[(String, Strin
         }
     } else {
         default_detection_order()
+    }
+}
+
+fn detect_formats_from_candidates(
+    candidates: &[RequestFormat],
+    path: &str,
+    headers: &[(String, String)],
+    body: &Value,
+) -> Vec<RequestFormat> {
+    let Some(body) = body.as_object() else {
+        return Vec::new();
     };
 
     candidates
-        .into_iter()
-        .find(|format| can_parse(*format, path, headers, body))
+        .iter()
+        .copied()
+        .filter(|format| can_parse(*format, path, headers, body))
+        .collect()
+}
+
+fn all_request_formats() -> Vec<RequestFormat> {
+    vec![
+        RequestFormat::OpenAiChat,
+        RequestFormat::ClaudeChat,
+        RequestFormat::OpenAiResponses,
+        RequestFormat::GeminiChat,
+    ]
+}
+
+fn expected_formats_label(from_cfg: Option<&Value>, candidates: &[RequestFormat]) -> String {
+    match from_cfg {
+        Some(Value::String(name)) if name != "auto" => format!("'{name}'"),
+        _ => format!(
+            "[{}]",
+            candidates
+                .iter()
+                .map(|format| format!("'{}'", format.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 fn default_detection_order() -> Vec<RequestFormat> {
@@ -1137,4 +1208,3 @@ fn gemini_tool_decl(tool: &InternalTool) -> Value {
         "parameters": tool.input_schema
     })
 }
-
