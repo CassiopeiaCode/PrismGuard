@@ -55,16 +55,31 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
                         }),
                         Some("input_image") | Some("image_url") => part
                             .get("image_url")
-                            .and_then(Value::as_str)
-                            .map(|url| {
-                                let mut image_url = Map::new();
-                                image_url.insert("url".to_string(), json!(url));
-                                if let Some(detail) = part.get("detail").cloned() {
-                                    image_url.insert("detail".to_string(), detail);
+                            .and_then(|image_url_value| {
+                                if let Some(url) = image_url_value.as_str() {
+                                    let mut image_url = Map::new();
+                                    image_url.insert("url".to_string(), json!(url));
+                                    if let Some(detail) = part.get("detail").cloned() {
+                                        image_url.insert("detail".to_string(), detail);
+                                    }
+                                    return Some(json!({
+                                        "type": "image_url",
+                                        "image_url": image_url
+                                    }));
                                 }
-                                json!({
-                                    "type": "image_url",
-                                    "image_url": image_url
+
+                                image_url_value.as_object().and_then(|image_url_obj| {
+                                    image_url_obj.get("url").and_then(Value::as_str).map(|url| {
+                                        let mut image_url = Map::new();
+                                        image_url.insert("url".to_string(), json!(url));
+                                        if let Some(detail) = image_url_obj.get("detail").cloned() {
+                                            image_url.insert("detail".to_string(), detail);
+                                        }
+                                        json!({
+                                            "type": "image_url",
+                                            "image_url": image_url
+                                        })
+                                    })
                                 })
                             }),
                         _ => None,
@@ -107,6 +122,19 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
                         }
                     }]),
                 );
+            }
+            Some("reasoning") => {
+                let text_content = last_item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|summary| summary.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text_content.is_empty() {
+                    message.insert("content".to_string(), json!(text_content));
+                }
             }
             _ => {}
         }
