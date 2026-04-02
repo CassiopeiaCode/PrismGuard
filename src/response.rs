@@ -154,14 +154,18 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
         response["created"] = created;
     }
 
-    if let Some(usage) = object.get("usage").and_then(Value::as_object) {
-        response["usage"] = json!({
-            "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0)),
-            "completion_tokens": usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0)),
-            "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0)),
-            "responses_usage": Value::Object(usage.clone()),
-        });
-    }
+    response["usage"] = object
+        .get("usage")
+        .and_then(Value::as_object)
+        .map(|usage| {
+            json!({
+                "prompt_tokens": usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0)),
+                "completion_tokens": usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0)),
+                "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0)),
+                "responses_usage": Value::Object(usage.clone()),
+            })
+        })
+        .unwrap_or(Value::Null);
 
     if let Some(response_obj) = response.as_object_mut() {
         for (key, value) in object {
