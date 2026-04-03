@@ -39,6 +39,10 @@
 
 这些内容属于后续“训练与存储”阶段，不纳入当前实现。
 
+补充说明：训练调度器与单 profile 训练子进程入口已拆到独立实现计划
+[`docs/superpowers/plans/2026-04-03-rust-training-scheduler.md`](../plans/2026-04-03-rust-training-scheduler.md)，
+后续按该计划补齐，不再在当前运行时闭环设计里继续展开。
+
 ## 总体方案
 
 运行时审核链路分为两层：

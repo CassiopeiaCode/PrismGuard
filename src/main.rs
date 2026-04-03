@@ -14,7 +14,7 @@ mod training;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::{Router, Server};
 use reqwest::Client;
 use tokio::net::TcpListener;
@@ -28,14 +28,30 @@ use crate::sample_rpc::{cleanup_stale_unix_socket, SampleRpcConfig, SampleRpcTra
 #[cfg(feature = "storage-debug")]
 use crate::sample_rpc::serve_storage_sample_rpc_until_shutdown;
 
+enum StartupMode {
+    Server,
+    TrainProfile { profile_name: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = std::env::args().collect::<Vec<_>>();
+    match select_startup_mode(&args)? {
+        StartupMode::Server => run_server().await,
+        StartupMode::TrainProfile { profile_name } => {
+            run_training_subprocess_placeholder(&profile_name).await
+        }
+    }
+}
+
+async fn run_server() -> Result<()> {
     let root_dir = std::env::current_dir().context("failed to resolve current dir")?;
     let settings = Settings::load(&root_dir)?;
     init_tracing(&settings.log_level);
     lower_process_priority();
     prepare_sample_rpc(&settings)?;
     let sample_rpc_task = start_sample_rpc_server(&settings)?;
+    let scheduler_task = start_scheduler_runtime(&settings)?;
 
     let state = AppState {
         settings: Arc::new(settings.clone()),
@@ -73,10 +89,39 @@ async fn main() -> Result<()> {
     if let Some(task) = sample_rpc_task {
         task.abort();
     }
+    if let Some(task) = scheduler_task {
+        task.abort();
+    }
 
     server_result?;
 
     Ok(())
+}
+
+fn select_startup_mode(args: &[String]) -> Result<StartupMode> {
+    match args.get(1).map(String::as_str) {
+        None => Ok(StartupMode::Server),
+        Some("train-profile") => {
+            let profile_name = args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow!("usage: {} train-profile <profile-name>", binary_name(args)))?;
+            Ok(StartupMode::TrainProfile { profile_name })
+        }
+        Some(other) => Err(anyhow!("unknown subcommand: {other}")),
+    }
+}
+
+fn binary_name(args: &[String]) -> &str {
+    args.first().map(String::as_str).unwrap_or("prismguard-rust")
+}
+
+async fn run_training_subprocess_placeholder(profile_name: &str) -> Result<()> {
+    // Reserved for the Task 6 training subprocess entrypoint.
+    Err(anyhow!(
+        "train-profile entrypoint is reserved for scheduler integration and is not wired yet: {}",
+        profile_name
+    ))
 }
 
 fn prepare_sample_rpc(settings: &Settings) -> Result<()> {
@@ -122,6 +167,12 @@ fn start_sample_rpc_server(settings: &Settings) -> Result<Option<JoinHandle<()>>
         )),
     }
     }
+}
+
+fn start_scheduler_runtime(_settings: &Settings) -> Result<Option<JoinHandle<()>>> {
+    // Reserved for the Task 5 scheduler loop startup hook.
+    info!("training scheduler startup hook reserved; scheduler loop not wired yet");
+    Ok(None)
 }
 
 fn lower_process_priority() {
