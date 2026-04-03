@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::moderation::hashlinear;
 use crate::profile::ModerationProfile;
@@ -63,22 +63,40 @@ pub async fn smart_moderation(
         return Ok(Some(result));
     }
 
-    if should_force_ai_review(&text, &profile) {
-        let result = llm_moderate(&text, &profile, http_client, env_map).await?;
-        save_cache(profile_name, &text, &result);
-        return Ok(Some(result));
-    }
-
-    if profile.local_model_exists() {
-        if let Some(result) = run_local_model(&text, &profile) {
-            save_cache(profile_name, &text, &result);
-            return Ok(Some(result));
-        }
-    }
-
-    let result = llm_moderate(&text, &profile, http_client, env_map).await?;
+    let result = decide_moderation(&text, &profile, http_client, env_map).await?;
     save_cache(profile_name, &text, &result);
     Ok(Some(result))
+}
+
+pub fn llm_semaphore() -> Arc<Semaphore> {
+    LLM_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_LLM_CONCURRENCY)))
+        .clone()
+}
+
+pub fn try_acquire_llm_slot() -> Result<OwnedSemaphorePermit, SmartModerationError> {
+    llm_semaphore().try_acquire_owned().map_err(|_| {
+        SmartModerationError::ConcurrencyLimit(format!(
+            "LLM审核并发数超限(max={MAX_LLM_CONCURRENCY})"
+        ))
+    })
+}
+
+async fn decide_moderation(
+    text: &str,
+    profile: &ModerationProfile,
+    http_client: &Client,
+    env_map: &HashMap<String, String>,
+) -> Result<SmartModerationResult, SmartModerationError> {
+    if should_force_ai_review(text, profile) {
+        return llm_moderate(text, profile, http_client, env_map).await;
+    }
+
+    if let Some(result) = run_local_model(text, profile) {
+        return Ok(result);
+    }
+
+    llm_moderate(text, profile, http_client, env_map).await
 }
 
 fn should_force_ai_review(text: &str, profile: &ModerationProfile) -> bool {
@@ -145,14 +163,7 @@ async fn llm_moderate(
     http_client: &Client,
     env_map: &HashMap<String, String>,
 ) -> Result<SmartModerationResult, SmartModerationError> {
-    let semaphore = LLM_SEMAPHORE
-        .get_or_init(|| Arc::new(Semaphore::new(MAX_LLM_CONCURRENCY)))
-        .clone();
-    let _permit = semaphore.try_acquire_owned().map_err(|_| {
-        SmartModerationError::ConcurrencyLimit(format!(
-            "LLM审核并发数超限(max={MAX_LLM_CONCURRENCY})"
-        ))
-    })?;
+    let _permit = try_acquire_llm_slot()?;
 
     let api_key_env = profile.config.ai.api_key_env.as_str();
     let api_key = env_map
@@ -284,7 +295,7 @@ fn extract_json_object(content: &str) -> Option<&str> {
 
 fn check_cache(profile_name: &str, text: &str) -> Option<SmartModerationResult> {
     let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = format!("{:x}", md5::compute(text.as_bytes()));
+    let key = cache_key(text);
     let mut guard = cache.lock().expect("moderation cache");
     let profile_cache = guard.get_mut(profile_name)?;
     let result = profile_cache.shift_remove(&key)?;
@@ -294,7 +305,7 @@ fn check_cache(profile_name: &str, text: &str) -> Option<SmartModerationResult> 
 
 fn save_cache(profile_name: &str, text: &str, result: &SmartModerationResult) {
     let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = format!("{:x}", md5::compute(text.as_bytes()));
+    let key = cache_key(text);
     let mut guard = cache.lock().expect("moderation cache");
     let profile_cache = guard
         .entry(profile_name.to_string())
@@ -304,4 +315,8 @@ fn save_cache(profile_name: &str, text: &str, result: &SmartModerationResult) {
     while profile_cache.len() > CACHE_SIZE {
         profile_cache.shift_remove_index(0);
     }
+}
+
+fn cache_key(text: &str) -> String {
+    format!("{:x}", md5::compute(text.as_bytes()))
 }
