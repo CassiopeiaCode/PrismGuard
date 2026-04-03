@@ -236,6 +236,68 @@ pub async fn run_profile_training(
     train_hashlinear_runtime(profile, &samples)
 }
 
+pub async fn run_training_subprocess_from_args(args: &[String]) -> Result<()> {
+    let profile_name = args
+        .get(2)
+        .cloned()
+        .ok_or_else(|| anyhow!("usage: {} train-profile <profile-name>", binary_name(args)))?;
+    let root_dir = std::env::current_dir().context("failed to resolve current dir")?;
+    let settings = crate::config::Settings::load(&root_dir)?;
+    let rpc = SampleRpcConfig::from_settings(&settings)?;
+    let profile = ModerationProfile::load(&root_dir, &profile_name)?;
+
+    let initial_sample_count = fetch_training_sample_count_via_rpc(&rpc, &profile)
+        .await
+        .unwrap_or(0);
+    write_training_status(
+        &profile,
+        &serde_json::json!({
+            "status": "running",
+            "message": "training in progress",
+            "timestamp": current_unix_secs(),
+            "profile": profile.profile_name,
+            "model_type": profile.config.local_model_type,
+            "sample_count": initial_sample_count
+        }),
+    )?;
+
+    match run_profile_training(&rpc, &profile).await {
+        Ok(output) => {
+            write_training_status(
+                &profile,
+                &serde_json::json!({
+                    "status": "success",
+                    "message": "training completed",
+                    "timestamp": current_unix_secs(),
+                    "profile": profile.profile_name,
+                    "model_type": profile.config.local_model_type,
+                    "sample_count": output.sample_count,
+                    "pass_count": output.pass_count,
+                    "violation_count": output.violation_count,
+                    "runtime_json_path": output.runtime_json_path,
+                    "runtime_coef_path": output.runtime_coef_path,
+                    "model_marker_path": output.model_marker_path
+                }),
+            )?;
+            Ok(())
+        }
+        Err(err) => {
+            write_training_status(
+                &profile,
+                &serde_json::json!({
+                    "status": "failed",
+                    "message": format!("{err:#}"),
+                    "timestamp": current_unix_secs(),
+                    "profile": profile.profile_name,
+                    "model_type": profile.config.local_model_type,
+                    "sample_count": initial_sample_count
+                }),
+            )?;
+            Err(err)
+        }
+    }
+}
+
 pub fn train_hashlinear_runtime(
     profile: &ModerationProfile,
     samples: &[TrainingSample],
@@ -369,6 +431,17 @@ fn training_max_db_items(profile: &ModerationProfile) -> Result<usize> {
         "bow" => Ok(profile.config.bow_training.max_db_items),
         other => Err(anyhow!("unsupported local_model_type: {other}")),
     }
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::ZERO)
+        .as_secs()
+}
+
+fn binary_name(args: &[String]) -> &str {
+    args.first().map(String::as_str).unwrap_or("prismguard-rust")
 }
 
 fn hashlinear_training_spec(profile: &ModerationProfile) -> HashlinearTrainingSpec {

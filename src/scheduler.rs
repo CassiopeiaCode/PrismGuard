@@ -3,8 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
 
+use crate::config::Settings;
 use crate::profile::ModerationProfile;
+use crate::sample_rpc::SampleRpcConfig;
+use crate::training::{evaluate_training_need, fetch_training_sample_count_via_rpc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingSubprocessCommand {
@@ -16,6 +21,13 @@ pub struct TrainingSubprocessCommand {
 pub struct ScannedProfile {
     pub profile_name: String,
     pub profile: ModerationProfile,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannedTrainingAction {
+    pub profile_name: String,
+    pub sample_count: usize,
+    pub reason: &'static str,
 }
 
 pub fn list_profiles(root_dir: &Path) -> Result<Vec<String>> {
@@ -104,4 +116,102 @@ pub fn build_training_subprocess_command(
             profile_name.to_string(),
         ],
     })
+}
+
+pub async fn plan_training_round(
+    root_dir: &Path,
+    settings: &Settings,
+    now_unix_secs: u64,
+) -> Result<Vec<PlannedTrainingAction>> {
+    let rpc = SampleRpcConfig::from_settings(settings)?;
+    let mut planned = Vec::new();
+
+    for scanned in scan_profiles(root_dir)? {
+        if !cooldown_allows_training(
+            &scanned.profile,
+            settings.training_scheduler_failure_cooldown_minutes,
+            now_unix_secs,
+        )? {
+            continue;
+        }
+
+        let sample_count = fetch_training_sample_count_via_rpc(&rpc, &scanned.profile).await?;
+        let model_mtime = fs::metadata(scanned.profile.training_model_path())
+            .ok()
+            .and_then(|meta| meta.modified().ok());
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(now_unix_secs);
+        let decision = evaluate_training_need(&scanned.profile, sample_count, model_mtime, now)?;
+        if decision.should_train {
+            planned.push(PlannedTrainingAction {
+                profile_name: scanned.profile_name,
+                sample_count,
+                reason: decision.reason,
+            });
+        }
+    }
+
+    Ok(planned)
+}
+
+pub async fn spawn_training_subprocess(
+    settings: &Settings,
+    profile_name: &str,
+) -> Result<std::process::ExitStatus> {
+    let command = build_training_subprocess_command(
+        &settings.root_dir.display().to_string(),
+        profile_name,
+        &settings.training_subprocess_allowed_cpus,
+    )?;
+    let status = std::process::Command::new(&command.program)
+        .args(&command.args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to run training subprocess for {}", profile_name))?;
+    Ok(status)
+}
+
+pub async fn run_scheduler_once(settings: &Settings) -> Result<Vec<PlannedTrainingAction>> {
+    let now_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::ZERO)
+        .as_secs();
+    let planned = plan_training_round(&settings.root_dir, settings, now_unix_secs).await?;
+
+    for action in &planned {
+        info!(
+            profile = %action.profile_name,
+            sample_count = action.sample_count,
+            reason = action.reason,
+            "scheduler selected profile for training"
+        );
+
+        let status = spawn_training_subprocess(settings, &action.profile_name).await?;
+        if !status.success() {
+            warn!(
+                profile = %action.profile_name,
+                status = ?status.code(),
+                "training subprocess exited unsuccessfully"
+            );
+        }
+    }
+
+    Ok(planned)
+}
+
+pub fn start_scheduler_loop(settings: Settings) -> Option<JoinHandle<()>> {
+    if !settings.training_scheduler_enabled {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let interval = Duration::from_secs(settings.training_scheduler_interval_minutes.max(1) * 60);
+        loop {
+            if let Err(err) = run_scheduler_once(&settings).await {
+                warn!(error = %err, "training scheduler round failed");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }))
 }

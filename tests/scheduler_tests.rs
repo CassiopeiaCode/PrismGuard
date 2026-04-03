@@ -4,12 +4,22 @@ mod config;
 mod profile;
 #[path = "../src/scheduler.rs"]
 mod scheduler;
+#[path = "../src/sample_rpc.rs"]
+mod sample_rpc;
+#[path = "../src/storage.rs"]
+mod storage;
+#[path = "../src/training.rs"]
+mod training;
 
+use config::Settings;
 use profile::ModerationProfile;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sample_rpc::{
+    serve_unix_requests_until_shutdown, SampleRpcRequest, SampleRpcResponse,
+};
 
 fn env_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -40,6 +50,27 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("current unix time")
         .as_secs()
+}
+
+fn test_settings(root_dir: &std::path::Path, socket_path: &std::path::Path) -> Settings {
+    Settings {
+        host: "127.0.0.1".to_string(),
+        port: 0,
+        debug: true,
+        log_level: "info".to_string(),
+        access_log_file: "logs/access.log".to_string(),
+        moderation_log_file: "logs/moderation.log".to_string(),
+        training_log_file: "logs/training.log".to_string(),
+        training_data_rpc_enabled: true,
+        training_data_rpc_transport: "unix".to_string(),
+        training_data_rpc_unix_socket: socket_path.display().to_string(),
+        training_scheduler_enabled: true,
+        training_scheduler_interval_minutes: 10,
+        training_scheduler_failure_cooldown_minutes: 30,
+        training_subprocess_allowed_cpus: "0".to_string(),
+        root_dir: root_dir.to_path_buf(),
+        env_map: Default::default(),
+    }
 }
 
 #[test]
@@ -175,4 +206,96 @@ fn scheduler_command_uses_single_core_systemd_scope() {
             .windows(2)
             .any(|window| window[0] == "train-profile" && window[1] == "default")
     );
+}
+
+#[tokio::test]
+async fn scheduler_run_once_trains_only_eligible_profiles() {
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-scheduler-run-once-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let eligible_dir = root_dir.join("configs/mod_profiles/eligible");
+    std::fs::create_dir_all(&eligible_dir).expect("create eligible dir");
+    std::fs::write(
+        eligible_dir.join("profile.json"),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "min_samples": 10
+            }
+        })
+        .to_string(),
+    )
+    .expect("write eligible profile");
+
+    let cooldown_dir = root_dir.join("configs/mod_profiles/cooldown");
+    std::fs::create_dir_all(&cooldown_dir).expect("create cooldown dir");
+    std::fs::write(
+        cooldown_dir.join("profile.json"),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "min_samples": 10
+            }
+        })
+        .to_string(),
+    )
+    .expect("write cooldown profile");
+    std::fs::write(
+        cooldown_dir.join(".train_status.json"),
+        json!({
+            "status": "failed",
+            "message": "previous run failed",
+            "timestamp": current_unix_secs(),
+            "profile": "cooldown",
+            "model_type": "hashlinear",
+            "sample_count": 20
+        })
+        .to_string(),
+    )
+    .expect("write cooldown status");
+
+    let socket_path = root_dir.join("run/sample-store.sock");
+    let settings = test_settings(&root_dir, &socket_path);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let response_socket = socket_path.clone();
+        async move {
+            serve_unix_requests_until_shutdown(
+                &response_socket,
+                move |request| match request {
+                    SampleRpcRequest::GetSampleCount { profile, .. } if profile == "eligible" => {
+                        SampleRpcResponse::ok(json!({ "sample_count": 20 }))
+                    }
+                    SampleRpcRequest::GetSampleCount { profile, .. } if profile == "cooldown" => {
+                        SampleRpcResponse::ok(json!({ "sample_count": 20 }))
+                    }
+                    other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let actions = scheduler::plan_training_round(&root_dir, &settings, current_unix_secs())
+        .await
+        .expect("plan round");
+
+    assert!(actions.iter().any(|item| item.profile_name == "eligible"));
+    assert!(!actions.iter().any(|item| item.profile_name == "cooldown"));
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root");
 }

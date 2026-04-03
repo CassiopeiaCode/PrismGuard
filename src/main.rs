@@ -5,6 +5,7 @@ mod proxy;
 mod response;
 mod routes;
 mod moderation;
+mod scheduler;
 mod sample_rpc;
 #[cfg(feature = "storage-debug")]
 mod storage;
@@ -24,9 +25,11 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Settings;
 use crate::routes::{router, AppState};
+use crate::scheduler::start_scheduler_loop;
 use crate::sample_rpc::{cleanup_stale_unix_socket, SampleRpcConfig, SampleRpcTransport};
 #[cfg(feature = "storage-debug")]
 use crate::sample_rpc::serve_storage_sample_rpc_until_shutdown;
+use crate::training::run_training_subprocess_from_args;
 
 enum StartupMode {
     Server,
@@ -38,9 +41,7 @@ async fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     match select_startup_mode(&args)? {
         StartupMode::Server => run_server().await,
-        StartupMode::TrainProfile { profile_name } => {
-            run_training_subprocess_placeholder(&profile_name).await
-        }
+        StartupMode::TrainProfile { .. } => run_training_subprocess_from_args(&args).await,
     }
 }
 
@@ -51,7 +52,7 @@ async fn run_server() -> Result<()> {
     lower_process_priority();
     prepare_sample_rpc(&settings)?;
     let sample_rpc_task = start_sample_rpc_server(&settings)?;
-    let scheduler_task = start_scheduler_runtime(&settings)?;
+    let scheduler_task = start_scheduler_loop(settings.clone());
 
     let state = AppState {
         settings: Arc::new(settings.clone()),
@@ -116,14 +117,6 @@ fn binary_name(args: &[String]) -> &str {
     args.first().map(String::as_str).unwrap_or("prismguard-rust")
 }
 
-async fn run_training_subprocess_placeholder(profile_name: &str) -> Result<()> {
-    // Reserved for the Task 6 training subprocess entrypoint.
-    Err(anyhow!(
-        "train-profile entrypoint is reserved for scheduler integration and is not wired yet: {}",
-        profile_name
-    ))
-}
-
 fn prepare_sample_rpc(settings: &Settings) -> Result<()> {
     let rpc = SampleRpcConfig::from_settings(settings)?;
     rpc.prepare_runtime()?;
@@ -167,12 +160,6 @@ fn start_sample_rpc_server(settings: &Settings) -> Result<Option<JoinHandle<()>>
         )),
     }
     }
-}
-
-fn start_scheduler_runtime(_settings: &Settings) -> Result<Option<JoinHandle<()>>> {
-    // Reserved for the Task 5 scheduler loop startup hook.
-    info!("training scheduler startup hook reserved; scheduler loop not wired yet");
-    Ok(None)
 }
 
 fn lower_process_priority() {
