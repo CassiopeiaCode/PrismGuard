@@ -36,6 +36,7 @@ use axum::{Json, Router};
 use config::Settings;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use routes::{router as proxy_router, AppState};
 use serde_json::{json, Value};
 
@@ -1297,6 +1298,190 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
 }
 
 #[tokio::test]
+async fn smart_moderation_reuses_history_sample_before_llm() {
+    let profile_name = format!("smart-history-hit-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"llm should not be called\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 1.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    seed_history_sample_db(
+        &profile_dir.join("history.rocks"),
+        "history db hit",
+        1,
+        Some("history-db"),
+        "2026-04-03 12:34:56",
+    );
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "history db hit"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(body["error"]["moderation_details"]["category"], "history-db");
+    assert!(
+        body["error"]["moderation_details"]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("From DB")
+    );
+    assert_eq!(*hits.lock().expect("hits lock"), 0);
+}
+
+#[tokio::test]
+async fn smart_moderation_persists_ai_result_into_history_sample_db() {
+    let profile_name = format!("smart-history-write-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"persisted\", \"reason\": \"saved to db\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 1.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "persist this moderation"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(body["error"]["moderation_details"]["category"], "persisted");
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+
+    let storage = storage::SampleStorage::open_read_only(profile_dir.join("history.rocks"))
+        .expect("open persisted history rocks");
+    let sample = storage
+        .find_by_text("persist this moderation")
+        .expect("lookup history sample")
+        .expect("persisted sample");
+    assert_eq!(sample.value["label"], 1);
+    assert_eq!(sample.value["category"], "persisted");
+}
+
+#[tokio::test]
 async fn smart_moderation_retries_llm_after_server_error_like_python() {
     let profile_name = format!("smart-llm-retry-{}", std::process::id());
     let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
@@ -2482,4 +2667,52 @@ fn write_hashlinear_runtime(profile_dir: &PathBuf, intercept: f32, coef: &[f32])
     }
     std::fs::write(profile_dir.join("hashlinear_runtime.coef.f32"), bytes)
         .expect("write hashlinear runtime coef");
+}
+
+fn seed_history_sample_db(
+    rocks_dir: &PathBuf,
+    text: &str,
+    label: i64,
+    category: Option<&str>,
+    created_at: &str,
+) {
+    if rocks_dir.exists() {
+        std::fs::remove_dir_all(rocks_dir).expect("cleanup old rocks dir");
+    }
+
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    options.set_comparator("rocksdict", Box::new(|lhs, rhs| lhs.cmp(rhs)));
+    let db = DBWithThreadMode::<MultiThreaded>::open(&options, rocks_dir).expect("open rocksdb");
+
+    let sample = json!({
+        "id": 1,
+        "text": text,
+        "label": label,
+        "category": category,
+        "created_at": created_at,
+    });
+    put_rocks_string(&db, "sample:00000000000000000001", &sample.to_string());
+    put_rocks_string(&db, "meta:next_id", "2");
+    put_rocks_string(&db, "meta:count", "1");
+    put_rocks_string(&db, "meta:count:0", if label == 0 { "1" } else { "0" });
+    put_rocks_string(&db, "meta:count:1", if label == 1 { "1" } else { "0" });
+    put_rocks_string(
+        &db,
+        &format!("text_latest:{:x}", md5::compute(text.as_bytes())),
+        "1",
+    );
+    drop(db);
+}
+
+fn put_rocks_string(db: &DBWithThreadMode<MultiThreaded>, key: &str, value: &str) {
+    db.put(encode_rocksdict_string(key), encode_rocksdict_string(value))
+        .expect("put rocks string");
+}
+
+fn encode_rocksdict_string(value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(value.len() + 1);
+    out.push(0x02);
+    out.extend_from_slice(value.as_bytes());
+    out
 }

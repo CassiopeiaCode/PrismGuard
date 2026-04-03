@@ -12,6 +12,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::moderation::hashlinear;
 use crate::profile::ModerationProfile;
+#[cfg(feature = "storage-debug")]
+use crate::storage::SampleStorage;
 
 const MAX_LLM_CONCURRENCY: usize = 5;
 const CACHE_SIZE: usize = 1024;
@@ -19,6 +21,7 @@ const CACHE_SIZE: usize = 1024;
 static LLM_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static MODERATION_CACHE: OnceLock<Mutex<HashMap<String, IndexMap<String, SmartModerationResult>>>> =
     OnceLock::new();
+static HISTORY_STORAGE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SmartModerationResult {
@@ -89,14 +92,14 @@ async fn decide_moderation(
     env_map: &HashMap<String, String>,
 ) -> Result<SmartModerationResult, SmartModerationError> {
     if should_force_ai_review(text, profile) {
-        return llm_moderate(text, profile, http_client, env_map).await;
+        return run_ai_moderation_with_history(text, profile, http_client, env_map).await;
     }
 
     if let Some(result) = run_local_model(text, profile) {
         return Ok(result);
     }
 
-    llm_moderate(text, profile, http_client, env_map).await
+    run_ai_moderation_with_history(text, profile, http_client, env_map).await
 }
 
 fn should_force_ai_review(text: &str, profile: &ModerationProfile) -> bool {
@@ -229,6 +232,101 @@ async fn llm_moderate(
     .into())
 }
 
+async fn run_ai_moderation_with_history(
+    text: &str,
+    profile: &ModerationProfile,
+    http_client: &Client,
+    env_map: &HashMap<String, String>,
+) -> Result<SmartModerationResult, SmartModerationError> {
+    if let Some(result) = load_history_result(text, profile).await? {
+        return Ok(result);
+    }
+    let result = llm_moderate(text, profile, http_client, env_map).await?;
+    save_history_result(text, profile, &result).await?;
+    Ok(result)
+}
+
+#[cfg(feature = "storage-debug")]
+async fn load_history_result(
+    text: &str,
+    profile: &ModerationProfile,
+) -> Result<Option<SmartModerationResult>, SmartModerationError> {
+    let text = text.to_string();
+    let profile = profile.clone();
+    tokio::task::spawn_blocking(move || {
+        let storage_lock = history_storage_lock(&profile.profile_name);
+        let _guard = storage_lock.lock().expect("history storage lock");
+        let storage = match SampleStorage::open_read_only(profile.history_rocks_path()) {
+            Ok(storage) => storage,
+            Err(_) => return Ok(None),
+        };
+        let Some(sample) = storage.find_by_text(&text)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(SmartModerationResult {
+            violation: sample
+                .value
+                .get("label")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                != 0,
+            category: sample
+                .value
+                .get("category")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            reason: sample
+                .value
+                .get("created_at")
+                .and_then(Value::as_str)
+                .map(|created_at| format!("From DB: {created_at}")),
+            source: "ai".to_string(),
+            confidence: None,
+        }))
+    })
+    .await
+    .map_err(|err| SmartModerationError::Other(anyhow!("history storage read task failed: {err}")))?
+}
+
+#[cfg(not(feature = "storage-debug"))]
+async fn load_history_result(
+    _text: &str,
+    _profile: &ModerationProfile,
+) -> Result<Option<SmartModerationResult>, SmartModerationError> {
+    Ok(None)
+}
+
+#[cfg(feature = "storage-debug")]
+async fn save_history_result(
+    text: &str,
+    profile: &ModerationProfile,
+    result: &SmartModerationResult,
+) -> Result<(), SmartModerationError> {
+    let text = text.to_string();
+    let profile = profile.clone();
+    let result = result.clone();
+    tokio::task::spawn_blocking(move || {
+        let storage_lock = history_storage_lock(&profile.profile_name);
+        let _guard = storage_lock.lock().expect("history storage lock");
+        let storage = SampleStorage::open_read_write(profile.history_rocks_path())?;
+        let label = if result.violation { 1 } else { 0 };
+        storage.save_sample(&text, label, result.category.as_deref())?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| SmartModerationError::Other(anyhow!("history storage write task failed: {err}")))?
+}
+
+#[cfg(not(feature = "storage-debug"))]
+async fn save_history_result(
+    _text: &str,
+    _profile: &ModerationProfile,
+    _result: &SmartModerationResult,
+) -> Result<(), SmartModerationError> {
+    Ok(())
+}
+
 fn parse_openai_moderation_response(payload: Value) -> Result<SmartModerationResult, SmartModerationError> {
     let content = payload
         .get("choices")
@@ -319,4 +417,13 @@ fn save_cache(profile_name: &str, text: &str, result: &SmartModerationResult) {
 
 fn cache_key(text: &str) -> String {
     format!("{:x}", md5::compute(text.as_bytes()))
+}
+
+fn history_storage_lock(profile_name: &str) -> Arc<Mutex<()>> {
+    let locks = HISTORY_STORAGE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = locks.lock().expect("history storage locks");
+    guard
+        .entry(profile_name.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }

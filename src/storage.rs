@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -31,6 +32,28 @@ pub struct SampleStorage {
 }
 
 impl SampleStorage {
+    pub fn open_read_write(rocks_path: impl AsRef<Path>) -> Result<Self> {
+        let rocks_path = rocks_path.as_ref().to_path_buf();
+        if let Some(parent) = rocks_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create RocksDB parent dir {}", parent.display()))?;
+        }
+
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.set_comparator("rocksdict", Box::new(bytewise_compare));
+        let db = DBWithThreadMode::<MultiThreaded>::open(&options, &rocks_path)
+            .with_context(|| format!("failed to open RocksDB {}", rocks_path.display()))?;
+
+        let storage = Self {
+            db,
+            rocks_path,
+            column_families: vec!["default".to_string()],
+        };
+        storage.ensure_metadata_defaults()?;
+        Ok(storage)
+    }
+
     pub fn open_read_only(rocks_path: impl AsRef<Path>) -> Result<Self> {
         let rocks_path = rocks_path.as_ref().to_path_buf();
         let mut options = Options::default();
@@ -158,6 +181,35 @@ impl SampleStorage {
         self.sample_by_id(sample_id)
     }
 
+    pub fn save_sample(&self, text: &str, label: i64, category: Option<&str>) -> Result<()> {
+        let sample_id = self.next_id();
+        let created_at = current_local_timestamp()?;
+        let text_hash = format!("{:x}", md5::compute(text.as_bytes()));
+        let sample = serde_json::json!({
+            "id": sample_id,
+            "text": text,
+            "label": label,
+            "category": category,
+            "created_at": created_at,
+        });
+
+        self.put_string(&format!("sample:{sample_id:020}"), &sample.to_string())?;
+        self.put_string(&format!("text_latest:{text_hash}"), &sample_id.to_string())?;
+
+        let mut count_0 = self.get_u64("meta:count:0").unwrap_or(0);
+        let mut count_1 = self.get_u64("meta:count:1").unwrap_or(0);
+        if label == 0 {
+            count_0 += 1;
+        } else {
+            count_1 += 1;
+        }
+        self.put_string("meta:count", &(count_0 + count_1).to_string())?;
+        self.put_string("meta:count:0", &count_0.to_string())?;
+        self.put_string("meta:count:1", &count_1.to_string())?;
+        self.put_string("meta:next_id", &(sample_id + 1).to_string())?;
+        Ok(())
+    }
+
     pub fn first_samples(&self, limit: usize) -> Vec<SampleRecord> {
         let mut out = Vec::new();
         for entry in self.db.iterator(IteratorMode::Start) {
@@ -213,6 +265,28 @@ impl SampleStorage {
 
     fn next_id(&self) -> u64 {
         self.get_u64("meta:next_id").unwrap_or(1)
+    }
+
+    fn ensure_metadata_defaults(&self) -> Result<()> {
+        if self.get_u64("meta:next_id").is_none() {
+            self.put_string("meta:next_id", "1")?;
+        }
+        if self.get_u64("meta:count").is_none() {
+            self.put_string("meta:count", "0")?;
+        }
+        if self.get_u64("meta:count:0").is_none() {
+            self.put_string("meta:count:0", "0")?;
+        }
+        if self.get_u64("meta:count:1").is_none() {
+            self.put_string("meta:count:1", "0")?;
+        }
+        Ok(())
+    }
+
+    fn put_string(&self, key: &str, value: &str) -> Result<()> {
+        self.db
+            .put(encode_rocksdict_string(key), encode_rocksdict_string(value))
+            .with_context(|| format!("failed to write key {key}"))
     }
 
     fn load_samples_by_label(&self, label: i64, limit: usize) -> Vec<SampleRecord> {
@@ -326,4 +400,73 @@ fn strip_rocksdict_prefix(raw: &[u8]) -> &[u8] {
     } else {
         raw
     }
+}
+
+fn current_local_timestamp() -> Result<String> {
+    let mut now = libc::time_t::default();
+    unsafe {
+        libc::time(&mut now as *mut libc::time_t);
+    }
+
+    let mut local_tm = libc::tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        tm_mday: 0,
+        tm_mon: 0,
+        tm_year: 0,
+        tm_wday: 0,
+        tm_yday: 0,
+        tm_isdst: 0,
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "emscripten",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "haiku",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "solaris"
+        ))]
+        tm_gmtoff: 0,
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "emscripten",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "haiku",
+            target_os = "illumos",
+            target_os = "linux",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "solaris"
+        ))]
+        tm_zone: std::ptr::null(),
+    };
+    let local_ptr = unsafe { libc::localtime_r(&now, &mut local_tm as *mut libc::tm) };
+    if local_ptr.is_null() {
+        return Err(anyhow::anyhow!("failed to compute local timestamp"));
+    }
+
+    let mut buffer = [0i8; 20];
+    let written = unsafe {
+        const FORMAT: &[u8] = b"%Y-%m-%d %H:%M:%S\0";
+        libc::strftime(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            FORMAT.as_ptr().cast(),
+            &local_tm as *const libc::tm,
+        )
+    };
+    if written == 0 {
+        return Err(anyhow::anyhow!("failed to format local timestamp"));
+    }
+
+    Ok(unsafe { CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
 }
