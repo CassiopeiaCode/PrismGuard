@@ -99,11 +99,7 @@ async fn proxy_entry_with_cfg(
             match error {
                 RequestProcessError::StrictParse(message) | RequestProcessError::Transform(message) => {
                     let moderation_details = moderation_details_for_message(&message);
-                    ApiError::new(StatusCode::BAD_REQUEST, message)
-                        .with_code("MODERATION_BLOCKED")
-                        .with_error_type("moderation_error")
-                        .with_source_format(source_format_hint.clone())
-                        .with_moderation_details(moderation_details)
+                    ApiError::moderation_blocked(message, source_format_hint.clone(), moderation_details)
                 }
             }
         })?;
@@ -112,46 +108,52 @@ async fn proxy_entry_with_cfg(
         .get("basic_moderation")
         .cloned()
         .unwrap_or(Value::Null);
-    if basic_mod_cfg
+    let basic_mod_enabled = basic_mod_cfg
         .get("enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let moderation_format = request_plan
-            .source_format
-            .map(|format| format.as_str())
-            .or_else(|| detect_source_format(&path, request_json.as_ref()))
-            .unwrap_or("openai_chat");
-        let moderation_text = extract::extract_text_for_moderation(&request_plan.body, moderation_format);
-        if let Some(blocked) = basic::basic_moderation(&moderation_text, &basic_mod_cfg)
-            .map_err(ApiError::from)?
-        {
-            return Err(
-                ApiError::new(StatusCode::BAD_REQUEST, blocked.reason)
-                    .with_code("MODERATION_BLOCKED")
-                    .with_error_type("moderation_error")
-                    .with_source_format(Some(moderation_format)),
-            );
-        }
-    }
+        .unwrap_or(false);
     let smart_mod_cfg = parsed
         .config
         .get("smart_moderation")
         .cloned()
         .unwrap_or(Value::Null);
-    if smart_mod_cfg
+    let smart_mod_enabled = smart_mod_cfg
         .get("enabled")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let moderation_context = if basic_mod_enabled || smart_mod_enabled {
         let moderation_format = request_plan
             .source_format
             .map(|format| format.as_str())
             .or_else(|| detect_source_format(&path, request_json.as_ref()))
-            .unwrap_or("openai_chat");
-        let moderation_text = extract::extract_text_for_moderation(&request_plan.body, moderation_format);
+            .unwrap_or("openai_chat")
+            .to_string();
+        let moderation_text =
+            extract::extract_text_for_moderation(&request_plan.body, moderation_format.as_str());
+        Some((moderation_format, moderation_text))
+    } else {
+        None
+    };
+    if basic_mod_enabled {
+        let (moderation_format, moderation_text) = moderation_context
+            .as_ref()
+            .expect("moderation context when basic moderation enabled");
+        if let Some(blocked) = basic::basic_moderation(moderation_text, &basic_mod_cfg)
+            .map_err(ApiError::from)?
+        {
+            return Err(ApiError::moderation_blocked(
+                blocked.reason,
+                Some(moderation_format.as_str()),
+                None,
+            ));
+        }
+    }
+    if smart_mod_enabled {
+        let (moderation_format, moderation_text) = moderation_context
+            .as_ref()
+            .expect("moderation context when smart moderation enabled");
         match smart::smart_moderation(
-            &moderation_text,
+            moderation_text,
             &smart_mod_cfg,
             &state.settings.root_dir,
             &state.http_client,
@@ -160,33 +162,26 @@ async fn proxy_entry_with_cfg(
         .await
         {
             Ok(Some(result)) if result.violation => {
-                return Err(
-                    ApiError::new(
-                        StatusCode::BAD_REQUEST,
-                        smart_moderation_error_message(&result),
-                    )
-                    .with_code("MODERATION_BLOCKED")
-                    .with_error_type("moderation_error")
-                    .with_source_format(Some(moderation_format))
-                    .with_moderation_details(Some(json!({
+                return Err(ApiError::moderation_blocked(
+                    smart_moderation_error_message(&result),
+                    Some(moderation_format.as_str()),
+                    Some(json!({
                         "source": result.source,
                         "reason": result.reason,
                         "category": result.category,
                         "confidence": result.confidence,
-                    }))),
-                );
+                    })),
+                ));
             }
             Ok(_) => {}
             Err(smart::SmartModerationError::ConcurrencyLimit(message)) => {
-                return Err(
-                    ApiError::new(StatusCode::BAD_REQUEST, message)
-                        .with_code("MODERATION_BLOCKED")
-                        .with_error_type("moderation_error")
-                        .with_source_format(Some(moderation_format))
-                        .with_moderation_details(Some(json!({
-                            "source": "concurrency_limit"
-                        }))),
-                );
+                return Err(ApiError::moderation_blocked(
+                    message,
+                    Some(moderation_format.as_str()),
+                    Some(json!({
+                        "source": "concurrency_limit"
+                    })),
+                ));
             }
             Err(smart::SmartModerationError::Other(err)) => return Err(ApiError::from(err)),
         }

@@ -478,6 +478,18 @@ impl ApiError {
         self.moderation_details = moderation_details;
         self
     }
+
+    pub(crate) fn moderation_blocked(
+        message: impl Into<String>,
+        source_format: Option<impl Into<String>>,
+        moderation_details: Option<Value>,
+    ) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+            .with_code("MODERATION_BLOCKED")
+            .with_error_type("moderation_error")
+            .with_source_format(source_format)
+            .with_moderation_details(moderation_details)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -546,6 +558,27 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(payload["error"]["source_format"], "claude_chat");
         assert_eq!(payload["error"]["moderation_details"]["source"], "concurrency_limit");
+    }
+
+    #[tokio::test]
+    async fn moderation_blocked_helper_uses_existing_error_shape() {
+        let response = ApiError::moderation_blocked(
+            "blocked by moderation",
+            Some("openai_chat"),
+            Some(json!({
+                "source": "hashlinear_model"
+            })),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body()).await.expect("body bytes");
+        let payload: Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(payload["error"]["code"], "MODERATION_BLOCKED");
+        assert_eq!(payload["error"]["type"], "moderation_error");
+        assert_eq!(payload["error"]["source_format"], "openai_chat");
+        assert_eq!(payload["error"]["moderation_details"]["source"], "hashlinear_model");
     }
 
     #[tokio::test]
