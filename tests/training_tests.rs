@@ -16,7 +16,7 @@ use profile::ModerationProfile;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use sample_rpc::{
     decode_request_line, decode_response_line, dispatch_request, encode_request_line,
@@ -29,8 +29,9 @@ use sample_rpc::serve_storage_sample_rpc_until_shutdown;
 use training::{
     build_training_sample_request, cleanup_training_samples_via_rpc, evaluate_training_need,
     fetch_training_sample_count_via_rpc, fetch_training_samples_via_rpc,
-    fetch_training_samples_via_unix_socket, run_profile_training, train_hashlinear_runtime,
-    write_training_status, TrainingSample,
+    fetch_training_samples_via_unix_socket, run_profile_training,
+    run_training_subprocess_from_args, train_hashlinear_runtime, write_training_status,
+    TrainingSample,
 };
 
 fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationProfile {
@@ -41,6 +42,25 @@ fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationPr
     std::fs::create_dir_all(&profile_dir).expect("create profile dir");
     std::fs::write(profile_dir.join("profile.json"), payload.to_string()).expect("write profile");
     ModerationProfile::load("/services/apps/Prismguand-Rust", profile_name).expect("load profile")
+}
+
+fn write_profile_into(
+    root_dir: &std::path::Path,
+    profile_name: &str,
+    payload: serde_json::Value,
+) -> ModerationProfile {
+    let profile_dir = root_dir
+        .join("configs")
+        .join("mod_profiles")
+        .join(profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    std::fs::write(profile_dir.join("profile.json"), payload.to_string()).expect("write profile");
+    ModerationProfile::load(root_dir, profile_name).expect("load profile")
+}
+
+fn current_dir_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[cfg(feature = "storage-debug")]
@@ -570,6 +590,201 @@ async fn run_profile_training_cleans_samples_then_trains_hashlinear_runtime() {
     ));
 
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
+}
+
+#[tokio::test]
+async fn training_subprocess_marks_success_after_runtime_write() {
+    let _guard = current_dir_test_lock().lock().expect("current dir lock");
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-training-subprocess-success-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let profile = write_profile_into(
+        &root_dir,
+        "default",
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4,
+                "n_features": 32,
+                "epochs": 2,
+                "batch_size": 2,
+                "alpha": 0.0001,
+                "max_seconds": 10
+            }
+        }),
+    );
+
+    let socket_path = root_dir.join("run/sample-store.sock");
+    std::fs::write(
+        root_dir.join(".env"),
+        format!(
+            "TRAINING_DATA_RPC_ENABLED=1\nTRAINING_DATA_RPC_TRANSPORT=unix\nTRAINING_DATA_RPC_UNIX_SOCKET={}\n",
+            socket_path.display()
+        ),
+    )
+    .expect("write env");
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_socket = socket_path.clone();
+    let expected_profile_name = profile.profile_name.clone();
+    let expected_db_path = profile.history_rocks_path().display().to_string();
+    let server_requests = Arc::clone(&requests);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_unix_requests_until_shutdown(
+            &server_socket,
+            move |request| {
+                server_requests.lock().expect("lock requests").push(request.clone());
+                match request {
+                    SampleRpcRequest::GetSampleCount {
+                        profile: request_profile,
+                        db_path: request_db_path,
+                    } => {
+                        assert_eq!(request_profile, expected_profile_name);
+                        assert_eq!(request_db_path, expected_db_path);
+                        SampleRpcResponse::ok(json!({ "sample_count": 20 }))
+                    }
+                    SampleRpcRequest::CleanupExcessSamples {
+                        profile: request_profile,
+                        db_path: request_db_path,
+                        max_items,
+                    } => {
+                        assert_eq!(request_profile, expected_profile_name);
+                        assert_eq!(request_db_path, expected_db_path);
+                        assert_eq!(max_items, 12);
+                        SampleRpcResponse::ok(json!({ "removed": 3 }))
+                    }
+                    SampleRpcRequest::LoadBalancedSamples {
+                        profile: request_profile,
+                        db_path: request_db_path,
+                        max_samples,
+                    } => {
+                        assert_eq!(request_profile, expected_profile_name);
+                        assert_eq!(request_db_path, expected_db_path);
+                        assert_eq!(max_samples, 4);
+                        SampleRpcResponse::ok(json!({
+                            "samples": [
+                                {"id": 1, "text": "safe text", "label": 0},
+                                {"id": 2, "text": "hello world", "label": 0},
+                                {"id": 3, "text": "kill threat", "label": 1, "category": "violence"},
+                                {"id": 4, "text": "bomb attack", "label": 1, "category": "violence"}
+                            ]
+                        }))
+                    }
+                    other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+                }
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let previous_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(&root_dir).expect("set current dir");
+    let result = run_training_subprocess_from_args(&[
+        "prismguard-rust".to_string(),
+        "train-profile".to_string(),
+        "default".to_string(),
+    ])
+    .await;
+    std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join server").expect("server result");
+
+    result.expect("training subprocess result");
+    let status = profile.training_status().expect("training status");
+    assert_eq!(status["status"], "success");
+    assert_eq!(status["profile"], "default");
+    assert_eq!(status["sample_count"], 4);
+    assert!(profile.hashlinear_runtime_json_path().exists());
+    assert!(profile.hashlinear_runtime_coef_path().exists());
+    assert!(profile.hashlinear_model_path().exists());
+
+    let requests = requests.lock().expect("requests lock");
+    assert!(requests.iter().any(|req| matches!(req, SampleRpcRequest::GetSampleCount { .. })));
+    assert!(requests.iter().any(|req| matches!(req, SampleRpcRequest::CleanupExcessSamples { .. })));
+    assert!(requests.iter().any(|req| matches!(req, SampleRpcRequest::LoadBalancedSamples { .. })));
+
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
+}
+
+#[tokio::test]
+async fn training_subprocess_marks_failed_when_rpc_unavailable() {
+    let _guard = current_dir_test_lock().lock().expect("current dir lock");
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-training-subprocess-failed-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let profile = write_profile_into(
+        &root_dir,
+        "default",
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4,
+                "n_features": 32
+            }
+        }),
+    );
+
+    let socket_path = root_dir.join("run/missing.sock");
+    std::fs::write(
+        root_dir.join(".env"),
+        format!(
+            "TRAINING_DATA_RPC_ENABLED=1\nTRAINING_DATA_RPC_TRANSPORT=unix\nTRAINING_DATA_RPC_UNIX_SOCKET={}\n",
+            socket_path.display()
+        ),
+    )
+    .expect("write env");
+
+    let previous_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(&root_dir).expect("set current dir");
+    let result = run_training_subprocess_from_args(&[
+        "prismguard-rust".to_string(),
+        "train-profile".to_string(),
+        "default".to_string(),
+    ])
+    .await;
+    std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+    assert!(result.is_err(), "expected subprocess training to fail without RPC");
+    let status = profile.training_status().expect("training status");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["profile"], "default");
+    assert!(
+        status["message"]
+            .as_str()
+            .expect("error message")
+            .contains("sample RPC")
+            || status["message"]
+                .as_str()
+                .expect("error message")
+                .contains("connect")
+    );
+
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
 }
 
 #[test]
