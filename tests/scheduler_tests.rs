@@ -1,20 +1,27 @@
-#[path = "../src/profile.rs"]
-mod profile;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/profile.rs"]
+mod profile;
+#[path = "../src/scheduler.rs"]
+mod scheduler;
 
 use profile::ModerationProfile;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn env_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
 fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationProfile {
-    let root_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root_dir = repo_root();
     let profile_dir = root_dir
         .join("configs")
         .join("mod_profiles")
@@ -22,6 +29,17 @@ fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationPr
     std::fs::create_dir_all(&profile_dir).expect("create profile dir");
     std::fs::write(profile_dir.join("profile.json"), payload.to_string()).expect("write profile");
     ModerationProfile::load(&root_dir, profile_name).expect("load profile")
+}
+
+fn write_training_status(profile: &ModerationProfile, payload: serde_json::Value) {
+    std::fs::write(profile.training_status_path(), payload.to_string()).expect("write training status");
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current unix time")
+        .as_secs()
 }
 
 #[test]
@@ -64,4 +82,97 @@ fn profile_training_max_db_items_matches_local_model_type() {
     );
 
     assert_eq!(profile.training_max_db_items().expect("max db items"), 321);
+}
+
+#[test]
+fn scheduler_lists_only_profiles_with_profile_json() {
+    let profile_name = format!("scheduler-list-valid-{}", std::process::id());
+    let ignored_name = format!("scheduler-list-ignored-{}", std::process::id());
+    let root_dir = repo_root();
+    let valid_dir = root_dir.join("configs").join("mod_profiles").join(&profile_name);
+    let ignored_dir = root_dir.join("configs").join("mod_profiles").join(&ignored_name);
+
+    std::fs::create_dir_all(&valid_dir).expect("create valid dir");
+    std::fs::write(
+        valid_dir.join("profile.json"),
+        json!({"local_model_type": "hashlinear"}).to_string(),
+    )
+    .expect("write valid profile");
+    std::fs::create_dir_all(&ignored_dir).expect("create ignored dir");
+
+    let profiles = scheduler::list_profiles(&root_dir).expect("list profiles");
+
+    assert!(profiles.contains(&profile_name));
+    assert!(!profiles.contains(&ignored_name));
+}
+
+#[test]
+fn scheduler_skips_profile_when_failure_cooldown_not_elapsed() {
+    let profile = write_profile(
+        &format!("scheduler-cooldown-active-{}", std::process::id()),
+        json!({"local_model_type": "hashlinear"}),
+    );
+    let now = current_unix_secs();
+    write_training_status(
+        &profile,
+        json!({
+            "status": "failed",
+            "message": "boom",
+            "timestamp": now,
+            "profile": profile.profile_name,
+            "model_type": "hashlinear"
+        }),
+    );
+
+    let decision = scheduler::cooldown_allows_training(&profile, 30, now).expect("cooldown decision");
+
+    assert!(!decision);
+}
+
+#[test]
+fn scheduler_allows_profile_after_failure_cooldown_elapses() {
+    let profile = write_profile(
+        &format!("scheduler-cooldown-expired-{}", std::process::id()),
+        json!({"local_model_type": "hashlinear"}),
+    );
+    let now = current_unix_secs();
+    let stale = now - Duration::from_secs(31 * 60).as_secs();
+    write_training_status(
+        &profile,
+        json!({
+            "status": "failed",
+            "message": "old boom",
+            "timestamp": stale,
+            "profile": profile.profile_name,
+            "model_type": "hashlinear"
+        }),
+    );
+
+    let decision = scheduler::cooldown_allows_training(&profile, 30, now).expect("cooldown decision");
+
+    assert!(decision);
+}
+
+#[test]
+fn scheduler_command_uses_single_core_systemd_scope() {
+    let root_dir = repo_root();
+    let cmd = scheduler::build_training_subprocess_command(
+        root_dir.to_str().expect("root dir string"),
+        "default",
+        "0",
+    )
+    .expect("build command");
+
+    assert_eq!(cmd.program, "systemd-run");
+    assert!(cmd.args.iter().any(|arg| arg == "--scope"));
+    assert!(cmd.args.iter().any(|arg| arg == "AllowedCPUs=0"));
+    assert!(cmd.args.iter().any(|arg| arg == "--working-directory"));
+    assert!(cmd.args.windows(2).any(|window| {
+        window[0] == "--working-directory" && window[1] == root_dir.display().to_string()
+    }));
+    assert!(
+        cmd.args
+            .windows(2)
+            .any(|window| window[0] == "train-profile" && window[1] == "default")
+    );
 }
