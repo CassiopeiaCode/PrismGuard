@@ -502,6 +502,10 @@ fn test_settings(env_map: HashMap<String, String>) -> Settings {
         training_data_rpc_enabled: true,
         training_data_rpc_transport: "unix".to_string(),
         training_data_rpc_unix_socket: "/tmp/prismguard-test.sock".to_string(),
+        training_scheduler_enabled: true,
+        training_scheduler_interval_minutes: 10,
+        training_scheduler_failure_cooldown_minutes: 30,
+        training_subprocess_allowed_cpus: "0".to_string(),
         root_dir: PathBuf::from("/services/apps/Prismguand-Rust"),
         env_map,
     }
