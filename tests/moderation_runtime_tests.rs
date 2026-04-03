@@ -10,6 +10,10 @@ mod proxy;
 mod response;
 #[path = "../src/routes.rs"]
 mod routes;
+#[path = "../src/sample_rpc.rs"]
+mod sample_rpc;
+#[path = "../src/storage.rs"]
+mod storage;
 #[path = "../src/training.rs"]
 mod training;
 #[path = "../src/moderation/basic.rs"]
@@ -273,6 +277,14 @@ async fn smart_moderation_local_hashlinear_blocks_before_upstream_proxy_call() {
                 "max_text_length": 4000
             },
             "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "analyzer": "char",
+                "ngram_range": [2, 4],
+                "n_features": 1,
+                "alternate_sign": false,
+                "norm": "l2",
+                "use_jieba": false
+            },
             "probability": {
                 "ai_review_rate": 0.0,
                 "random_seed": 42,
@@ -352,6 +364,14 @@ async fn smart_moderation_low_risk_hashlinear_still_reaches_upstream() {
                 "max_text_length": 4000
             },
             "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "analyzer": "char",
+                "ngram_range": [2, 4],
+                "n_features": 1,
+                "alternate_sign": false,
+                "norm": "l2",
+                "use_jieba": false
+            },
             "probability": {
                 "ai_review_rate": 0.0,
                 "random_seed": 42,
