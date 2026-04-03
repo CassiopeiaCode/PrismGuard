@@ -56,20 +56,46 @@ struct HashlinearRuntime {
     cfg: RuntimeConfig,
 }
 
-pub fn predict_proba(text: &str, profile: &ModerationProfile) -> Result<Option<f64>> {
-    let prefix = runtime_prefix(profile);
-    let meta_path = prefix.with_extension("json");
-    let coef_path = prefix.with_extension("coef.f32");
-    if !meta_path.exists() || !coef_path.exists() {
+#[derive(Debug, Clone)]
+pub struct HashlinearRuntimePaths {
+    pub prefix: PathBuf,
+    pub metadata_path: PathBuf,
+    pub coefficients_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HashlinearScore {
+    pub probability: f64,
+}
+
+pub fn runtime_paths(profile: &ModerationProfile) -> HashlinearRuntimePaths {
+    let prefix = profile.base_dir.join("hashlinear_runtime");
+    HashlinearRuntimePaths {
+        metadata_path: prefix.with_extension("json"),
+        coefficients_path: prefix.with_extension("coef.f32"),
+        prefix,
+    }
+}
+
+pub fn runtime_exists(profile: &ModerationProfile) -> bool {
+    let paths = runtime_paths(profile);
+    paths.metadata_path.exists() && paths.coefficients_path.exists()
+}
+
+pub fn predict(text: &str, profile: &ModerationProfile) -> Result<Option<HashlinearScore>> {
+    let paths = runtime_paths(profile);
+    if !paths.metadata_path.exists() || !paths.coefficients_path.exists() {
         return Ok(None);
     }
 
-    let runtime = load_runtime(profile, &meta_path, &coef_path)?;
-    Ok(Some(runtime.predict_proba(text)?))
+    let runtime = load_runtime(profile, &paths.metadata_path, &paths.coefficients_path)?;
+    Ok(Some(HashlinearScore {
+        probability: runtime.predict_proba(text)?,
+    }))
 }
 
-fn runtime_prefix(profile: &ModerationProfile) -> PathBuf {
-    profile.base_dir.join("hashlinear_runtime")
+pub fn predict_proba(text: &str, profile: &ModerationProfile) -> Result<Option<f64>> {
+    Ok(predict(text, profile)?.map(|score| score.probability))
 }
 
 fn load_runtime(
@@ -79,25 +105,30 @@ fn load_runtime(
 ) -> Result<Arc<HashlinearRuntime>> {
     let signature = runtime_signature(meta_path, coef_path)?;
     let cache = RUNTIME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_key = runtime_cache_key(profile);
     {
         let guard = cache.lock().expect("hashlinear runtime cache");
-        if let Some(cached) = guard.get(&profile.profile_name) {
+        if let Some(cached) = guard.get(&cache_key) {
             if cached.signature == signature {
                 return Ok(cached.runtime.clone());
             }
         }
     }
 
-    let runtime = Arc::new(HashlinearRuntime::load(meta_path, coef_path)?);
+    let runtime = Arc::new(HashlinearRuntime::load(meta_path, coef_path, profile)?);
     let mut guard = cache.lock().expect("hashlinear runtime cache");
     guard.insert(
-        profile.profile_name.clone(),
+        cache_key,
         CachedRuntime {
             signature,
             runtime: runtime.clone(),
         },
     );
     Ok(runtime)
+}
+
+fn runtime_cache_key(profile: &ModerationProfile) -> String {
+    profile.base_dir.display().to_string()
 }
 
 fn runtime_signature(meta_path: &Path, coef_path: &Path) -> Result<RuntimeSignature> {
@@ -118,7 +149,7 @@ fn modified_secs(path: &Path) -> Result<u64> {
 }
 
 impl HashlinearRuntime {
-    fn load(meta_path: &Path, coef_path: &Path) -> Result<Self> {
+    fn load(meta_path: &Path, coef_path: &Path, profile: &ModerationProfile) -> Result<Self> {
         let metadata: RuntimeMetadata = serde_json::from_str(
             &fs::read_to_string(meta_path)
                 .with_context(|| format!("failed to read {}", meta_path.display()))?,
@@ -144,6 +175,7 @@ impl HashlinearRuntime {
                 metadata.n_features
             ));
         }
+        validate_runtime_metadata(&metadata, profile)?;
 
         let coef_bytes =
             fs::read(coef_path).with_context(|| format!("failed to read {}", coef_path.display()))?;
@@ -188,6 +220,10 @@ fn extract_features(
     cfg: &RuntimeConfig,
     n_features: usize,
 ) -> Result<HashMap<usize, f64>> {
+    if n_features == 0 {
+        return Err(anyhow!("hashlinear runtime n_features must be > 0"));
+    }
+
     let lowered = if cfg.lowercase {
         text.to_lowercase()
     } else {
@@ -222,9 +258,54 @@ fn extract_features(
 
 fn ngram_range(range: &[usize]) -> Result<(usize, usize)> {
     match range {
-        [min_n, max_n] => Ok((*min_n, *max_n)),
+        [min_n, max_n] if *min_n > 0 && *min_n <= *max_n => Ok((*min_n, *max_n)),
         other => Err(anyhow!("invalid hashlinear ngram_range: {:?}", other)),
     }
+}
+
+fn validate_runtime_metadata(metadata: &RuntimeMetadata, profile: &ModerationProfile) -> Result<()> {
+    if metadata.n_features == 0 {
+        return Err(anyhow!("hashlinear runtime n_features must be > 0"));
+    }
+
+    let expected = &profile.config.hashlinear_training;
+    if metadata.cfg.analyzer != expected.analyzer {
+        return Err(anyhow!(
+            "hashlinear runtime analyzer mismatch: {} != {}",
+            metadata.cfg.analyzer,
+            expected.analyzer
+        ));
+    }
+    if metadata.cfg.ngram_range != expected.ngram_range {
+        return Err(anyhow!(
+            "hashlinear runtime ngram_range mismatch: {:?} != {:?}",
+            metadata.cfg.ngram_range,
+            expected.ngram_range
+        ));
+    }
+    if metadata.cfg.n_features != expected.n_features {
+        return Err(anyhow!(
+            "hashlinear runtime profile n_features mismatch: {} != {}",
+            metadata.cfg.n_features,
+            expected.n_features
+        ));
+    }
+    if metadata.cfg.alternate_sign != expected.alternate_sign {
+        return Err(anyhow!(
+            "hashlinear runtime alternate_sign mismatch: {} != {}",
+            metadata.cfg.alternate_sign,
+            expected.alternate_sign
+        ));
+    }
+    if metadata.cfg.norm != expected.norm {
+        return Err(anyhow!(
+            "hashlinear runtime norm mismatch: {:?} != {:?}",
+            metadata.cfg.norm,
+            expected.norm
+        ));
+    }
+
+    Ok(())
 }
 
 fn normalize_spaces(input: &str) -> String {
