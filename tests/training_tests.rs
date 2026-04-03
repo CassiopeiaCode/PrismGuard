@@ -16,6 +16,7 @@ use profile::ModerationProfile;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use sample_rpc::{
     decode_request_line, decode_response_line, dispatch_request, encode_request_line,
@@ -26,8 +27,10 @@ use sample_rpc::{
 #[cfg(feature = "storage-debug")]
 use sample_rpc::serve_storage_sample_rpc_until_shutdown;
 use training::{
-    build_training_sample_request, evaluate_training_need, fetch_training_samples_via_rpc,
-    fetch_training_samples_via_unix_socket, train_hashlinear_runtime, TrainingSample,
+    build_training_sample_request, cleanup_training_samples_via_rpc, evaluate_training_need,
+    fetch_training_sample_count_via_rpc, fetch_training_samples_via_rpc,
+    fetch_training_samples_via_unix_socket, run_profile_training, train_hashlinear_runtime,
+    write_training_status, TrainingSample,
 };
 
 fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationProfile {
@@ -311,6 +314,261 @@ async fn training_fetches_samples_via_sample_rpc_config() {
     );
 
     server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
+}
+
+#[tokio::test]
+async fn training_fetches_sample_count_via_sample_rpc_config() {
+    let profile = write_profile(
+        &format!("training-fetch-count-rpc-config-{}", std::process::id()),
+        json!({
+            "local_model_type": "hashlinear"
+        }),
+    );
+
+    let socket_dir =
+        PathBuf::from(format!("/tmp/prismguard-train-count-rpc-config-{}", std::process::id()));
+    if socket_dir.exists() {
+        std::fs::remove_dir_all(&socket_dir).expect("cleanup old socket dir");
+    }
+    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+    let socket_path = socket_dir.join("sample.sock");
+
+    let rpc = SampleRpcConfig {
+        enabled: true,
+        transport: SampleRpcTransport::Unix,
+        unix_socket: socket_path.clone(),
+    };
+
+    let expected_request = SampleRpcRequest::GetSampleCount {
+        profile: profile.profile_name.clone(),
+        db_path: profile.history_rocks_path().display().to_string(),
+    };
+    let server_socket = socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_one_unix_request(&server_socket, |request| {
+            assert_eq!(request, expected_request);
+            Ok(SampleRpcResponse::ok(json!({
+                "sample_count": 23
+            })))
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let sample_count = fetch_training_sample_count_via_rpc(&rpc, &profile)
+        .await
+        .expect("fetch sample count via rpc config");
+    assert_eq!(sample_count, 23);
+
+    server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
+}
+
+#[tokio::test]
+async fn training_cleans_up_samples_via_sample_rpc_config() {
+    let profile = write_profile(
+        &format!("training-cleanup-rpc-config-{}", std::process::id()),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "max_db_items": 32
+            }
+        }),
+    );
+
+    let socket_dir =
+        PathBuf::from(format!("/tmp/prismguard-train-cleanup-rpc-config-{}", std::process::id()));
+    if socket_dir.exists() {
+        std::fs::remove_dir_all(&socket_dir).expect("cleanup old socket dir");
+    }
+    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+    let socket_path = socket_dir.join("sample.sock");
+
+    let rpc = SampleRpcConfig {
+        enabled: true,
+        transport: SampleRpcTransport::Unix,
+        unix_socket: socket_path.clone(),
+    };
+
+    let expected_request = SampleRpcRequest::CleanupExcessSamples {
+        profile: profile.profile_name.clone(),
+        db_path: profile.history_rocks_path().display().to_string(),
+        max_items: 32,
+    };
+    let server_socket = socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_one_unix_request(&server_socket, |request| {
+            assert_eq!(request, expected_request);
+            Ok(SampleRpcResponse::ok(json!({
+                "removed": 5
+            })))
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let removed = cleanup_training_samples_via_rpc(&rpc, &profile)
+        .await
+        .expect("cleanup training samples via rpc config");
+    assert_eq!(removed, 5);
+
+    server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
+}
+
+#[test]
+fn training_status_writer_persists_python_style_fields() {
+    let profile = write_profile(
+        &format!("training-status-shape-{}", std::process::id()),
+        json!({
+            "local_model_type": "hashlinear"
+        }),
+    );
+
+    write_training_status(
+        &profile,
+        &json!({
+            "status": "failed",
+            "message": "previous run failed",
+            "timestamp": 1_744_000_000u64,
+            "profile": profile.profile_name,
+            "model_type": "hashlinear",
+            "sample_count": 19
+        }),
+    )
+    .expect("write status");
+
+    let status = profile.training_status().expect("training status");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["message"], "previous run failed");
+    assert_eq!(status["sample_count"], 19);
+}
+
+#[tokio::test]
+async fn run_profile_training_cleans_samples_then_trains_hashlinear_runtime() {
+    let profile = write_profile(
+        &format!("training-run-profile-{}", std::process::id()),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4,
+                "n_features": 32,
+                "epochs": 2,
+                "batch_size": 2,
+                "alpha": 0.0001,
+                "max_seconds": 10
+            }
+        }),
+    );
+
+    let runtime_json = profile.hashlinear_runtime_json_path();
+    let runtime_coef = profile.hashlinear_runtime_coef_path();
+    let model_marker = profile.hashlinear_model_path();
+    let _ = std::fs::remove_file(&runtime_json);
+    let _ = std::fs::remove_file(&runtime_coef);
+    let _ = std::fs::remove_file(&model_marker);
+
+    let socket_dir = PathBuf::from(format!("/tmp/prismguard-run-profile-rpc-{}", std::process::id()));
+    if socket_dir.exists() {
+        std::fs::remove_dir_all(&socket_dir).expect("cleanup old socket dir");
+    }
+    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+    let socket_path = socket_dir.join("sample.sock");
+
+    let rpc = SampleRpcConfig {
+        enabled: true,
+        transport: SampleRpcTransport::Unix,
+        unix_socket: socket_path.clone(),
+    };
+
+    let profile_name = profile.profile_name.clone();
+    let db_path = profile.history_rocks_path().display().to_string();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_socket = socket_path.clone();
+    let server_requests = Arc::clone(&requests);
+    let server = tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let response_profile_name = profile_name.clone();
+        let response_db_path = db_path.clone();
+        let recorded_requests = Arc::clone(&server_requests);
+        let server = tokio::spawn(async move {
+            serve_unix_requests_until_shutdown(
+                &server_socket,
+                move |request| {
+                    recorded_requests.lock().expect("lock requests").push(request.clone());
+                    match request {
+                        SampleRpcRequest::CleanupExcessSamples {
+                            profile,
+                            db_path,
+                            max_items,
+                        } => {
+                            assert_eq!(profile, response_profile_name);
+                            assert_eq!(db_path, response_db_path);
+                            assert_eq!(max_items, 12);
+                            SampleRpcResponse::ok(json!({ "removed": 3 }))
+                        }
+                        SampleRpcRequest::LoadBalancedSamples {
+                            profile,
+                            db_path,
+                            max_samples,
+                        } => {
+                            assert_eq!(profile, response_profile_name);
+                            assert_eq!(db_path, response_db_path);
+                            assert_eq!(max_samples, 4);
+                            SampleRpcResponse::ok(json!({
+                                "samples": [
+                                    {"id": 1, "text": "safe text", "label": 0},
+                                    {"id": 2, "text": "hello world", "label": 0},
+                                    {"id": 3, "text": "kill threat", "label": 1, "category": "violence"},
+                                    {"id": 4, "text": "bomb attack", "label": 1, "category": "violence"}
+                                ]
+                            }))
+                        }
+                        other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+                    }
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let _ = shutdown_tx.send(());
+        let result = server.await.expect("join nested server");
+        result
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let output = run_profile_training(&rpc, &profile)
+        .await
+        .expect("run profile training");
+    assert_eq!(output.sample_count, 4);
+    assert_eq!(output.pass_count, 2);
+    assert_eq!(output.violation_count, 2);
+    assert!(runtime_json.exists());
+    assert!(runtime_coef.exists());
+    assert!(model_marker.exists());
+
+    server.await.expect("join server").expect("server result");
+    let requests = requests.lock().expect("lock requests");
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(
+        requests.first(),
+        Some(SampleRpcRequest::CleanupExcessSamples { .. })
+    ));
+    assert!(matches!(
+        requests.get(1),
+        Some(SampleRpcRequest::LoadBalancedSamples { .. })
+    ));
+
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
@@ -707,6 +965,60 @@ fn sample_rpc_dispatches_get_sample_count_with_real_storage() {
         SampleRpcResponse {
             ok: true,
             result: Some(json!({ "sample_count": 7 })),
+            error: None,
+        }
+    );
+
+    std::fs::remove_dir_all(&rocks_dir).expect("cleanup rocks dir");
+}
+
+#[cfg(feature = "storage-debug")]
+#[test]
+fn sample_rpc_dispatches_cleanup_excess_samples_with_real_storage() {
+    let rocks_dir = PathBuf::from(format!(
+        "/tmp/prismguard-sample-rpc-cleanup-{}",
+        std::process::id()
+    ));
+    seed_sample_db(
+        &rocks_dir,
+        &[
+            json!({"id": 1, "text": "pass-1", "label": 0, "category": null, "created_at": "2026-04-03 10:00:00"}),
+            json!({"id": 2, "text": "pass-2", "label": 0, "category": null, "created_at": "2026-04-03 10:01:00"}),
+            json!({"id": 3, "text": "pass-3", "label": 0, "category": null, "created_at": "2026-04-03 10:02:00"}),
+            json!({"id": 4, "text": "pass-4", "label": 0, "category": null, "created_at": "2026-04-03 10:03:00"}),
+            json!({"id": 5, "text": "violation-1", "label": 1, "category": "unsafe", "created_at": "2026-04-03 10:04:00"}),
+            json!({"id": 6, "text": "violation-2", "label": 1, "category": "unsafe", "created_at": "2026-04-03 10:05:00"}),
+            json!({"id": 7, "text": "violation-3", "label": 1, "category": "unsafe", "created_at": "2026-04-03 10:06:00"}),
+            json!({"id": 8, "text": "violation-4", "label": 1, "category": "unsafe", "created_at": "2026-04-03 10:07:00"}),
+        ],
+    );
+
+    let response = sample_rpc::dispatch_request_with_storage(
+        SampleRpcRequest::CleanupExcessSamples {
+            profile: "default".to_string(),
+            db_path: rocks_dir.display().to_string(),
+            max_items: 4,
+        },
+    );
+
+    assert_eq!(
+        response,
+        SampleRpcResponse {
+            ok: true,
+            result: Some(json!({ "removed": 4 })),
+            error: None,
+        }
+    );
+
+    let count_response = sample_rpc::dispatch_request_with_storage(SampleRpcRequest::GetSampleCount {
+        profile: "default".to_string(),
+        db_path: rocks_dir.display().to_string(),
+    });
+    assert_eq!(
+        count_response,
+        SampleRpcResponse {
+            ok: true,
+            result: Some(json!({ "sample_count": 4 })),
             error: None,
         }
     );

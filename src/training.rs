@@ -139,6 +139,57 @@ pub async fn fetch_training_samples_via_rpc(
     fetch_training_samples_via_unix_socket(rpc.unix_socket_path()?, profile).await
 }
 
+pub async fn fetch_training_sample_count_via_rpc(
+    rpc: &SampleRpcConfig,
+    profile: &ModerationProfile,
+) -> Result<usize> {
+    let request = SampleRpcRequest::GetSampleCount {
+        profile: profile.profile_name.clone(),
+        db_path: profile.history_rocks_path_string(),
+    };
+    let response = send_unix_request(rpc.unix_socket_path()?, &request).await?;
+    if !response.ok {
+        return Err(anyhow!(
+            "sample RPC request failed: {}",
+            response.error.unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+
+    parse_usize_result(
+        response
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow!("sample RPC response missing result payload"))?,
+        "sample_count",
+    )
+}
+
+pub async fn cleanup_training_samples_via_rpc(
+    rpc: &SampleRpcConfig,
+    profile: &ModerationProfile,
+) -> Result<usize> {
+    let request = SampleRpcRequest::CleanupExcessSamples {
+        profile: profile.profile_name.clone(),
+        db_path: profile.history_rocks_path_string(),
+        max_items: training_max_db_items(profile)?,
+    };
+    let response = send_unix_request(rpc.unix_socket_path()?, &request).await?;
+    if !response.ok {
+        return Err(anyhow!(
+            "sample RPC request failed: {}",
+            response.error.unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+
+    parse_usize_result(
+        response
+            .result
+            .as_ref()
+            .ok_or_else(|| anyhow!("sample RPC response missing result payload"))?,
+        "removed",
+    )
+}
+
 pub async fn fetch_training_samples_via_unix_socket(
     socket_path: &Path,
     profile: &ModerationProfile,
@@ -158,6 +209,31 @@ pub async fn fetch_training_samples_via_unix_socket(
             .as_ref()
             .ok_or_else(|| anyhow!("sample RPC response missing result payload"))?,
     )
+}
+
+pub fn write_training_status(profile: &ModerationProfile, status: &Value) -> Result<()> {
+    let status_path = profile.training_status_path();
+    let tmp_path = status_path.with_extension("json.tmp");
+    let payload = serde_json::to_vec_pretty(status).context("failed to encode training status")?;
+    fs::write(&tmp_path, payload)
+        .with_context(|| format!("failed to write training status tmp {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &status_path).with_context(|| {
+        format!(
+            "failed to replace training status {} with {}",
+            status_path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub async fn run_profile_training(
+    rpc: &SampleRpcConfig,
+    profile: &ModerationProfile,
+) -> Result<HashlinearTrainingOutput> {
+    let _ = cleanup_training_samples_via_rpc(rpc, profile).await?;
+    let samples = fetch_training_samples_via_rpc(rpc, profile).await?;
+    train_hashlinear_runtime(profile, &samples)
 }
 
 pub fn train_hashlinear_runtime(
@@ -276,6 +352,23 @@ fn parse_training_samples(result: &Value) -> Result<Vec<TrainingSample>> {
         .into_iter()
         .map(|sample| serde_json::from_value(sample).context("failed to decode training sample"))
         .collect()
+}
+
+fn parse_usize_result(result: &Value, field: &str) -> Result<usize> {
+    let value = result
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("sample RPC response missing numeric {field}"))?;
+    usize::try_from(value).context("sample RPC numeric result overflowed usize")
+}
+
+fn training_max_db_items(profile: &ModerationProfile) -> Result<usize> {
+    match profile.config.local_model_type.as_str() {
+        "fasttext" => Ok(profile.config.fasttext_training.max_db_items),
+        "hashlinear" => Ok(profile.config.hashlinear_training.max_db_items),
+        "bow" => Ok(profile.config.bow_training.max_db_items),
+        other => Err(anyhow!("unsupported local_model_type: {other}")),
+    }
 }
 
 fn hashlinear_training_spec(profile: &ModerationProfile) -> HashlinearTrainingSpec {
