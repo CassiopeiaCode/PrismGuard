@@ -10,8 +10,10 @@ mod proxy;
 mod response;
 #[path = "../src/routes.rs"]
 mod routes;
-#[path = "../src/storage.rs"]
-mod storage;
+#[path = "../src/training.rs"]
+mod training;
+#[path = "../src/moderation/mod.rs"]
+mod moderation;
 #[path = "../src/streaming.rs"]
 mod streaming;
 
@@ -24,7 +26,7 @@ use axum::body::Body;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
-use axum::Router;
+use axum::{Json, Router};
 use config::Settings;
 use routes::{router as proxy_router, AppState};
 use serde_json::json;
@@ -116,6 +118,377 @@ async fn delay_stream_header_returns_json_error_before_committing_empty_stream()
 
     let body: serde_json::Value = response.json().await.expect("json body");
     assert!(body["error"]["message"].as_str().unwrap().contains("Stream"));
+}
+
+#[tokio::test]
+async fn delay_stream_header_rejects_too_short_stream_content_like_python() {
+    let upstream_base = spawn_too_short_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "UPSTREAM_STREAM_ERROR");
+    assert_eq!(body["error"]["type"], "upstream_stream_error");
+}
+
+#[tokio::test]
+async fn delay_stream_header_allows_large_unrecognized_stream_after_protection_limit() {
+    let upstream_base = spawn_large_unrecognized_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+}
+
+#[tokio::test]
+async fn non_200_sse_is_passed_through_without_delay_validation_like_python() {
+    let upstream_base = spawn_status_sse_upstream(
+        StatusCode::TOO_MANY_REQUESTS,
+        "data: {\"error\":\"busy\"}\n\n",
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"error\":\"busy\""), "{body}");
+}
+
+#[tokio::test]
+async fn non_200_ok_sse_is_still_passed_through_like_python() {
+    let upstream_base = spawn_status_sse_upstream(
+        StatusCode::CREATED,
+        "data: {\"created\":\"yes\"}\n\n",
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"created\":\"yes\""), "{body}");
+    assert!(!body.contains("chat.completion.chunk"), "{body}");
+}
+
+#[tokio::test]
+async fn non_200_sse_preserves_custom_headers_and_strips_denied_like_python() {
+    let upstream_base = spawn_status_sse_upstream_with_headers(
+        StatusCode::TOO_MANY_REQUESTS,
+        "data: {\"error\":\"busy\"}\n\n",
+        vec![
+            ("x-upstream-marker", "kept-on-pass-through"),
+            ("set-cookie", "session=secret"),
+            ("x-frame-options", "DENY"),
+        ],
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("kept-on-pass-through")
+    );
+    assert_eq!(response.headers().get("set-cookie"), None);
+    assert_eq!(response.headers().get("x-frame-options"), None);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"error\":\"busy\""), "{body}");
+}
+
+#[tokio::test]
+async fn stream_request_non_200_json_error_preserves_json_content_type_like_python() {
+    let upstream_base = spawn_status_json_upstream(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "error": {
+                "message": "busy"
+            }
+        }),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["message"], "busy");
+}
+
+#[tokio::test]
+async fn stream_request_with_non_stream_json_success_stays_json_like_python() {
+    let upstream_base = spawn_status_json_upstream(
+        StatusCode::OK,
+        json!({
+            "id": "resp_sync",
+            "object": "response",
+            "model": "gpt-4.1-mini",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "hello"
+                }]
+            }]
+        }),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: serde_json::Value = response.json().await.expect("json body");
+    assert_eq!(body["choices"][0]["message"]["content"], "hello");
+}
+
+#[tokio::test]
+async fn stream_request_with_mislabelled_sse_response_is_still_treated_as_stream_like_python() {
+    let upstream_base = spawn_mislabelled_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = response.text().await.expect("stream body");
+    assert!(body.contains("chat.completion.chunk"), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
 }
 
 #[tokio::test]
@@ -631,6 +1004,132 @@ async fn spawn_error_event_sse_upstream() -> String {
     format!("http://{}", addr)
 }
 
+async fn spawn_too_short_sse_upstream() -> String {
+    let body = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_short\",\"model\":\"gpt-4.1-mini\",\"created_at\":1710000000}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    spawn_raw_sse_upstream(body).await
+}
+
+async fn spawn_large_unrecognized_sse_upstream() -> String {
+    let filler = "x".repeat(1200);
+    let body = format!("data: {{{filler}}}\n\n");
+    let leaked: &'static str = Box::leak(body.into_boxed_str());
+    spawn_raw_sse_upstream(leaked).await
+}
+
+async fn spawn_raw_sse_upstream(body: &'static str) -> String {
+    spawn_status_sse_upstream(StatusCode::OK, body).await
+}
+
+async fn spawn_status_sse_upstream(status: StatusCode, body: &'static str) -> String {
+    spawn_status_sse_upstream_with_headers(status, body, Vec::new()).await
+}
+
+async fn spawn_status_sse_upstream_with_headers(
+    status: StatusCode,
+    body: &'static str,
+    headers: Vec<(&'static str, &'static str)>,
+) -> String {
+    let app = Router::new().route(
+        "/*path",
+        post(move || {
+            let headers = headers.clone();
+            async move {
+                let mut response = Response::builder()
+                    .status(status)
+                    .header(CONTENT_TYPE, "text/event-stream");
+                for (name, value) in headers {
+                    response = response.header(name, value);
+                }
+                response
+                    .body(Body::from(body.to_string()))
+                    .expect("raw sse response")
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw sse upstream");
+    let addr = listener.local_addr().expect("raw sse upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("raw sse upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_mislabelled_sse_upstream() -> String {
+    let payload = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_mislabelled\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_mislabelled\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .expect("mislabelled sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mislabelled sse upstream");
+    let addr = listener
+        .local_addr()
+        .expect("mislabelled sse upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("mislabelled sse upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_status_json_upstream(status: StatusCode, body: serde_json::Value) -> String {
+    let app = Router::new().route(
+        "/*path",
+        post(move || {
+            let body = body.clone();
+            async move { (status, Json(body)) }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind status json upstream");
+    let addr = listener.local_addr().expect("status json upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("status json upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
 async fn spawn_completed_without_done_sse_upstream() -> String {
     let payload = concat!(
         "event: response.created\n",
@@ -928,6 +1427,9 @@ fn test_settings() -> Settings {
         access_log_file: "logs/access.log".to_string(),
         moderation_log_file: "logs/moderation.log".to_string(),
         training_log_file: "logs/training.log".to_string(),
+        training_data_rpc_enabled: true,
+        training_data_rpc_transport: "unix".to_string(),
+        training_data_rpc_unix_socket: "/tmp/prismguard-test.sock".to_string(),
         root_dir: PathBuf::from("/services/apps/Prismguand-Rust"),
         env_map: HashMap::new(),
     }

@@ -10,8 +10,10 @@ mod proxy;
 mod response;
 #[path = "../src/routes.rs"]
 mod routes;
-#[path = "../src/storage.rs"]
-mod storage;
+#[path = "../src/training.rs"]
+mod training;
+#[path = "../src/moderation/mod.rs"]
+mod moderation;
 #[path = "../src/streaming.rs"]
 mod streaming;
 
@@ -20,7 +22,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
 use config::Settings;
@@ -979,7 +983,7 @@ async fn upstream_openai_responses_empty_output_keeps_empty_assistant_message_sh
 }
 
 #[tokio::test]
-async fn non_json_success_response_is_passed_through_as_text_body() {
+async fn non_json_success_response_is_wrapped_as_json_like_python() {
     let upstream_base = spawn_fixed_upstream(
         StatusCode::OK,
         "text/plain; charset=utf-8",
@@ -1008,18 +1012,489 @@ async fn non_json_success_response_is_passed_through_as_text_body() {
             .headers()
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(
+        body,
+        json!({
+            "text": "plain text body",
+            "status_code": 200
+        })
+    );
+}
+
+#[tokio::test]
+async fn non_json_success_response_respects_declared_charset_like_python() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::OK,
+        "text/plain; charset=iso-8859-1",
+        b"caf\xe9".to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({}).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(
+        body,
+        json!({
+            "text": "café",
+            "status_code": 200
+        })
+    );
+}
+
+#[tokio::test]
+async fn successful_json_response_does_not_preserve_upstream_custom_headers_like_python() {
+    let upstream_base = spawn_json_upstream_with_header(
+        json!({
+            "ok": true
+        }),
+        ("x-upstream-marker", "kept-by-rust-today"),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({}).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-marker")
+            .and_then(|value| value.to_str().ok()),
+        None
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["ok"], true);
+}
+
+#[tokio::test]
+async fn json_array_success_response_is_passed_through_when_response_transform_fails() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::OK,
+        "application/json",
+        br#"[{"type":"unexpected"}]"#.to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body, json!([{ "type": "unexpected" }]));
+}
+
+#[tokio::test]
+async fn json_scalar_success_response_is_passed_through_like_python() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::OK,
+        "application/json",
+        br#""hello from upstream""#.to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({}).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body, json!("hello from upstream"));
+}
+
+#[tokio::test]
+async fn delay_stream_header_allows_json_scalar_success_response_like_python() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::OK,
+        "application/json",
+        br#""hello from upstream""#.to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body, json!("hello from upstream"));
+}
+
+#[tokio::test]
+async fn delay_stream_header_skips_validation_for_non_200_success_like_python() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::CREATED,
+        "text/plain; charset=utf-8",
+        b"x".to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
         Some("text/plain; charset=utf-8")
     );
     let body = response.text().await.expect("text body");
-    assert_eq!(body, "plain text body");
+    assert_eq!(body, "x");
+}
+
+#[tokio::test]
+async fn non_200_ok_empty_response_is_passed_through_like_python() {
+    let upstream_base = spawn_fixed_upstream(StatusCode::NO_CONTENT, "text/plain", Vec::new()).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({}).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    let body = response.bytes().await.expect("body bytes");
+    assert!(body.is_empty(), "{body:?}");
+}
+
+#[tokio::test]
+async fn non_200_response_preserves_upstream_custom_headers_like_python() {
+    let upstream_base = spawn_fixed_upstream_with_extra_header(
+        StatusCode::BAD_REQUEST,
+        "application/json",
+        br#"{"error":"bad request"}"#.to_vec(),
+        ("x-upstream-marker", "kept-on-pass-through"),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({}).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("kept-on-pass-through")
+    );
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body, json!({"error": "bad request"}));
+}
+
+#[tokio::test]
+async fn non_200_response_strips_denied_headers_like_python() {
+    let upstream_base = spawn_fixed_upstream_with_headers(
+        StatusCode::BAD_REQUEST,
+        "application/json",
+        br#"{"error":"bad request"}"#.to_vec(),
+        vec![
+            ("x-upstream-marker", "kept-on-pass-through"),
+            ("set-cookie", "session=secret"),
+            ("x-frame-options", "DENY"),
+        ],
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({}).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-marker")
+            .and_then(|value| value.to_str().ok()),
+        Some("kept-on-pass-through")
+    );
+    assert_eq!(response.headers().get("set-cookie"), None);
+    assert_eq!(response.headers().get("x-frame-options"), None);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body, json!({"error": "bad request"}));
+}
+
+#[tokio::test]
+async fn delay_stream_header_validates_non_stream_empty_response_like_python() {
+    let upstream_base = spawn_json_upstream(json!({
+        "id": "resp_empty_for_validation",
+        "object": "response",
+        "model": "gpt-4.1-mini",
+        "status": "completed",
+        "output": []
+    }))
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "EMPTY_RESPONSE");
+    assert_eq!(body["error"]["type"], "content_validation_error");
+}
+
+#[tokio::test]
+async fn delay_stream_header_rejects_non_json_success_response_like_python() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::OK,
+        "text/plain; charset=utf-8",
+        b"plain text body".to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "EMPTY_RESPONSE");
+    assert_eq!(body["error"]["type"], "content_validation_error");
+}
+
+#[tokio::test]
+async fn delay_stream_header_non_json_transform_failure_uses_client_format_for_validation_like_python() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::OK,
+        "text/plain; charset=utf-8",
+        b"plain text body".to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "EMPTY_RESPONSE");
+    assert_eq!(body["error"]["type"], "content_validation_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("Format name: openai_chat")
+    );
 }
 
 async fn spawn_json_upstream(body: Value) -> String {
+    spawn_json_upstream_with_header(body, ("x-unused", "unused")).await
+}
+
+async fn spawn_json_upstream_with_header(body: Value, header: (&'static str, &'static str)) -> String {
     let app = Router::new().route(
         "/*path",
         post(move || {
             let body = body.clone();
-            async move { (StatusCode::OK, Json(body)) }
+            let header = header;
+            async move { (StatusCode::OK, [(header.0, header.1)], Json(body)) }
         }),
     );
 
@@ -1040,16 +1515,43 @@ async fn spawn_json_upstream(body: Value) -> String {
 }
 
 async fn spawn_fixed_upstream(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> String {
+    spawn_fixed_upstream_with_headers(
+        status,
+        content_type,
+        body,
+        vec![("x-unused", "unused")],
+    )
+    .await
+}
+
+async fn spawn_fixed_upstream_with_extra_header(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+    header: (&'static str, &'static str),
+) -> String {
+    spawn_fixed_upstream_with_headers(status, content_type, body, vec![header]).await
+}
+
+async fn spawn_fixed_upstream_with_headers(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+    headers: Vec<(&'static str, &'static str)>,
+) -> String {
     let app = Router::new().route(
         "/*path",
         post(move || {
             let body = body.clone();
+            let headers = headers.clone();
             async move {
-                (
-                    status,
-                    [(axum::http::header::CONTENT_TYPE, content_type)],
-                    body,
-                )
+                let mut response = Response::builder()
+                    .status(status)
+                    .header(axum::http::header::CONTENT_TYPE, content_type);
+                for (name, value) in headers {
+                    response = response.header(name, value);
+                }
+                response.body(Body::from(body)).expect("upstream response")
             }
         }),
     );
@@ -1104,6 +1606,9 @@ fn test_settings() -> Settings {
         access_log_file: "logs/access.log".to_string(),
         moderation_log_file: "logs/moderation.log".to_string(),
         training_log_file: "logs/training.log".to_string(),
+        training_data_rpc_enabled: true,
+        training_data_rpc_transport: "unix".to_string(),
+        training_data_rpc_unix_socket: "/tmp/prismguard-test.sock".to_string(),
         root_dir: PathBuf::from("/services/apps/Prismguand-Rust"),
         env_map: HashMap::new(),
     }

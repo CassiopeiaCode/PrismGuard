@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, Options};
@@ -69,6 +69,81 @@ impl SampleStorage {
         }
     }
 
+    pub fn sample_count(&self) -> Option<u64> {
+        self.get_u64("meta:count")
+    }
+
+    pub fn label_counts(&self) -> (u64, u64) {
+        (
+            self.get_u64("meta:count:0").unwrap_or(0),
+            self.get_u64("meta:count:1").unwrap_or(0),
+        )
+    }
+
+    pub fn load_balanced_latest_samples(&self, max_samples: usize) -> Vec<SampleRecord> {
+        if max_samples <= 0 {
+            return Vec::new();
+        }
+
+        let (pass_count, violation_count) = self.label_counts();
+        let target_per_label = max_samples / 2;
+        if target_per_label == 0 {
+            return Vec::new();
+        }
+
+        let pass_samples = self.load_samples_by_label(0, usize::min(pass_count as usize, target_per_label));
+        let violation_samples =
+            self.load_samples_by_label(1, usize::min(violation_count as usize, target_per_label));
+        self.interleave_deterministically(pass_samples, violation_samples)
+    }
+
+    pub fn load_balanced_random_samples(&self, max_samples: usize) -> Vec<SampleRecord> {
+        if max_samples <= 0 {
+            return Vec::new();
+        }
+
+        let (pass_count, violation_count) = self.label_counts();
+        let target_per_label = max_samples / 2;
+        if target_per_label == 0 {
+            return Vec::new();
+        }
+
+        let pass_take = usize::min(pass_count as usize, target_per_label);
+        let violation_take = usize::min(violation_count as usize, target_per_label);
+
+        let pass_samples = self.select_pseudo_random(self.load_samples_by_label(0, pass_count as usize), pass_take);
+        let violation_samples =
+            self.select_pseudo_random(self.load_samples_by_label(1, violation_count as usize), violation_take);
+        self.interleave_deterministically(pass_samples, violation_samples)
+    }
+
+    pub fn load_balanced_samples(&self, max_samples: usize) -> Vec<SampleRecord> {
+        if max_samples <= 0 {
+            return Vec::new();
+        }
+
+        let (pass_count, violation_count) = self.label_counts();
+        if pass_count == 0 || violation_count == 0 {
+            return Vec::new();
+        }
+
+        let target_per_label = max_samples / 2;
+        if target_per_label == 0 {
+            return Vec::new();
+        }
+
+        let balanced_count = usize::min(usize::min(pass_count as usize, violation_count as usize), target_per_label);
+        if balanced_count == 0 {
+            return Vec::new();
+        }
+
+        let pass_samples =
+            self.select_pseudo_random(self.load_samples_by_label(0, pass_count as usize), balanced_count);
+        let violation_samples =
+            self.select_pseudo_random(self.load_samples_by_label(1, violation_count as usize), balanced_count);
+        self.interleave_deterministically(pass_samples, violation_samples)
+    }
+
     pub fn sample_by_id(&self, id: u64) -> Result<Option<SampleRecord>> {
         let key = format!("sample:{id:020}");
         self.sample_by_key(&key)
@@ -136,6 +211,72 @@ impl SampleStorage {
             .and_then(|s| s.parse::<u64>().ok())
     }
 
+    fn next_id(&self) -> u64 {
+        self.get_u64("meta:next_id").unwrap_or(1)
+    }
+
+    fn load_samples_by_label(&self, label: i64, limit: usize) -> Vec<SampleRecord> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut sample_id = self.next_id().saturating_sub(1);
+        while sample_id > 0 && out.len() < limit {
+            if let Ok(Some(sample)) = self.sample_by_id(sample_id) {
+                if sample.value.get("label").and_then(Value::as_i64) == Some(label) {
+                    out.push(sample);
+                }
+            }
+            sample_id -= 1;
+        }
+        out
+    }
+
+    fn select_pseudo_random(&self, mut samples: Vec<SampleRecord>, take: usize) -> Vec<SampleRecord> {
+        if samples.len() <= take {
+            return samples;
+        }
+
+        samples.sort_by(|lhs, rhs| {
+            let lhs_key = pseudo_random_key(lhs);
+            let rhs_key = pseudo_random_key(rhs);
+            lhs_key
+                .cmp(&rhs_key)
+                .then_with(|| lhs.id.cmp(&rhs.id))
+                .then_with(|| lhs.key.cmp(&rhs.key))
+        });
+        samples.truncate(take);
+        samples
+    }
+
+    fn interleave_deterministically(
+        &self,
+        pass_samples: Vec<SampleRecord>,
+        violation_samples: Vec<SampleRecord>,
+    ) -> Vec<SampleRecord> {
+        let mut combined = Vec::with_capacity(pass_samples.len() + violation_samples.len());
+        let mut pass_iter = pass_samples.into_iter();
+        let mut violation_iter = violation_samples.into_iter();
+
+        loop {
+            let mut pushed = false;
+            if let Some(sample) = violation_iter.next() {
+                combined.push(sample);
+                pushed = true;
+            }
+            if let Some(sample) = pass_iter.next() {
+                combined.push(sample);
+                pushed = true;
+            }
+            if !pushed {
+                break;
+            }
+        }
+
+        combined
+    }
+
     fn raw_keys(&self, limit: usize) -> Vec<String> {
         let mut out = Vec::new();
         for entry in self.db.iterator(IteratorMode::Start) {
@@ -153,6 +294,13 @@ impl SampleStorage {
 
 fn bytewise_compare(lhs: &[u8], rhs: &[u8]) -> Ordering {
     lhs.cmp(rhs)
+}
+
+fn pseudo_random_key(sample: &SampleRecord) -> [u8; 16] {
+    let mut seed = sample.id.unwrap_or(0).to_string();
+    seed.push(':');
+    seed.push_str(sample.value.get("text").and_then(Value::as_str).unwrap_or(""));
+    md5::compute(seed.as_bytes()).0
 }
 
 fn encode_rocksdict_string(value: &str) -> Vec<u8> {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiConfig {
@@ -18,6 +19,17 @@ pub struct AiConfig {
     pub timeout: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+}
+
+impl AiConfig {
+    pub fn get_model_candidates(&self) -> Vec<String> {
+        self.model
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -301,6 +313,94 @@ impl ModerationProfile {
     pub fn history_rocks_path(&self) -> PathBuf {
         self.base_dir.join("history.rocks")
     }
+
+    pub fn training_status_path(&self) -> PathBuf {
+        self.base_dir.join(".train_status.json")
+    }
+
+    pub fn hashlinear_model_path(&self) -> PathBuf {
+        self.base_dir.join("hashlinear_model.pkl")
+    }
+
+    pub fn bow_model_path(&self) -> PathBuf {
+        self.base_dir.join("bow_model.pkl")
+    }
+
+    pub fn bow_vectorizer_path(&self) -> PathBuf {
+        self.base_dir.join("bow_vectorizer.pkl")
+    }
+
+    pub fn fasttext_model_path(&self) -> PathBuf {
+        self.base_dir.join("fasttext_model.bin")
+    }
+
+    pub fn get_prompt_template(&self) -> String {
+        let template_path = self.base_dir.join(&self.config.prompt.template_file);
+        if let Ok(raw) = fs::read_to_string(&template_path) {
+            return raw;
+        }
+        "请判断以下文本是否违规：\n{{text}}".to_string()
+    }
+
+    pub fn truncate_text(&self, text: &str) -> String {
+        let max_len = self.config.prompt.max_text_length;
+        if text.chars().count() <= max_len {
+            return text.to_string();
+        }
+
+        let front_len = max_len.saturating_mul(2) / 3;
+        let back_len = max_len.saturating_sub(front_len);
+        let chars = text.chars().collect::<Vec<_>>();
+        let front = chars.iter().take(front_len).collect::<String>();
+        let back = chars
+            .iter()
+            .rev()
+            .take(back_len)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        format!("{front}\n...[中间省略]...\n{back}")
+    }
+
+    pub fn render_prompt(&self, text: &str) -> String {
+        self.get_prompt_template()
+            .replace("{{text}}", &escape_html(text))
+    }
+
+    pub fn local_model_exists(&self) -> bool {
+        match self.config.local_model_type.as_str() {
+            "fasttext" => self.fasttext_model_path().exists(),
+            "hashlinear" => {
+                self.hashlinear_model_path().exists()
+                    || (self.base_dir.join("hashlinear_runtime.json").exists()
+                        && self.base_dir.join("hashlinear_runtime.coef.f32").exists())
+            }
+            _ => self.bow_model_path().exists() && self.bow_vectorizer_path().exists(),
+        }
+    }
+
+    pub fn training_status(&self) -> Option<Value> {
+        let path = self.training_status_path();
+        let raw = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+}
+
+fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn default_provider() -> String { "openai".to_string() }

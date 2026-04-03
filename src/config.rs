@@ -16,6 +16,9 @@ pub struct Settings {
     pub access_log_file: String,
     pub moderation_log_file: String,
     pub training_log_file: String,
+    pub training_data_rpc_enabled: bool,
+    pub training_data_rpc_transport: String,
+    pub training_data_rpc_unix_socket: String,
     #[serde(skip_serializing)]
     pub root_dir: PathBuf,
     #[serde(skip_serializing)]
@@ -46,6 +49,11 @@ impl Settings {
                 .unwrap_or_else(|_| "logs/moderation.log".to_string()),
             training_log_file: env::var("TRAINING_LOG_FILE")
                 .unwrap_or_else(|_| "logs/training.log".to_string()),
+            training_data_rpc_enabled: parse_bool_env("TRAINING_DATA_RPC_ENABLED", true),
+            training_data_rpc_transport: env::var("TRAINING_DATA_RPC_TRANSPORT")
+                .unwrap_or_else(|_| "unix".to_string()),
+            training_data_rpc_unix_socket: env::var("TRAINING_DATA_RPC_UNIX_SOCKET")
+                .unwrap_or_else(|_| root_dir.join("run/sample-store.sock").display().to_string()),
             root_dir,
             env_map,
         })
@@ -64,6 +72,54 @@ impl Settings {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn settings_default_training_rpc_uses_unix_socket() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let root_dir = PathBuf::from("/tmp/prismguard-config-defaults");
+        std::env::remove_var("TRAINING_DATA_RPC_ENABLED");
+        std::env::remove_var("TRAINING_DATA_RPC_TRANSPORT");
+        std::env::remove_var("TRAINING_DATA_RPC_UNIX_SOCKET");
+
+        let settings = Settings::load(&root_dir).expect("load settings");
+
+        assert!(settings.training_data_rpc_enabled);
+        assert_eq!(settings.training_data_rpc_transport, "unix");
+        assert_eq!(
+            settings.training_data_rpc_unix_socket,
+            "/tmp/prismguard-config-defaults/run/sample-store.sock"
+        );
+    }
+
+    #[test]
+    fn settings_can_override_training_rpc_env() {
+        let _guard = env_test_lock().lock().expect("env test lock");
+        let root_dir = PathBuf::from("/tmp/prismguard-config-overrides");
+        std::env::set_var("TRAINING_DATA_RPC_ENABLED", "0");
+        std::env::set_var("TRAINING_DATA_RPC_TRANSPORT", "tcp");
+        std::env::set_var("TRAINING_DATA_RPC_UNIX_SOCKET", "/tmp/custom.sock");
+
+        let settings = Settings::load(&root_dir).expect("load settings");
+
+        assert!(!settings.training_data_rpc_enabled);
+        assert_eq!(settings.training_data_rpc_transport, "tcp");
+        assert_eq!(settings.training_data_rpc_unix_socket, "/tmp/custom.sock");
+
+        std::env::remove_var("TRAINING_DATA_RPC_ENABLED");
+        std::env::remove_var("TRAINING_DATA_RPC_TRANSPORT");
+        std::env::remove_var("TRAINING_DATA_RPC_UNIX_SOCKET");
     }
 }
 

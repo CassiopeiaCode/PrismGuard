@@ -4,8 +4,12 @@ mod profile;
 mod proxy;
 mod response;
 mod routes;
+mod moderation;
+mod sample_rpc;
+#[cfg(feature = "storage-debug")]
 mod storage;
 mod streaming;
+mod training;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,11 +18,15 @@ use anyhow::{Context, Result};
 use axum::{Router, Server};
 use reqwest::Client;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Settings;
 use crate::routes::{router, AppState};
+use crate::sample_rpc::{cleanup_stale_unix_socket, SampleRpcConfig, SampleRpcTransport};
+#[cfg(feature = "storage-debug")]
+use crate::sample_rpc::serve_storage_sample_rpc_until_shutdown;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,6 +34,8 @@ async fn main() -> Result<()> {
     let settings = Settings::load(&root_dir)?;
     init_tracing(&settings.log_level);
     lower_process_priority();
+    prepare_sample_rpc(&settings)?;
+    let sample_rpc_task = start_sample_rpc_server(&settings)?;
 
     let state = AppState {
         settings: Arc::new(settings.clone()),
@@ -53,14 +63,65 @@ async fn main() -> Result<()> {
         "starting server"
     );
 
-    Server::from_tcp(listener.into_std()?)
+    let server_result = Server::from_tcp(listener.into_std()?)
         .context("failed to convert tokio listener to std listener")?
         .serve(app.into_make_service())
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("server exited with error")?;
+        .context("server exited with error");
+
+    if let Some(task) = sample_rpc_task {
+        task.abort();
+    }
+
+    server_result?;
 
     Ok(())
+}
+
+fn prepare_sample_rpc(settings: &Settings) -> Result<()> {
+    let rpc = SampleRpcConfig::from_settings(settings)?;
+    rpc.prepare_runtime()?;
+    if rpc.enabled && rpc.transport == SampleRpcTransport::Unix {
+        cleanup_stale_unix_socket(&rpc.unix_socket)?;
+    }
+    Ok(())
+}
+
+fn start_sample_rpc_server(settings: &Settings) -> Result<Option<JoinHandle<()>>> {
+    #[cfg(not(feature = "storage-debug"))]
+    {
+        let rpc = SampleRpcConfig::from_settings(settings)?;
+        if rpc.enabled {
+            warn!("sample RPC configured but storage-debug feature is disabled; server not started");
+        }
+        return Ok(None);
+    }
+
+    #[cfg(feature = "storage-debug")]
+    {
+    let rpc = SampleRpcConfig::from_settings(settings)?;
+    if !rpc.enabled {
+        return Ok(None);
+    }
+
+    match rpc.transport {
+        SampleRpcTransport::Unix => {
+            let socket_path = rpc.unix_socket.clone();
+            let handle = tokio::spawn(async move {
+                let _ = serve_storage_sample_rpc_until_shutdown(
+                    &socket_path,
+                    std::future::pending::<()>(),
+                )
+                .await;
+            });
+            Ok(Some(handle))
+        }
+        SampleRpcTransport::Tcp => Err(anyhow::anyhow!(
+            "TRAINING_DATA_RPC_TRANSPORT=tcp is not implemented yet"
+        )),
+    }
+    }
 }
 
 fn lower_process_priority() {
