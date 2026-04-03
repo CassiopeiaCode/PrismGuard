@@ -115,7 +115,7 @@ fn load_runtime(
         }
     }
 
-    let runtime = Arc::new(HashlinearRuntime::load(meta_path, coef_path, profile)?);
+    let runtime = Arc::new(HashlinearRuntime::load(meta_path, coef_path)?);
     let mut guard = cache.lock().expect("hashlinear runtime cache");
     guard.insert(
         cache_key,
@@ -149,7 +149,7 @@ fn modified_secs(path: &Path) -> Result<u64> {
 }
 
 impl HashlinearRuntime {
-    fn load(meta_path: &Path, coef_path: &Path, profile: &ModerationProfile) -> Result<Self> {
+    fn load(meta_path: &Path, coef_path: &Path) -> Result<Self> {
         let metadata: RuntimeMetadata = serde_json::from_str(
             &fs::read_to_string(meta_path)
                 .with_context(|| format!("failed to read {}", meta_path.display()))?,
@@ -175,7 +175,7 @@ impl HashlinearRuntime {
                 metadata.n_features
             ));
         }
-        validate_runtime_metadata(&metadata, profile)?;
+        validate_runtime_metadata(&metadata)?;
 
         let coef_bytes =
             fs::read(coef_path).with_context(|| format!("failed to read {}", coef_path.display()))?;
@@ -263,48 +263,10 @@ fn ngram_range(range: &[usize]) -> Result<(usize, usize)> {
     }
 }
 
-fn validate_runtime_metadata(metadata: &RuntimeMetadata, profile: &ModerationProfile) -> Result<()> {
+fn validate_runtime_metadata(metadata: &RuntimeMetadata) -> Result<()> {
     if metadata.n_features == 0 {
         return Err(anyhow!("hashlinear runtime n_features must be > 0"));
     }
-
-    let expected = &profile.config.hashlinear_training;
-    if metadata.cfg.analyzer != expected.analyzer {
-        return Err(anyhow!(
-            "hashlinear runtime analyzer mismatch: {} != {}",
-            metadata.cfg.analyzer,
-            expected.analyzer
-        ));
-    }
-    if metadata.cfg.ngram_range != expected.ngram_range {
-        return Err(anyhow!(
-            "hashlinear runtime ngram_range mismatch: {:?} != {:?}",
-            metadata.cfg.ngram_range,
-            expected.ngram_range
-        ));
-    }
-    if metadata.cfg.n_features != expected.n_features {
-        return Err(anyhow!(
-            "hashlinear runtime profile n_features mismatch: {} != {}",
-            metadata.cfg.n_features,
-            expected.n_features
-        ));
-    }
-    if metadata.cfg.alternate_sign != expected.alternate_sign {
-        return Err(anyhow!(
-            "hashlinear runtime alternate_sign mismatch: {} != {}",
-            metadata.cfg.alternate_sign,
-            expected.alternate_sign
-        ));
-    }
-    if metadata.cfg.norm != expected.norm {
-        return Err(anyhow!(
-            "hashlinear runtime norm mismatch: {:?} != {:?}",
-            metadata.cfg.norm,
-            expected.norm
-        ));
-    }
-
     Ok(())
 }
 

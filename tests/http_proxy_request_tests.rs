@@ -10,6 +10,10 @@ mod proxy;
 mod response;
 #[path = "../src/routes.rs"]
 mod routes;
+#[path = "../src/sample_rpc.rs"]
+mod sample_rpc;
+#[path = "../src/storage.rs"]
+mod storage;
 #[path = "../src/training.rs"]
 mod training;
 #[path = "../src/moderation/mod.rs"]
