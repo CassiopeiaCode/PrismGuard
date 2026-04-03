@@ -112,6 +112,19 @@ impl SampleRpcConfig {
 
         Ok(())
     }
+
+    pub fn unix_socket_path(&self) -> Result<&Path> {
+        if !self.enabled {
+            return Err(anyhow!("sample RPC is disabled"));
+        }
+        if self.transport != SampleRpcTransport::Unix {
+            return Err(anyhow!(
+                "sample RPC transport {:?} does not expose a unix socket",
+                self.transport
+            ));
+        }
+        Ok(self.unix_socket.as_path())
+    }
 }
 
 pub fn cleanup_stale_unix_socket(path: &Path) -> Result<()> {

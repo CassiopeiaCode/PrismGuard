@@ -26,8 +26,8 @@ use sample_rpc::{
 #[cfg(feature = "storage-debug")]
 use sample_rpc::serve_storage_sample_rpc_until_shutdown;
 use training::{
-    build_training_sample_request, evaluate_training_need, fetch_training_samples_via_unix_socket,
-    train_hashlinear_runtime, TrainingSample,
+    build_training_sample_request, evaluate_training_need, fetch_training_samples_via_rpc,
+    fetch_training_samples_via_unix_socket, train_hashlinear_runtime, TrainingSample,
 };
 
 fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationProfile {
@@ -250,6 +250,70 @@ async fn training_fetches_samples_over_unix_socket() {
     std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
 }
 
+#[tokio::test]
+async fn training_fetches_samples_via_sample_rpc_config() {
+    let profile = write_profile(
+        &format!("training-fetch-rpc-config-{}", std::process::id()),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "max_samples": 2,
+                "sample_loading": "latest_full"
+            }
+        }),
+    );
+
+    let socket_dir = PathBuf::from(format!("/tmp/prismguard-train-rpc-config-{}", std::process::id()));
+    if socket_dir.exists() {
+        std::fs::remove_dir_all(&socket_dir).expect("cleanup old socket dir");
+    }
+    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+    let socket_path = socket_dir.join("sample.sock");
+
+    let rpc = SampleRpcConfig {
+        enabled: true,
+        transport: SampleRpcTransport::Unix,
+        unix_socket: socket_path.clone(),
+    };
+
+    let expected_request = SampleRpcRequest::LoadBalancedLatestSamples {
+        profile: profile.profile_name.clone(),
+        db_path: profile.history_rocks_path().display().to_string(),
+        max_samples: 2,
+    };
+    let server_socket = socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_one_unix_request(&server_socket, |request| {
+            assert_eq!(request, expected_request);
+            Ok(SampleRpcResponse::ok(json!({
+                "samples": [
+                    {"id": 21, "text": "safe", "label": 0}
+                ]
+            })))
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let samples = fetch_training_samples_via_rpc(&rpc, &profile)
+        .await
+        .expect("fetch samples via rpc config");
+    assert_eq!(
+        samples,
+        vec![TrainingSample {
+            id: Some(21),
+            text: "safe".to_string(),
+            label: 0,
+            category: None,
+            created_at: None,
+        }]
+    );
+
+    server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
+}
+
 #[test]
 fn training_writes_hashlinear_runtime_files() {
     let profile = write_profile(
@@ -319,9 +383,29 @@ fn training_writes_hashlinear_runtime_files() {
             .expect("parse runtime json");
     assert_eq!(metadata["runtime_version"], 1);
     assert_eq!(metadata["n_features"], 64);
+    assert_eq!(metadata["source_model"], json!(profile.hashlinear_model_path()));
 
     let coef_bytes = std::fs::read(&runtime_coef).expect("read runtime coef");
     assert_eq!(coef_bytes.len(), 64 * std::mem::size_of::<f32>());
+}
+
+#[test]
+fn profile_hashlinear_runtime_paths_use_shared_prefix() {
+    let profile = write_profile(
+        &format!("training-runtime-paths-{}", std::process::id()),
+        json!({
+            "local_model_type": "hashlinear"
+        }),
+    );
+
+    assert_eq!(
+        profile.hashlinear_runtime_json_path(),
+        profile.hashlinear_runtime_prefix().with_extension("json")
+    );
+    assert_eq!(
+        profile.hashlinear_runtime_coef_path(),
+        profile.hashlinear_runtime_prefix().with_extension("coef.f32")
+    );
 }
 
 #[test]
@@ -364,6 +448,18 @@ fn sample_rpc_prepare_runtime_creates_parent_dir() {
     assert!(base.join("nested").is_dir());
 
     std::fs::remove_dir_all(&base).expect("cleanup temp dir");
+}
+
+#[test]
+fn sample_rpc_unix_socket_path_rejects_non_unix_transport() {
+    let rpc = SampleRpcConfig {
+        enabled: true,
+        transport: SampleRpcTransport::Tcp,
+        unix_socket: PathBuf::from("/tmp/ignored.sock"),
+    };
+
+    let err = rpc.unix_socket_path().expect_err("tcp transport should not expose unix socket");
+    assert!(err.to_string().contains("unix"));
 }
 
 #[test]

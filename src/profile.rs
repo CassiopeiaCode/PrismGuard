@@ -314,12 +314,28 @@ impl ModerationProfile {
         self.base_dir.join("history.rocks")
     }
 
+    pub fn history_rocks_path_string(&self) -> String {
+        self.history_rocks_path().display().to_string()
+    }
+
     pub fn training_status_path(&self) -> PathBuf {
         self.base_dir.join(".train_status.json")
     }
 
     pub fn hashlinear_model_path(&self) -> PathBuf {
         self.base_dir.join("hashlinear_model.pkl")
+    }
+
+    pub fn hashlinear_runtime_prefix(&self) -> PathBuf {
+        self.base_dir.join("hashlinear_runtime")
+    }
+
+    pub fn hashlinear_runtime_json_path(&self) -> PathBuf {
+        self.hashlinear_runtime_prefix().with_extension("json")
+    }
+
+    pub fn hashlinear_runtime_coef_path(&self) -> PathBuf {
+        self.hashlinear_runtime_prefix().with_extension("coef.f32")
     }
 
     pub fn bow_model_path(&self) -> PathBuf {
@@ -374,8 +390,8 @@ impl ModerationProfile {
             "fasttext" => self.fasttext_model_path().exists(),
             "hashlinear" => {
                 self.hashlinear_model_path().exists()
-                    || (self.base_dir.join("hashlinear_runtime.json").exists()
-                        && self.base_dir.join("hashlinear_runtime.coef.f32").exists())
+                    || (self.hashlinear_runtime_json_path().exists()
+                        && self.hashlinear_runtime_coef_path().exists())
             }
             _ => self.bow_model_path().exists() && self.bow_vectorizer_path().exists(),
         }

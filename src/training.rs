@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::profile::ModerationProfile;
-use crate::sample_rpc::{send_unix_request, SampleRpcRequest};
+use crate::sample_rpc::{send_unix_request, SampleRpcConfig, SampleRpcRequest};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainingDecision {
@@ -110,7 +110,7 @@ pub fn evaluate_training_need(
 pub fn build_training_sample_request(profile: &ModerationProfile) -> Result<SampleRpcRequest> {
     let (sample_loading, max_samples) = sample_loading_config(profile)?;
     let profile_name = profile.profile_name.clone();
-    let db_path = profile.history_rocks_path().display().to_string();
+    let db_path = profile.history_rocks_path_string();
 
     let request = match sample_loading {
         "latest_full" => SampleRpcRequest::LoadBalancedLatestSamples {
@@ -130,6 +130,13 @@ pub fn build_training_sample_request(profile: &ModerationProfile) -> Result<Samp
         },
     };
     Ok(request)
+}
+
+pub async fn fetch_training_samples_via_rpc(
+    rpc: &SampleRpcConfig,
+    profile: &ModerationProfile,
+) -> Result<Vec<TrainingSample>> {
+    fetch_training_samples_via_unix_socket(rpc.unix_socket_path()?, profile).await
 }
 
 pub async fn fetch_training_samples_via_unix_socket(
@@ -206,8 +213,8 @@ pub fn train_hashlinear_runtime(
 
     write_hashlinear_runtime(profile, &spec, intercept as f32, &weights)?;
 
-    let runtime_json_path = profile.base_dir.join("hashlinear_runtime.json");
-    let runtime_coef_path = profile.base_dir.join("hashlinear_runtime.coef.f32");
+    let runtime_json_path = profile.hashlinear_runtime_json_path();
+    let runtime_coef_path = profile.hashlinear_runtime_coef_path();
     let model_marker_path = profile.hashlinear_model_path();
 
     Ok(HashlinearTrainingOutput {
@@ -334,8 +341,8 @@ fn write_hashlinear_runtime(
     fs::create_dir_all(&profile.base_dir)
         .with_context(|| format!("failed to create {}", profile.base_dir.display()))?;
 
-    let runtime_json_path = profile.base_dir.join("hashlinear_runtime.json");
-    let runtime_coef_path = profile.base_dir.join("hashlinear_runtime.coef.f32");
+    let runtime_json_path = profile.hashlinear_runtime_json_path();
+    let runtime_coef_path = profile.hashlinear_runtime_coef_path();
     let model_marker_path = profile.hashlinear_model_path();
 
     let runtime_json_tmp = runtime_json_path.with_extension("json.tmp");
