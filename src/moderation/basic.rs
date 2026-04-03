@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -12,9 +13,21 @@ pub struct BasicModerationBlock {
 }
 
 #[derive(Debug, Clone)]
+struct KeywordPattern {
+    original: String,
+    normalized: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeywordFileSignature {
+    modified_at: Option<SystemTime>,
+    len: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 struct KeywordFilter {
-    mtime_secs: u64,
-    patterns: Vec<String>,
+    signature: KeywordFileSignature,
+    patterns: Vec<KeywordPattern>,
 }
 
 static FILTERS: OnceLock<Mutex<HashMap<String, KeywordFilter>>> = OnceLock::new();
@@ -36,9 +49,9 @@ pub fn basic_moderation(text: &str, cfg: &Value) -> Result<Option<BasicModeratio
     let normalized = text.to_ascii_lowercase();
 
     for kw in patterns {
-        if normalized.contains(&kw.to_ascii_lowercase()) {
+        if normalized.contains(&kw.normalized) {
             return Ok(Some(BasicModerationBlock {
-                reason: format!("[{}] Matched keyword: {}", error_code, kw),
+                reason: format!("[{}] Matched keyword: {}", error_code, kw.original),
             }));
         }
     }
@@ -46,18 +59,13 @@ pub fn basic_moderation(text: &str, cfg: &Value) -> Result<Option<BasicModeratio
     Ok(None)
 }
 
-fn load_keywords(path: &str) -> Result<Vec<String>> {
+fn load_keywords(path: &str) -> Result<Vec<KeywordPattern>> {
     let cache = FILTERS.get_or_init(|| Mutex::new(HashMap::new()));
-    let meta = fs::metadata(path).ok();
-    let mtime_secs = meta
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let signature = keyword_file_signature(Path::new(path));
 
     let mut guard = cache.lock().expect("keyword filter cache");
     if let Some(entry) = guard.get(path) {
-        if entry.mtime_secs == mtime_secs {
+        if entry.signature == signature {
             return Ok(entry.patterns.clone());
         }
     }
@@ -67,8 +75,11 @@ fn load_keywords(path: &str) -> Result<Vec<String>> {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
+            .map(|line| KeywordPattern {
+                original: line.to_string(),
+                normalized: line.to_ascii_lowercase(),
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -76,10 +87,25 @@ fn load_keywords(path: &str) -> Result<Vec<String>> {
     guard.insert(
         path.to_string(),
         KeywordFilter {
-            mtime_secs,
+            signature,
             patterns: patterns.clone(),
         },
     );
 
     Ok(patterns)
+}
+
+fn keyword_file_signature(path: &Path) -> KeywordFileSignature {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+
+    match fs::metadata(&canonical) {
+        Ok(metadata) => KeywordFileSignature {
+            modified_at: metadata.modified().ok(),
+            len: Some(metadata.len()),
+        },
+        Err(_) => KeywordFileSignature {
+            modified_at: None,
+            len: None,
+        },
+    }
 }
