@@ -19,6 +19,10 @@ pub struct Settings {
     pub training_data_rpc_enabled: bool,
     pub training_data_rpc_transport: String,
     pub training_data_rpc_unix_socket: String,
+    pub training_scheduler_enabled: bool,
+    pub training_scheduler_interval_minutes: u64,
+    pub training_scheduler_failure_cooldown_minutes: u64,
+    pub training_subprocess_allowed_cpus: String,
     #[serde(skip_serializing)]
     pub root_dir: PathBuf,
     #[serde(skip_serializing)]
@@ -54,6 +58,21 @@ impl Settings {
                 .unwrap_or_else(|_| "unix".to_string()),
             training_data_rpc_unix_socket: env::var("TRAINING_DATA_RPC_UNIX_SOCKET")
                 .unwrap_or_else(|_| root_dir.join("run/sample-store.sock").display().to_string()),
+            training_scheduler_enabled: parse_bool_env("TRAINING_SCHEDULER_ENABLED", true),
+            training_scheduler_interval_minutes: env::var(
+                "TRAINING_SCHEDULER_INTERVAL_MINUTES",
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
+            training_scheduler_failure_cooldown_minutes: env::var(
+                "TRAINING_SCHEDULER_FAILURE_COOLDOWN_MINUTES",
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+            training_subprocess_allowed_cpus: env::var("TRAINING_SUBPROCESS_ALLOWED_CPUS")
+                .unwrap_or_else(|_| "0".to_string()),
             root_dir,
             env_map,
         })

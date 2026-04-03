@@ -350,6 +350,23 @@ impl ModerationProfile {
         self.base_dir.join("fasttext_model.bin")
     }
 
+    pub fn training_model_path(&self) -> PathBuf {
+        match self.config.local_model_type.as_str() {
+            "fasttext" => self.fasttext_model_path(),
+            "hashlinear" => self.hashlinear_model_path(),
+            _ => self.bow_model_path(),
+        }
+    }
+
+    pub fn training_max_db_items(&self) -> Result<usize> {
+        match self.config.local_model_type.as_str() {
+            "fasttext" => Ok(self.config.fasttext_training.max_db_items),
+            "hashlinear" => Ok(self.config.hashlinear_training.max_db_items),
+            "bow" => Ok(self.config.bow_training.max_db_items),
+            other => Err(anyhow::anyhow!("unsupported local_model_type: {other}")),
+        }
+    }
+
     pub fn get_prompt_template(&self) -> String {
         let template_path = self.base_dir.join(&self.config.prompt.template_file);
         if let Ok(raw) = fs::read_to_string(&template_path) {
