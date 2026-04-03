@@ -16,7 +16,7 @@ indexmap = "=2.2.6"
 libc = "0.2"
 md5 = "0.7"
 reqwest = { version = "0.11.27", default-features = false, features = ["json", "stream", "rustls-tls"] }
-rocksdb = { version = "=0.19.0", default-features = false }
+rocksdb = { version = "=0.18.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "net"] }
