@@ -31,27 +31,11 @@ fn extract_from_openai_chat(body: &Value) -> String {
 fn extract_from_claude_chat(body: &Value) -> String {
     let mut texts = Vec::new();
 
-    if let Some(system) = body.get("system").and_then(Value::as_str) {
-        if !system.is_empty() {
-            texts.push(system.to_string());
-        }
-    }
+    collect_claude_text_parts(body.get("system"), &mut texts);
 
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         for msg in messages {
-            match msg.get("content") {
-                Some(Value::String(text)) => texts.push(text.to_string()),
-                Some(Value::Array(parts)) => {
-                    for part in parts {
-                        if part.get("type").and_then(Value::as_str) == Some("text") {
-                            if let Some(text) = part.get("text").and_then(Value::as_str) {
-                                texts.push(text.to_string());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+            collect_claude_text_parts(msg.get("content"), &mut texts);
         }
     }
 
@@ -59,22 +43,21 @@ fn extract_from_claude_chat(body: &Value) -> String {
 }
 
 fn extract_from_openai_response(body: &Value) -> String {
+    let mut texts = Vec::new();
+
+    collect_non_empty_text(body.get("instructions"), &mut texts);
+
     if let Some(prompt) = body.get("prompt") {
         match prompt {
-            Value::String(text) => return text.to_string(),
-            Value::Array(items) => {
-                return items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-            }
+            Value::String(_) | Value::Array(_) => collect_non_empty_text(Some(prompt), &mut texts),
             _ => {}
         }
     }
 
-    if let Some(input) = body.get("input").and_then(Value::as_str) {
-        return input.to_string();
+    collect_openai_responses_input(body.get("input"), &mut texts);
+
+    if !texts.is_empty() {
+        return texts.join("\n");
     }
 
     if body.get("messages").is_some() {
@@ -82,4 +65,89 @@ fn extract_from_openai_response(body: &Value) -> String {
     }
 
     String::new()
+}
+
+fn collect_claude_text_parts(value: Option<&Value>, texts: &mut Vec<String>) {
+    match value {
+        Some(Value::String(text)) => push_if_not_empty(text, texts),
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("text") {
+                    collect_non_empty_text(part.get("text"), texts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_openai_responses_input(value: Option<&Value>, texts: &mut Vec<String>) {
+    match value {
+        Some(Value::String(text)) => push_if_not_empty(text, texts),
+        Some(Value::Array(items)) => {
+            for item in items {
+                collect_openai_responses_item(item, texts);
+            }
+        }
+        Some(Value::Object(_)) => collect_openai_responses_item(value.expect("checked Some"), texts),
+        _ => {}
+    }
+}
+
+fn collect_openai_responses_item(value: &Value, texts: &mut Vec<String>) {
+    let Some(item) = value.as_object() else {
+        collect_non_empty_text(Some(value), texts);
+        return;
+    };
+
+    if let Some(content) = item.get("content") {
+        collect_openai_responses_content(content, texts);
+    }
+
+    if item.get("content").is_none() {
+        collect_non_empty_text(item.get("text"), texts);
+    }
+
+    if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+        collect_non_empty_text(item.get("output"), texts);
+    }
+}
+
+fn collect_openai_responses_content(value: &Value, texts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => push_if_not_empty(text, texts),
+        Value::Array(parts) => {
+            for part in parts {
+                let part_type = part.get("type").and_then(Value::as_str);
+                match part_type {
+                    Some("text") | Some("input_text") | Some("output_text") => {
+                        collect_non_empty_text(part.get("text"), texts);
+                    }
+                    Some("function_call_output") => {
+                        collect_non_empty_text(part.get("output"), texts);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_non_empty_text(value: Option<&Value>, texts: &mut Vec<String>) {
+    match value {
+        Some(Value::String(text)) => push_if_not_empty(text, texts),
+        Some(Value::Array(values)) => {
+            for value in values {
+                collect_non_empty_text(Some(value), texts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_if_not_empty(text: &str, texts: &mut Vec<String>) {
+    if !text.is_empty() {
+        texts.push(text.to_string());
+    }
 }
