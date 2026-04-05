@@ -13,7 +13,7 @@ RUN apt-get update \
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:${PATH}
-ENV LIBCLANG_PATH=/usr/lib/llvm-16/lib
+ENV LIBCLANG_PATH=/usr/lib/llvm-18/lib
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain 1.89.0
