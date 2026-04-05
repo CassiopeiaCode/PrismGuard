@@ -13,8 +13,6 @@ permissions:
 env:
   IMAGE_NAME: ghcr.io/cassiopeiacode/prismguard
   LIBCLANG_PATH: /usr/lib/llvm-16/lib
-  ROCKSDB_LIB_DIR: /usr/lib/x86_64-linux-gnu
-  ROCKSDB_INCLUDE_DIR: /usr/include
 
 jobs:
   build-binary:
@@ -27,7 +25,7 @@ jobs:
       - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev librocksdb-dev pkg-config
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

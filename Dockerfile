@@ -8,16 +8,12 @@ RUN apt-get update \
         clang \
         curl \
         libclang-dev \
-        librocksdb-dev \
-        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV CARGO_HOME=/usr/local/cargo
 ENV PATH=/usr/local/cargo/bin:${PATH}
 ENV LIBCLANG_PATH=/usr/lib/llvm-16/lib
-ENV ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu
-ENV ROCKSDB_INCLUDE_DIR=/usr/include
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain 1.89.0
@@ -39,7 +35,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         libgcc-s1 \
-        librocksdb-dev \
         libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
