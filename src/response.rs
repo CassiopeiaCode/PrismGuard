@@ -119,7 +119,11 @@ fn openai_chat_to_claude_response(body: Value) -> Result<Value, ApiError> {
         "stop_sequence": Value::Null,
     });
 
-    if let Some(usage) = object.get("usage").and_then(chat_usage_to_claude_usage) {
+    if let Some(usage) = object
+        .get("usage")
+        .and_then(Value::as_object)
+        .and_then(chat_usage_to_claude_usage)
+    {
         response["usage"] = usage;
     }
 
