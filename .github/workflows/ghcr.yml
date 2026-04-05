@@ -15,7 +15,6 @@ env:
   LIBCLANG_PATH: /usr/lib/llvm-16/lib
   ROCKSDB_LIB_DIR: /usr/lib/x86_64-linux-gnu
   ROCKSDB_INCLUDE_DIR: /usr/include
-  CARGO_BUILD_JOBS: 1
 
 jobs:
   build-binary:
@@ -28,7 +27,7 @@ jobs:
       - name: Install system build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev librocksdb-dev pkg-config util-linux
+          sudo apt-get install -y --no-install-recommends clang libclang-dev librocksdb-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,7 +38,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: taskset -c 0 cargo build --release -j 1
+        run: cargo build --release
 
       - name: Package binary artifact
         run: |
