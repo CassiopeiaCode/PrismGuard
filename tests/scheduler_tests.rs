@@ -302,3 +302,84 @@ async fn scheduler_run_once_trains_only_eligible_profiles() {
     server.await.expect("join server").expect("server result");
     std::fs::remove_dir_all(&root_dir).expect("cleanup root");
 }
+
+#[tokio::test]
+async fn scheduler_plan_round_skips_profiles_with_unreadable_history_storage() {
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-scheduler-corrupt-history-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let eligible_dir = root_dir.join("configs/mod_profiles/eligible");
+    std::fs::create_dir_all(&eligible_dir).expect("create eligible dir");
+    std::fs::write(
+        eligible_dir.join("profile.json"),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "min_samples": 10
+            }
+        })
+        .to_string(),
+    )
+    .expect("write eligible profile");
+
+    let corrupt_dir = root_dir.join("configs/mod_profiles/corrupt");
+    std::fs::create_dir_all(&corrupt_dir).expect("create corrupt dir");
+    std::fs::write(
+        corrupt_dir.join("profile.json"),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "min_samples": 10
+            }
+        })
+        .to_string(),
+    )
+    .expect("write corrupt profile");
+
+    let socket_path = root_dir.join("run/sample-store.sock");
+    let settings = test_settings(&root_dir, &socket_path);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let response_socket = socket_path.clone();
+        async move {
+            serve_unix_requests_until_shutdown(
+                &response_socket,
+                move |request| match request {
+                    SampleRpcRequest::GetSampleCount { profile, .. } if profile == "eligible" => {
+                        SampleRpcResponse::ok(json!({ "sample_count": 20 }))
+                    }
+                    SampleRpcRequest::GetSampleCount { profile, .. } if profile == "corrupt" => {
+                        SampleRpcResponse::err(
+                            "failed to open RocksDB /tmp/corrupt/history.rocks: Corruption: Corrupt or unsupported format_version: 6"
+                        )
+                    }
+                    other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let actions = scheduler::plan_training_round(&root_dir, &settings, current_unix_secs())
+        .await
+        .expect("plan round");
+
+    assert!(actions.iter().any(|item| item.profile_name == "eligible"));
+    assert!(!actions.iter().any(|item| item.profile_name == "corrupt"));
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root");
+}

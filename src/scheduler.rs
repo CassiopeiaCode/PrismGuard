@@ -135,7 +135,17 @@ pub async fn plan_training_round(
             continue;
         }
 
-        let sample_count = fetch_training_sample_count_via_rpc(&rpc, &scanned.profile).await?;
+        let sample_count = match fetch_training_sample_count_via_rpc(&rpc, &scanned.profile).await {
+            Ok(sample_count) => sample_count,
+            Err(err) => {
+                warn!(
+                    profile = %scanned.profile_name,
+                    error = %err,
+                    "skipping profile during scheduler round because training sample count is unavailable"
+                );
+                continue;
+            }
+        };
         let model_mtime = fs::metadata(scanned.profile.training_model_path())
             .ok()
             .and_then(|meta| meta.modified().ok());
