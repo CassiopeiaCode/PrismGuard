@@ -21,7 +21,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 COPY .cargo ./.cargo
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY configs ./configs
 COPY artifacts ./artifacts
 COPY start.sh ./start.sh
 COPY README.md ./README.md
@@ -39,7 +38,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/Prismguand-Rust /app/Prismguand-Rust
-COPY --from=builder /app/configs /app/configs
 COPY --from=builder /app/artifacts /app/artifacts
 COPY --from=builder /app/start.sh /app/start.sh
 COPY --from=builder /app/README.md /app/README.md
