@@ -243,12 +243,17 @@ async fn debug_profile(
     let model_mtime = std::fs::metadata(&model_path)
         .ok()
         .and_then(|meta| meta.modified().ok());
-    let sample_count = profile
+    let live_sample_count = SampleStorage::open_read_only(profile.history_rocks_path())
+        .ok()
+        .and_then(|storage| storage.sample_count())
+        .map(|count| count as usize);
+    let training_status_sample_count = profile
         .training_status()
         .as_ref()
         .and_then(|status| status.get("sample_count"))
         .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+        .map(|count| count as usize);
+    let sample_count = live_sample_count.or(training_status_sample_count).unwrap_or(0);
     let training_decision = evaluate_training_need(
         &profile,
         sample_count,
@@ -266,6 +271,8 @@ async fn debug_profile(
         "fasttext_model_path": profile.fasttext_model_path(),
         "hashlinear_model_path": profile.hashlinear_model_path(),
         "local_model_exists": profile.local_model_exists(),
+        "live_sample_count": live_sample_count,
+        "training_status_sample_count": training_status_sample_count,
         "training_status": profile.training_status(),
         "training_decision": training_decision,
         "config": profile.config
