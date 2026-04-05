@@ -10,11 +10,129 @@ pub fn maybe_transform_json_response(
     client_format: Option<RequestFormat>,
 ) -> Result<Value, ApiError> {
     match (upstream_format, client_format) {
+        (Some(RequestFormat::OpenAiChat), Some(RequestFormat::ClaudeChat)) => {
+            openai_chat_to_claude_response(body)
+        }
         (Some(RequestFormat::OpenAiResponses), Some(RequestFormat::OpenAiChat)) => {
             openai_responses_to_openai_chat(body)
         }
         _ => Ok(body),
     }
+}
+
+fn openai_chat_to_claude_response(body: Value) -> Result<Value, ApiError> {
+    let object = body.as_object().ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_GATEWAY, "response body is not a JSON object")
+            .with_code("PROXY_ERROR")
+    })?;
+
+    let choice = object
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_GATEWAY, "chat response choices[0] is missing")
+                .with_code("PROXY_ERROR")
+        })?;
+
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_GATEWAY, "chat response message is missing")
+                .with_code("PROXY_ERROR")
+        })?;
+
+    let mut content = Vec::new();
+
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text,
+            }));
+        }
+    } else if let Some(parts) = message.get("content").and_then(Value::as_array) {
+        for part in parts {
+            let Some(part) = part.as_object() else {
+                continue;
+            };
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            content.push(json!({
+                                "type": "text",
+                                "text": text,
+                            }));
+                        }
+                    }
+                }
+                Some("tool_use") => {
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": part.get("id").cloned().unwrap_or_else(|| json!("")),
+                        "name": part.get("name").cloned().unwrap_or_else(|| json!("")),
+                        "input": part.get("input").cloned().unwrap_or_else(|| json!({})),
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls.iter().filter_map(Value::as_object) {
+            let function = tool_call
+                .get("function")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let input = function
+                .get("arguments")
+                .map(parse_tool_arguments)
+                .unwrap_or_else(|| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": tool_call.get("id").cloned().unwrap_or_else(|| json!("")),
+                "name": function.get("name").cloned().unwrap_or_else(|| json!("")),
+                "input": input,
+            }));
+        }
+    }
+
+    if content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": "",
+        }));
+    }
+
+    let mut response = json!({
+        "id": object.get("id").cloned().unwrap_or_else(|| json!("")),
+        "model": object.get("model").cloned().unwrap_or_else(|| json!("")),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "stop_reason": map_chat_finish_reason(choice.get("finish_reason").and_then(Value::as_str)),
+        "stop_sequence": Value::Null,
+    });
+
+    if let Some(usage) = object.get("usage").and_then(chat_usage_to_claude_usage) {
+        response["usage"] = usage;
+    }
+
+    if let Some(response_obj) = response.as_object_mut() {
+        for (key, value) in object {
+            if matches!(key.as_str(), "id" | "model" | "choices" | "usage") {
+                continue;
+            }
+            response_obj.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(response)
 }
 
 fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
@@ -257,5 +375,30 @@ fn map_finish_reason(status: Option<&str>) -> Value {
         Some("incomplete") => json!("length"),
         Some("failed") => json!("error"),
         _ => Value::Null,
+    }
+}
+
+fn map_chat_finish_reason(finish_reason: Option<&str>) -> Value {
+    match finish_reason {
+        Some("stop") | None => json!("end_turn"),
+        Some("length") => json!("max_tokens"),
+        Some("tool_calls") => json!("tool_use"),
+        Some(other) => json!(other),
+    }
+}
+
+fn chat_usage_to_claude_usage(usage: &Map<String, Value>) -> Option<Value> {
+    Some(json!({
+        "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or_else(|| usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0))),
+        "output_tokens": usage.get("completion_tokens").cloned().unwrap_or_else(|| usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0))),
+        "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0)),
+    }))
+}
+
+fn parse_tool_arguments(arguments: &Value) -> Value {
+    match arguments {
+        Value::String(raw) => serde_json::from_str(raw).unwrap_or_else(|_| json!({})),
+        Value::Object(_) | Value::Array(_) => arguments.clone(),
+        _ => json!({}),
     }
 }
