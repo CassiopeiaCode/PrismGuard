@@ -12,7 +12,7 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/cassiopeiacode/prismguard
-  LIBCLANG_PATH: /usr/lib/llvm-16/lib
+  LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
 jobs:
   build-binary:
