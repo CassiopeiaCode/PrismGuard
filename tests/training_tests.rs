@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../src/profile.rs"]
 mod profile;
 #[path = "../src/config.rs"]
@@ -30,8 +32,8 @@ use training::{
     build_training_sample_request, cleanup_training_samples_via_rpc, evaluate_training_need,
     fetch_training_sample_count_via_rpc, fetch_training_samples_via_rpc,
     fetch_training_samples_via_unix_socket, run_profile_training,
-    run_training_subprocess_from_args, train_hashlinear_runtime, write_training_status,
-    TrainingSample,
+    run_training_subprocess_from_args, train_bow_runtime, train_fasttext_runtime,
+    train_hashlinear_runtime, write_training_status, TrainingSample,
 };
 
 fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationProfile {
@@ -593,6 +595,216 @@ async fn run_profile_training_cleans_samples_then_trains_hashlinear_runtime() {
 }
 
 #[tokio::test]
+async fn run_profile_training_cleans_samples_then_trains_bow_runtime() {
+    let profile = write_profile(
+        &format!("training-run-profile-bow-{}", std::process::id()),
+        json!({
+            "local_model_type": "bow",
+            "bow_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4,
+                "max_features": 16
+            }
+        }),
+    );
+
+    let runtime_json = profile.bow_runtime_json_path();
+    let runtime_coef = profile.bow_runtime_coef_path();
+    let model_marker = profile.bow_model_path();
+    let vectorizer_marker = profile.bow_vectorizer_path();
+    let _ = std::fs::remove_file(&runtime_json);
+    let _ = std::fs::remove_file(&runtime_coef);
+    let _ = std::fs::remove_file(&model_marker);
+    let _ = std::fs::remove_file(&vectorizer_marker);
+
+    let socket_dir = PathBuf::from(format!("/tmp/prismguard-run-profile-bow-rpc-{}", std::process::id()));
+    if socket_dir.exists() {
+        std::fs::remove_dir_all(&socket_dir).expect("cleanup old socket dir");
+    }
+    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+    let socket_path = socket_dir.join("sample.sock");
+
+    let rpc = SampleRpcConfig {
+        enabled: true,
+        transport: SampleRpcTransport::Unix,
+        unix_socket: socket_path.clone(),
+    };
+
+    let profile_name = profile.profile_name.clone();
+    let db_path = profile.history_rocks_path().display().to_string();
+    let server_socket = socket_path.clone();
+    let server = tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let response_profile_name = profile_name.clone();
+        let response_db_path = db_path.clone();
+        let server = tokio::spawn(async move {
+            serve_unix_requests_until_shutdown(
+                &server_socket,
+                move |request| match request {
+                    SampleRpcRequest::CleanupExcessSamples {
+                        profile,
+                        db_path,
+                        max_items,
+                    } => {
+                        assert_eq!(profile, response_profile_name);
+                        assert_eq!(db_path, response_db_path);
+                        assert_eq!(max_items, 12);
+                        SampleRpcResponse::ok(json!({ "removed": 1 }))
+                    }
+                    SampleRpcRequest::LoadBalancedSamples {
+                        profile,
+                        db_path,
+                        max_samples,
+                    } => {
+                        assert_eq!(profile, response_profile_name);
+                        assert_eq!(db_path, response_db_path);
+                        assert_eq!(max_samples, 4);
+                        SampleRpcResponse::ok(json!({
+                            "samples": [
+                                {"id": 1, "text": "hello friend", "label": 0},
+                                {"id": 2, "text": "safe weather", "label": 0},
+                                {"id": 3, "text": "blocked phrase", "label": 1},
+                                {"id": 4, "text": "blocked threat", "label": 1}
+                            ]
+                        }))
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(());
+        server.await.expect("join inner server")
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let output = run_profile_training(&rpc, &profile)
+        .await
+        .expect("run profile training");
+    assert_eq!(output.sample_count, 4);
+    assert_eq!(output.pass_count, 2);
+    assert_eq!(output.violation_count, 2);
+    assert_eq!(output.runtime_json_path, runtime_json);
+    assert_eq!(output.runtime_coef_path, runtime_coef);
+    assert_eq!(output.model_marker_path, model_marker);
+
+    assert!(runtime_json.exists());
+    assert!(runtime_coef.exists());
+    assert!(model_marker.exists());
+    assert!(vectorizer_marker.exists());
+
+    server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
+}
+
+#[tokio::test]
+async fn run_profile_training_cleans_samples_then_trains_fasttext_runtime() {
+    let profile = write_profile(
+        &format!("training-run-profile-fasttext-{}", std::process::id()),
+        json!({
+            "local_model_type": "fasttext",
+            "fasttext_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4
+            }
+        }),
+    );
+
+    let runtime_json = profile.fasttext_runtime_json_path();
+    let model_marker = profile.fasttext_model_path();
+    let _ = std::fs::remove_file(&runtime_json);
+    let _ = std::fs::remove_file(&model_marker);
+
+    let socket_dir = PathBuf::from(format!("/tmp/prismguard-run-profile-fasttext-rpc-{}", std::process::id()));
+    if socket_dir.exists() {
+        std::fs::remove_dir_all(&socket_dir).expect("cleanup old socket dir");
+    }
+    std::fs::create_dir_all(&socket_dir).expect("create socket dir");
+    let socket_path = socket_dir.join("sample.sock");
+
+    let rpc = SampleRpcConfig {
+        enabled: true,
+        transport: SampleRpcTransport::Unix,
+        unix_socket: socket_path.clone(),
+    };
+
+    let profile_name = profile.profile_name.clone();
+    let db_path = profile.history_rocks_path().display().to_string();
+    let server_socket = socket_path.clone();
+    let server = tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let response_profile_name = profile_name.clone();
+        let response_db_path = db_path.clone();
+        let server = tokio::spawn(async move {
+            serve_unix_requests_until_shutdown(
+                &server_socket,
+                move |request| match request {
+                    SampleRpcRequest::CleanupExcessSamples {
+                        profile,
+                        db_path,
+                        max_items,
+                    } => {
+                        assert_eq!(profile, response_profile_name);
+                        assert_eq!(db_path, response_db_path);
+                        assert_eq!(max_items, 12);
+                        SampleRpcResponse::ok(json!({ "removed": 1 }))
+                    }
+                    SampleRpcRequest::LoadBalancedSamples {
+                        profile,
+                        db_path,
+                        max_samples,
+                    } => {
+                        assert_eq!(profile, response_profile_name);
+                        assert_eq!(db_path, response_db_path);
+                        assert_eq!(max_samples, 4);
+                        SampleRpcResponse::ok(json!({
+                            "samples": [
+                                {"id": 1, "text": "hello friend", "label": 0},
+                                {"id": 2, "text": "safe weather", "label": 0},
+                                {"id": 3, "text": "blocked phrase", "label": 1},
+                                {"id": 4, "text": "blocked threat", "label": 1}
+                            ]
+                        }))
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                },
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = shutdown_tx.send(());
+        server.await.expect("join inner server")
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let output = run_profile_training(&rpc, &profile)
+        .await
+        .expect("run profile training");
+    assert_eq!(output.sample_count, 4);
+    assert_eq!(output.pass_count, 2);
+    assert_eq!(output.violation_count, 2);
+    assert_eq!(output.runtime_json_path, runtime_json);
+    assert_eq!(output.model_marker_path, model_marker);
+
+    assert!(runtime_json.exists());
+    assert!(model_marker.exists());
+
+    server.await.expect("join server").expect("server result");
+    std::fs::remove_dir_all(&socket_dir).expect("cleanup socket dir");
+}
+
+#[tokio::test]
 async fn training_subprocess_marks_success_after_runtime_write() {
     let _guard = current_dir_test_lock().lock().expect("current dir lock");
     let root_dir = PathBuf::from(format!(
@@ -709,7 +921,22 @@ async fn training_subprocess_marks_success_after_runtime_write() {
     let status = profile.training_status().expect("training status");
     assert_eq!(status["status"], "success");
     assert_eq!(status["profile"], "default");
+    assert_eq!(status["model_type"], "hashlinear");
     assert_eq!(status["sample_count"], 4);
+    assert_eq!(status["pass_count"], 2);
+    assert_eq!(status["violation_count"], 2);
+    assert_eq!(
+        status["runtime_json_path"],
+        serde_json::json!(profile.hashlinear_runtime_json_path())
+    );
+    assert_eq!(
+        status["runtime_coef_path"],
+        serde_json::json!(profile.hashlinear_runtime_coef_path())
+    );
+    assert_eq!(
+        status["model_marker_path"],
+        serde_json::json!(profile.hashlinear_model_path())
+    );
     assert!(profile.hashlinear_runtime_json_path().exists());
     assert!(profile.hashlinear_runtime_coef_path().exists());
     assert!(profile.hashlinear_model_path().exists());
@@ -718,6 +945,267 @@ async fn training_subprocess_marks_success_after_runtime_write() {
     assert!(requests.iter().any(|req| matches!(req, SampleRpcRequest::GetSampleCount { .. })));
     assert!(requests.iter().any(|req| matches!(req, SampleRpcRequest::CleanupExcessSamples { .. })));
     assert!(requests.iter().any(|req| matches!(req, SampleRpcRequest::LoadBalancedSamples { .. })));
+
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
+}
+
+#[tokio::test]
+async fn training_subprocess_marks_success_after_bow_runtime_write() {
+    let _guard = current_dir_test_lock().lock().expect("current dir lock");
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-training-subprocess-bow-success-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let profile = write_profile_into(
+        &root_dir,
+        "default",
+        json!({
+            "local_model_type": "bow",
+            "bow_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4,
+                "max_features": 16
+            }
+        }),
+    );
+
+    let socket_path = root_dir.join("run/sample-store.sock");
+    std::fs::write(
+        root_dir.join(".env"),
+        format!(
+            "TRAINING_DATA_RPC_ENABLED=1\nTRAINING_DATA_RPC_TRANSPORT=unix\nTRAINING_DATA_RPC_UNIX_SOCKET={}\n",
+            socket_path.display()
+        ),
+    )
+    .expect("write env");
+
+    let server_socket = socket_path.clone();
+    let expected_profile_name = profile.profile_name.clone();
+    let expected_db_path = profile.history_rocks_path().display().to_string();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_unix_requests_until_shutdown(
+            &server_socket,
+            move |request| match request {
+                SampleRpcRequest::GetSampleCount {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    SampleRpcResponse::ok(json!({ "sample_count": 4 }))
+                }
+                SampleRpcRequest::CleanupExcessSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_items,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_items, 12);
+                    SampleRpcResponse::ok(json!({ "removed": 0 }))
+                }
+                SampleRpcRequest::LoadBalancedSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_samples,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_samples, 4);
+                    SampleRpcResponse::ok(json!({
+                        "samples": [
+                            {"id": 1, "text": "hello friend", "label": 0},
+                            {"id": 2, "text": "safe weather", "label": 0},
+                            {"id": 3, "text": "blocked phrase", "label": 1},
+                            {"id": 4, "text": "blocked threat", "label": 1}
+                        ]
+                    }))
+                }
+                other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let previous_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(&root_dir).expect("set current dir");
+    let result = run_training_subprocess_from_args(&[
+        "prismguard-rust".to_string(),
+        "train-profile".to_string(),
+        "default".to_string(),
+    ])
+    .await;
+    std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join server").expect("server result");
+
+    result.expect("training subprocess result");
+    let status = profile.training_status().expect("training status");
+    assert_eq!(status["status"], "success");
+    assert_eq!(status["profile"], "default");
+    assert_eq!(status["model_type"], "bow");
+    assert_eq!(status["sample_count"], 4);
+    assert_eq!(status["pass_count"], 2);
+    assert_eq!(status["violation_count"], 2);
+    assert_eq!(
+        status["runtime_json_path"],
+        serde_json::json!(profile.bow_runtime_json_path())
+    );
+    assert_eq!(
+        status["runtime_coef_path"],
+        serde_json::json!(profile.bow_runtime_coef_path())
+    );
+    assert_eq!(
+        status["model_marker_path"],
+        serde_json::json!(profile.bow_model_path())
+    );
+    assert!(profile.bow_runtime_json_path().exists());
+    assert!(profile.bow_runtime_coef_path().exists());
+    assert!(profile.bow_model_path().exists());
+    assert!(profile.bow_vectorizer_path().exists());
+
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
+}
+
+#[tokio::test]
+async fn training_subprocess_marks_success_after_fasttext_runtime_write() {
+    let _guard = current_dir_test_lock().lock().expect("current dir lock");
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-training-subprocess-fasttext-success-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let profile = write_profile_into(
+        &root_dir,
+        "default",
+        json!({
+            "local_model_type": "fasttext",
+            "fasttext_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4
+            }
+        }),
+    );
+
+    let socket_path = root_dir.join("run/sample-store.sock");
+    std::fs::write(
+        root_dir.join(".env"),
+        format!(
+            "TRAINING_DATA_RPC_ENABLED=1\nTRAINING_DATA_RPC_TRANSPORT=unix\nTRAINING_DATA_RPC_UNIX_SOCKET={}\n",
+            socket_path.display()
+        ),
+    )
+    .expect("write env");
+
+    let server_socket = socket_path.clone();
+    let expected_profile_name = profile.profile_name.clone();
+    let expected_db_path = profile.history_rocks_path().display().to_string();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_unix_requests_until_shutdown(
+            &server_socket,
+            move |request| match request {
+                SampleRpcRequest::GetSampleCount {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    SampleRpcResponse::ok(json!({ "sample_count": 4 }))
+                }
+                SampleRpcRequest::CleanupExcessSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_items,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_items, 12);
+                    SampleRpcResponse::ok(json!({ "removed": 0 }))
+                }
+                SampleRpcRequest::LoadBalancedSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_samples,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_samples, 4);
+                    SampleRpcResponse::ok(json!({
+                        "samples": [
+                            {"id": 1, "text": "hello friend", "label": 0},
+                            {"id": 2, "text": "safe weather", "label": 0},
+                            {"id": 3, "text": "blocked phrase", "label": 1},
+                            {"id": 4, "text": "blocked threat", "label": 1}
+                        ]
+                    }))
+                }
+                other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let previous_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(&root_dir).expect("set current dir");
+    let result = run_training_subprocess_from_args(&[
+        "prismguard-rust".to_string(),
+        "train-profile".to_string(),
+        "default".to_string(),
+    ])
+    .await;
+    std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join server").expect("server result");
+
+    result.expect("training subprocess result");
+    let status = profile.training_status().expect("training status");
+    assert_eq!(status["status"], "success");
+    assert_eq!(status["profile"], "default");
+    assert_eq!(status["model_type"], "fasttext");
+    assert_eq!(status["sample_count"], 4);
+    assert_eq!(status["pass_count"], 2);
+    assert_eq!(status["violation_count"], 2);
+    assert_eq!(
+        status["runtime_json_path"],
+        serde_json::json!(profile.fasttext_runtime_json_path())
+    );
+    assert_eq!(
+        status["runtime_coef_path"],
+        serde_json::json!(profile.fasttext_runtime_json_path())
+    );
+    assert_eq!(
+        status["model_marker_path"],
+        serde_json::json!(profile.fasttext_model_path())
+    );
+    assert!(profile.fasttext_runtime_json_path().exists());
+    assert!(profile.fasttext_model_path().exists());
 
     std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
 }
@@ -773,6 +1261,8 @@ async fn training_subprocess_marks_failed_when_rpc_unavailable() {
     let status = profile.training_status().expect("training status");
     assert_eq!(status["status"], "failed");
     assert_eq!(status["profile"], "default");
+    assert_eq!(status["model_type"], "hashlinear");
+    assert_eq!(status["sample_count"], 0);
     assert!(
         status["message"]
             .as_str()
@@ -782,6 +1272,241 @@ async fn training_subprocess_marks_failed_when_rpc_unavailable() {
                 .as_str()
                 .expect("error message")
                 .contains("connect")
+    );
+
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
+}
+
+#[tokio::test]
+async fn training_subprocess_marks_failed_when_bow_samples_are_single_label() {
+    let _guard = current_dir_test_lock().lock().expect("current dir lock");
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-training-subprocess-bow-failed-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let profile = write_profile_into(
+        &root_dir,
+        "default",
+        json!({
+            "local_model_type": "bow",
+            "bow_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4,
+                "max_features": 16
+            }
+        }),
+    );
+
+    let socket_path = root_dir.join("run/sample-store.sock");
+    std::fs::write(
+        root_dir.join(".env"),
+        format!(
+            "TRAINING_DATA_RPC_ENABLED=1\nTRAINING_DATA_RPC_TRANSPORT=unix\nTRAINING_DATA_RPC_UNIX_SOCKET={}\n",
+            socket_path.display()
+        ),
+    )
+    .expect("write env");
+
+    let server_socket = socket_path.clone();
+    let expected_profile_name = profile.profile_name.clone();
+    let expected_db_path = profile.history_rocks_path().display().to_string();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_unix_requests_until_shutdown(
+            &server_socket,
+            move |request| match request {
+                SampleRpcRequest::GetSampleCount {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    SampleRpcResponse::ok(json!({ "sample_count": 4 }))
+                }
+                SampleRpcRequest::CleanupExcessSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_items,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_items, 12);
+                    SampleRpcResponse::ok(json!({ "removed": 0 }))
+                }
+                SampleRpcRequest::LoadBalancedSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_samples,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_samples, 4);
+                    SampleRpcResponse::ok(json!({
+                        "samples": [
+                            {"id": 1, "text": "safe text", "label": 0},
+                            {"id": 2, "text": "more safe text", "label": 0}
+                        ]
+                    }))
+                }
+                other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let previous_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(&root_dir).expect("set current dir");
+    let result = run_training_subprocess_from_args(&[
+        "prismguard-rust".to_string(),
+        "train-profile".to_string(),
+        "default".to_string(),
+    ])
+    .await;
+    std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join server").expect("server result");
+
+    assert!(result.is_err(), "single-label bow training should fail");
+    let status = profile.training_status().expect("training status");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["profile"], "default");
+    assert_eq!(status["model_type"], "bow");
+    assert_eq!(status["sample_count"], 4);
+    assert!(
+        status["message"]
+            .as_str()
+            .expect("error message")
+            .contains("both labels")
+    );
+
+    std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
+}
+
+#[tokio::test]
+async fn training_subprocess_marks_failed_when_fasttext_samples_are_single_label() {
+    let _guard = current_dir_test_lock().lock().expect("current dir lock");
+    let root_dir = PathBuf::from(format!(
+        "/tmp/prismguard-training-subprocess-fasttext-failed-{}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old root");
+    }
+    std::fs::create_dir_all(root_dir.join("configs/mod_profiles")).expect("create profile root");
+    std::fs::create_dir_all(root_dir.join("run")).expect("create run dir");
+
+    let profile = write_profile_into(
+        &root_dir,
+        "default",
+        json!({
+            "local_model_type": "fasttext",
+            "fasttext_training": {
+                "max_db_items": 12,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 4
+            }
+        }),
+    );
+
+    let socket_path = root_dir.join("run/sample-store.sock");
+    std::fs::write(
+        root_dir.join(".env"),
+        format!(
+            "TRAINING_DATA_RPC_ENABLED=1\nTRAINING_DATA_RPC_TRANSPORT=unix\nTRAINING_DATA_RPC_UNIX_SOCKET={}\n",
+            socket_path.display()
+        ),
+    )
+    .expect("write env");
+
+    let server_socket = socket_path.clone();
+    let expected_profile_name = profile.profile_name.clone();
+    let expected_db_path = profile.history_rocks_path().display().to_string();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_unix_requests_until_shutdown(
+            &server_socket,
+            move |request| match request {
+                SampleRpcRequest::GetSampleCount {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    SampleRpcResponse::ok(json!({ "sample_count": 4 }))
+                }
+                SampleRpcRequest::CleanupExcessSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_items,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_items, 12);
+                    SampleRpcResponse::ok(json!({ "removed": 0 }))
+                }
+                SampleRpcRequest::LoadBalancedSamples {
+                    profile: request_profile,
+                    db_path: request_db_path,
+                    max_samples,
+                } => {
+                    assert_eq!(request_profile, expected_profile_name);
+                    assert_eq!(request_db_path, expected_db_path);
+                    assert_eq!(max_samples, 4);
+                    SampleRpcResponse::ok(json!({
+                        "samples": [
+                            {"id": 1, "text": "blocked phrase", "label": 1},
+                            {"id": 2, "text": "blocked threat", "label": 1}
+                        ]
+                    }))
+                }
+                other => SampleRpcResponse::err(format!("unexpected request: {other:?}")),
+            },
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let previous_dir = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(&root_dir).expect("set current dir");
+    let result = run_training_subprocess_from_args(&[
+        "prismguard-rust".to_string(),
+        "train-profile".to_string(),
+        "default".to_string(),
+    ])
+    .await;
+    std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+    let _ = shutdown_tx.send(());
+    server.await.expect("join server").expect("server result");
+
+    assert!(result.is_err(), "single-label fasttext training should fail");
+    let status = profile.training_status().expect("training status");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["profile"], "default");
+    assert_eq!(status["model_type"], "fasttext");
+    assert_eq!(status["sample_count"], 4);
+    assert!(
+        status["message"]
+            .as_str()
+            .expect("error message")
+            .contains("both labels")
     );
 
     std::fs::remove_dir_all(&root_dir).expect("cleanup root dir");
@@ -855,11 +1580,288 @@ fn training_writes_hashlinear_runtime_files() {
         serde_json::from_str(&std::fs::read_to_string(&runtime_json).expect("read runtime json"))
             .expect("parse runtime json");
     assert_eq!(metadata["runtime_version"], 1);
+    assert_eq!(metadata["classes"], json!([0, 1]));
     assert_eq!(metadata["n_features"], 64);
     assert_eq!(metadata["source_model"], json!(profile.hashlinear_model_path()));
+    assert_eq!(metadata["cfg"]["lowercase"], true);
 
     let coef_bytes = std::fs::read(&runtime_coef).expect("read runtime coef");
     assert_eq!(coef_bytes.len(), 64 * std::mem::size_of::<f32>());
+
+    let marker: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&model_marker).expect("read model marker"))
+            .expect("parse model marker");
+    assert_eq!(marker["kind"], "hashlinear_runtime_marker");
+    assert_eq!(marker["runtime_json"], json!(runtime_json));
+    assert_eq!(marker["runtime_coef"], json!(runtime_coef));
+    assert!(marker["trained_at"].as_u64().is_some());
+}
+
+#[test]
+fn training_writes_bow_runtime_files() {
+    let profile = write_profile(
+        &format!("training-bow-runtime-export-{}", std::process::id()),
+        json!({
+            "local_model_type": "bow",
+            "bow_training": {
+                "max_features": 16,
+                "sample_loading": "balanced_undersample",
+                "max_samples": 8
+            }
+        }),
+    );
+
+    let runtime_json = profile.base_dir.join("bow_runtime.json");
+    let runtime_coef = profile.base_dir.join("bow_runtime.coef.f32");
+    let model_marker = profile.bow_model_path();
+    let vectorizer_marker = profile.bow_vectorizer_path();
+    let _ = std::fs::remove_file(&runtime_json);
+    let _ = std::fs::remove_file(&runtime_coef);
+    let _ = std::fs::remove_file(&model_marker);
+    let _ = std::fs::remove_file(&vectorizer_marker);
+
+    train_bow_runtime(
+        &profile,
+        &[
+            TrainingSample {
+                id: Some(1),
+                text: "hello friend".to_string(),
+                label: 0,
+                category: None,
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(2),
+                text: "calm weather".to_string(),
+                label: 0,
+                category: None,
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(3),
+                text: "blocked phrase".to_string(),
+                label: 1,
+                category: Some("policy".to_string()),
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(4),
+                text: "blocked threat".to_string(),
+                label: 1,
+                category: Some("policy".to_string()),
+                created_at: None,
+            },
+        ],
+    )
+    .expect("train bow runtime");
+
+    assert!(runtime_json.exists());
+    assert!(runtime_coef.exists());
+    assert!(model_marker.exists());
+    assert!(vectorizer_marker.exists());
+
+    let metadata: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&runtime_json).expect("read runtime json"))
+            .expect("parse runtime json");
+    assert_eq!(metadata["runtime_version"], 1);
+    assert_eq!(metadata["classes"], json!([0, 1]));
+    assert_eq!(metadata["source_model"], json!(profile.bow_model_path()));
+    assert_eq!(
+        metadata["source_vectorizer"],
+        json!(profile.bow_vectorizer_path())
+    );
+    assert!(
+        metadata["vocabulary"]
+            .as_array()
+            .expect("vocabulary array")
+            .len()
+            >= 2
+    );
+    assert_eq!(metadata["tokenizer"]["lowercase"], true);
+    assert_eq!(metadata["tokenizer"]["split_whitespace"], true);
+
+    let coef_bytes = std::fs::read(&runtime_coef).expect("read runtime coef");
+    assert_eq!(
+        coef_bytes.len(),
+        metadata["vocabulary"].as_array().expect("vocabulary array").len() * std::mem::size_of::<f32>()
+    );
+
+    let model_marker_payload: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&model_marker).expect("read bow model marker"),
+    )
+    .expect("parse bow model marker");
+    assert_eq!(model_marker_payload["kind"], "bow_runtime_marker");
+    assert_eq!(model_marker_payload["runtime_json"], json!(runtime_json));
+    assert_eq!(model_marker_payload["runtime_coef"], json!(runtime_coef));
+    assert!(model_marker_payload["trained_at"].as_u64().is_some());
+
+    let vectorizer_marker_payload: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&vectorizer_marker).expect("read bow vectorizer marker"),
+    )
+    .expect("parse bow vectorizer marker");
+    assert_eq!(
+        vectorizer_marker_payload["kind"],
+        "bow_vectorizer_runtime_marker"
+    );
+    assert_eq!(vectorizer_marker_payload["runtime_json"], json!(runtime_json));
+    assert!(vectorizer_marker_payload["trained_at"].as_u64().is_some());
+}
+
+#[test]
+fn training_writes_fasttext_runtime_file() {
+    let profile = write_profile(
+        &format!("training-fasttext-runtime-export-{}", std::process::id()),
+        json!({
+            "local_model_type": "fasttext",
+            "fasttext_training": {
+                "sample_loading": "balanced_undersample",
+                "max_samples": 8
+            }
+        }),
+    );
+
+    let runtime_json = profile.base_dir.join("fasttext_runtime.json");
+    let model_marker = profile.fasttext_model_path();
+    let _ = std::fs::remove_file(&runtime_json);
+    let _ = std::fs::remove_file(&model_marker);
+
+    train_fasttext_runtime(
+        &profile,
+        &[
+            TrainingSample {
+                id: Some(1),
+                text: "hello friend".to_string(),
+                label: 0,
+                category: None,
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(2),
+                text: "safe weather".to_string(),
+                label: 0,
+                category: None,
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(3),
+                text: "blocked phrase".to_string(),
+                label: 1,
+                category: Some("policy".to_string()),
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(4),
+                text: "blocked threat".to_string(),
+                label: 1,
+                category: Some("policy".to_string()),
+                created_at: None,
+            },
+        ],
+    )
+    .expect("train fasttext runtime");
+
+    assert!(runtime_json.exists());
+    assert!(model_marker.exists());
+
+    let metadata: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&runtime_json).expect("read runtime json"))
+            .expect("parse runtime json");
+    assert_eq!(metadata["runtime_version"], 1);
+    assert_eq!(metadata["classes"], json!([0, 1]));
+    assert_eq!(metadata["source_model"], json!(profile.fasttext_model_path()));
+    assert_eq!(metadata["tokenizer"]["lowercase"], true);
+    assert_eq!(metadata["tokenizer"]["split_whitespace"], true);
+    assert!(
+        metadata["weights"]
+            .as_array()
+            .expect("weights array")
+            .len()
+            >= 2
+    );
+    assert!(
+        metadata["weights"]
+            .as_array()
+            .expect("weights array")
+            .iter()
+            .all(|item| item.get("token").is_some() && item.get("weight").is_some())
+    );
+
+    let marker: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&model_marker).expect("read fasttext marker"),
+    )
+    .expect("parse fasttext marker");
+    assert_eq!(marker["kind"], "fasttext_runtime_marker");
+    assert_eq!(marker["runtime_json"], json!(runtime_json));
+    assert!(marker["trained_at"].as_u64().is_some());
+}
+
+#[test]
+fn training_rejects_bow_runtime_when_only_one_label_exists() {
+    let profile = write_profile(
+        &format!("training-bow-single-label-{}", std::process::id()),
+        json!({
+            "local_model_type": "bow",
+            "bow_training": {
+                "max_features": 16
+            }
+        }),
+    );
+
+    let err = train_bow_runtime(
+        &profile,
+        &[
+            TrainingSample {
+                id: Some(1),
+                text: "safe text".to_string(),
+                label: 0,
+                category: None,
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(2),
+                text: "more safe text".to_string(),
+                label: 0,
+                category: None,
+                created_at: None,
+            },
+        ],
+    )
+    .expect_err("single-label bow training should fail");
+
+    assert!(err.to_string().contains("both labels"));
+}
+
+#[test]
+fn training_rejects_fasttext_runtime_when_only_one_label_exists() {
+    let profile = write_profile(
+        &format!("training-fasttext-single-label-{}", std::process::id()),
+        json!({
+            "local_model_type": "fasttext"
+        }),
+    );
+
+    let err = train_fasttext_runtime(
+        &profile,
+        &[
+            TrainingSample {
+                id: Some(1),
+                text: "blocked phrase".to_string(),
+                label: 1,
+                category: Some("policy".to_string()),
+                created_at: None,
+            },
+            TrainingSample {
+                id: Some(2),
+                text: "blocked threat".to_string(),
+                label: 1,
+                category: Some("policy".to_string()),
+                created_at: None,
+            },
+        ],
+    )
+    .expect_err("single-label fasttext training should fail");
+
+    assert!(err.to_string().contains("both labels"));
 }
 
 #[test]

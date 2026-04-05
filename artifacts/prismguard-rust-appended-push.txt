@@ -1,0 +1,16 @@
+仓库目录: /services/apps/PrismGuard-landing
+当前分支: prismguard-rust-appended
+备份分支: backup/origin-master
+
+安全推到新分支:
+  git -C /services/apps/PrismGuard-landing push origin prismguard-rust-appended:prismguard-rust-appended
+
+如果要直接覆盖 GitHub master:
+  git -C /services/apps/PrismGuard-landing push --force-with-lease origin prismguard-rust-appended:master
+
+如果需要回滚到原始 GitHub master:
+  git -C /services/apps/PrismGuard-landing push --force-with-lease origin backup/origin-master:master
+
+本地核对:
+  git -C /services/apps/PrismGuard-landing log --oneline --decorate --graph --max-count=25
+  git -C /services/apps/PrismGuard-landing log --oneline origin/master..prismguard-rust-appended

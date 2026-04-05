@@ -233,7 +233,12 @@ pub async fn run_profile_training(
 ) -> Result<HashlinearTrainingOutput> {
     let _ = cleanup_training_samples_via_rpc(rpc, profile).await?;
     let samples = fetch_training_samples_via_rpc(rpc, profile).await?;
-    train_hashlinear_runtime(profile, &samples)
+    match profile.config.local_model_type.as_str() {
+        "hashlinear" => train_hashlinear_runtime(profile, &samples),
+        "bow" => train_bow_runtime(profile, &samples),
+        "fasttext" => train_fasttext_runtime(profile, &samples),
+        other => Err(anyhow!("unsupported local_model_type: {other}")),
+    }
 }
 
 pub async fn run_training_subprocess_from_args(args: &[String]) -> Result<()> {
@@ -365,6 +370,58 @@ pub fn train_hashlinear_runtime(
     })
 }
 
+pub fn train_bow_runtime(
+    profile: &ModerationProfile,
+    samples: &[TrainingSample],
+) -> Result<HashlinearTrainingOutput> {
+    if profile.config.local_model_type != "bow" {
+        return Err(anyhow!(
+            "train_bow_runtime requires local_model_type=bow, got {}",
+            profile.config.local_model_type
+        ));
+    }
+
+    let (pass_count, violation_count) = ensure_binary_samples("bow", samples)?;
+    let max_features = profile.config.bow_training.max_features.max(1);
+    let (vocabulary, idf, weights, intercept) = train_token_runtime(samples, max_features);
+    write_bow_runtime(profile, &vocabulary, &idf, intercept as f32, &weights)?;
+
+    Ok(HashlinearTrainingOutput {
+        sample_count: samples.len(),
+        pass_count,
+        violation_count,
+        runtime_json_path: profile.bow_runtime_json_path(),
+        runtime_coef_path: profile.bow_runtime_coef_path(),
+        model_marker_path: profile.bow_model_path(),
+    })
+}
+
+pub fn train_fasttext_runtime(
+    profile: &ModerationProfile,
+    samples: &[TrainingSample],
+) -> Result<HashlinearTrainingOutput> {
+    if profile.config.local_model_type != "fasttext" {
+        return Err(anyhow!(
+            "train_fasttext_runtime requires local_model_type=fasttext, got {}",
+            profile.config.local_model_type
+        ));
+    }
+
+    let (pass_count, violation_count) = ensure_binary_samples("fasttext", samples)?;
+    let max_features = profile.config.fasttext_training.max_samples.max(16);
+    let (vocabulary, _idf, weights, intercept) = train_token_runtime(samples, max_features);
+    write_fasttext_runtime(profile, &vocabulary, intercept as f32, &weights)?;
+
+    Ok(HashlinearTrainingOutput {
+        sample_count: samples.len(),
+        pass_count,
+        violation_count,
+        runtime_json_path: profile.fasttext_runtime_json_path(),
+        runtime_coef_path: profile.fasttext_runtime_json_path(),
+        model_marker_path: profile.fasttext_model_path(),
+    })
+}
+
 fn sample_loading_config(profile: &ModerationProfile) -> Result<(&str, usize)> {
     match profile.config.local_model_type.as_str() {
         "fasttext" => Ok((
@@ -381,6 +438,23 @@ fn sample_loading_config(profile: &ModerationProfile) -> Result<(&str, usize)> {
         )),
         other => Err(anyhow!("unsupported local_model_type: {other}")),
     }
+}
+
+fn ensure_binary_samples(kind: &str, samples: &[TrainingSample]) -> Result<(usize, usize)> {
+    if samples.is_empty() {
+        return Err(anyhow!("cannot train {kind} runtime with empty samples"));
+    }
+
+    let pass_count = samples.iter().filter(|sample| sample.label == 0).count();
+    let violation_count = samples.iter().filter(|sample| sample.label == 1).count();
+    if pass_count == 0 || violation_count == 0 {
+        return Err(anyhow!(
+            "{kind} runtime training requires both labels, got pass={} violation={}",
+            pass_count,
+            violation_count
+        ));
+    }
+    Ok((pass_count, violation_count))
 }
 
 fn training_config(profile: &ModerationProfile) -> Result<(PathBuf, usize, usize)> {
@@ -402,6 +476,62 @@ fn training_config(profile: &ModerationProfile) -> Result<(PathBuf, usize, usize
         )),
         other => Err(anyhow!("unsupported local_model_type: {other}")),
     }
+}
+
+fn train_token_runtime(
+    samples: &[TrainingSample],
+    max_features: usize,
+) -> (Vec<String>, Vec<f64>, Vec<f32>, f64) {
+    let mut token_stats: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    let mut pass_docs = 0usize;
+    let mut violation_docs = 0usize;
+
+    for sample in samples {
+        if sample.label == 0 {
+            pass_docs += 1;
+        } else {
+            violation_docs += 1;
+        }
+
+        let tokens = tokenize_training_text(&sample.text);
+        let mut seen = std::collections::HashSet::new();
+        for token in tokens {
+            let entry = token_stats.entry(token.clone()).or_insert((0, 0, 0));
+            if sample.label == 0 {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+            if seen.insert(token) {
+                entry.2 += 1;
+            }
+        }
+    }
+
+    let mut ranked = token_stats.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|(lhs_token, lhs), (rhs_token, rhs)| {
+        let lhs_score = usize::abs_diff(lhs.1, lhs.0);
+        let rhs_score = usize::abs_diff(rhs.1, rhs.0);
+        rhs_score
+            .cmp(&lhs_score)
+            .then_with(|| rhs.2.cmp(&lhs.2))
+            .then_with(|| lhs_token.cmp(rhs_token))
+    });
+    ranked.truncate(max_features.max(1));
+
+    let total_docs = samples.len() as f64;
+    let prior = ((violation_docs as f64 + 1.0) / (pass_docs as f64 + 1.0)).ln();
+    let mut vocabulary = Vec::with_capacity(ranked.len());
+    let mut idf = Vec::with_capacity(ranked.len());
+    let mut weights = Vec::with_capacity(ranked.len());
+
+    for (token, (pass_hits, violation_hits, doc_freq)) in ranked {
+        vocabulary.push(token);
+        idf.push(((total_docs + 1.0) / (doc_freq as f64 + 1.0)).ln() + 1.0);
+        weights.push((((violation_hits as f64) + 1.0) / ((pass_hits as f64) + 1.0)).ln() as f32);
+    }
+
+    (vocabulary, idf, weights, prior)
 }
 
 fn parse_training_samples(result: &Value) -> Result<Vec<TrainingSample>> {
@@ -560,6 +690,139 @@ fn write_hashlinear_runtime(
     fs::rename(&model_marker_tmp, &model_marker_path)
         .with_context(|| format!("failed to rename {}", model_marker_path.display()))?;
     Ok(())
+}
+
+fn write_bow_runtime(
+    profile: &ModerationProfile,
+    vocabulary: &[String],
+    idf: &[f64],
+    intercept: f32,
+    weights: &[f32],
+) -> Result<()> {
+    fs::create_dir_all(&profile.base_dir)
+        .with_context(|| format!("failed to create {}", profile.base_dir.display()))?;
+
+    let runtime_json_path = profile.bow_runtime_json_path();
+    let runtime_coef_path = profile.bow_runtime_coef_path();
+    let model_marker_path = profile.bow_model_path();
+    let vectorizer_marker_path = profile.bow_vectorizer_path();
+
+    let runtime_json_tmp = runtime_json_path.with_extension("json.tmp");
+    let runtime_coef_tmp = runtime_coef_path.with_extension("f32.tmp");
+    let model_marker_tmp = model_marker_path.with_extension("pkl.tmp");
+    let vectorizer_marker_tmp = vectorizer_marker_path.with_extension("pkl.tmp");
+
+    let metadata = serde_json::json!({
+        "runtime_version": 1,
+        "source_model": model_marker_path,
+        "source_vectorizer": vectorizer_marker_path,
+        "intercept": intercept,
+        "classes": [0, 1],
+        "tokenizer": {
+            "lowercase": true,
+            "split_whitespace": true,
+            "char_ngram_range": []
+        },
+        "vocabulary": vocabulary,
+        "idf": idf
+    });
+    fs::write(&runtime_json_tmp, metadata.to_string())
+        .with_context(|| format!("failed to write {}", runtime_json_tmp.display()))?;
+
+    let mut coef_bytes = Vec::with_capacity(weights.len() * std::mem::size_of::<f32>());
+    for weight in weights {
+        coef_bytes.extend_from_slice(&weight.to_le_bytes());
+    }
+    fs::write(&runtime_coef_tmp, coef_bytes)
+        .with_context(|| format!("failed to write {}", runtime_coef_tmp.display()))?;
+
+    let model_marker = serde_json::json!({
+        "kind": "bow_runtime_marker",
+        "runtime_json": runtime_json_path,
+        "runtime_coef": runtime_coef_path,
+        "trained_at": current_unix_secs()
+    });
+    fs::write(&model_marker_tmp, model_marker.to_string())
+        .with_context(|| format!("failed to write {}", model_marker_tmp.display()))?;
+
+    let vectorizer_marker = serde_json::json!({
+        "kind": "bow_vectorizer_runtime_marker",
+        "runtime_json": runtime_json_path,
+        "trained_at": current_unix_secs()
+    });
+    fs::write(&vectorizer_marker_tmp, vectorizer_marker.to_string())
+        .with_context(|| format!("failed to write {}", vectorizer_marker_tmp.display()))?;
+
+    fs::rename(&runtime_json_tmp, &runtime_json_path)
+        .with_context(|| format!("failed to rename {}", runtime_json_path.display()))?;
+    fs::rename(&runtime_coef_tmp, &runtime_coef_path)
+        .with_context(|| format!("failed to rename {}", runtime_coef_path.display()))?;
+    fs::rename(&model_marker_tmp, &model_marker_path)
+        .with_context(|| format!("failed to rename {}", model_marker_path.display()))?;
+    fs::rename(&vectorizer_marker_tmp, &vectorizer_marker_path)
+        .with_context(|| format!("failed to rename {}", vectorizer_marker_path.display()))?;
+    Ok(())
+}
+
+fn write_fasttext_runtime(
+    profile: &ModerationProfile,
+    vocabulary: &[String],
+    intercept: f32,
+    weights: &[f32],
+) -> Result<()> {
+    fs::create_dir_all(&profile.base_dir)
+        .with_context(|| format!("failed to create {}", profile.base_dir.display()))?;
+
+    let runtime_json_path = profile.fasttext_runtime_json_path();
+    let model_marker_path = profile.fasttext_model_path();
+    let runtime_json_tmp = runtime_json_path.with_extension("json.tmp");
+    let model_marker_tmp = model_marker_path.with_extension("bin.tmp");
+
+    let items = vocabulary
+        .iter()
+        .zip(weights.iter())
+        .map(|(token, weight)| {
+            serde_json::json!({
+                "token": token,
+                "weight": weight
+            })
+        })
+        .collect::<Vec<_>>();
+    let metadata = serde_json::json!({
+        "runtime_version": 1,
+        "source_model": model_marker_path,
+        "intercept": intercept,
+        "classes": [0, 1],
+        "tokenizer": {
+            "lowercase": true,
+            "split_whitespace": true
+        },
+        "weights": items
+    });
+    fs::write(&runtime_json_tmp, metadata.to_string())
+        .with_context(|| format!("failed to write {}", runtime_json_tmp.display()))?;
+
+    let model_marker = serde_json::json!({
+        "kind": "fasttext_runtime_marker",
+        "runtime_json": runtime_json_path,
+        "trained_at": current_unix_secs()
+    });
+    fs::write(&model_marker_tmp, model_marker.to_string())
+        .with_context(|| format!("failed to write {}", model_marker_tmp.display()))?;
+
+    fs::rename(&runtime_json_tmp, &runtime_json_path)
+        .with_context(|| format!("failed to rename {}", runtime_json_path.display()))?;
+    fs::rename(&model_marker_tmp, &model_marker_path)
+        .with_context(|| format!("failed to rename {}", model_marker_path.display()))?;
+    Ok(())
+}
+
+fn tokenize_training_text(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn extract_features(text: &str, spec: &HashlinearTrainingSpec) -> Result<HashMap<usize, f64>> {

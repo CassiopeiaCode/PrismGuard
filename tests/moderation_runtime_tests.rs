@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/format.rs"]
@@ -12,6 +14,7 @@ mod response;
 mod routes;
 #[path = "../src/sample_rpc.rs"]
 mod sample_rpc;
+#[cfg(feature = "storage-debug")]
 #[path = "../src/storage.rs"]
 mod storage;
 #[path = "../src/training.rs"]

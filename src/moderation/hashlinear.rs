@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
+use jieba_rs::Jieba;
 use serde::Deserialize;
 
 use crate::profile::ModerationProfile;
 
 static RUNTIME_CACHE: OnceLock<Mutex<HashMap<String, CachedRuntime>>> = OnceLock::new();
+static JIEBA: OnceLock<Jieba> = OnceLock::new();
 
 #[derive(Clone)]
 struct CachedRuntime {
@@ -46,6 +48,8 @@ struct RuntimeConfig {
     norm: Option<String>,
     #[serde(default = "default_true")]
     lowercase: bool,
+    #[serde(default)]
+    use_jieba: bool,
 }
 
 #[derive(Clone)]
@@ -77,6 +81,7 @@ pub fn runtime_paths(profile: &ModerationProfile) -> HashlinearRuntimePaths {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn runtime_exists(profile: &ModerationProfile) -> bool {
     let paths = runtime_paths(profile);
     paths.metadata_path.exists() && paths.coefficients_path.exists()
@@ -89,8 +94,10 @@ pub fn predict(text: &str, profile: &ModerationProfile) -> Result<Option<Hashlin
     }
 
     let runtime = load_runtime(profile, &paths.metadata_path, &paths.coefficients_path)?;
+    let clean = text.replace('\r', " ").replace('\n', " ");
+    let prepared = maybe_tokenize_for_word_analyzer(&clean, &runtime.cfg);
     Ok(Some(HashlinearScore {
-        probability: runtime.predict_proba(text)?,
+        probability: runtime.predict_proba(&prepared)?,
     }))
 }
 
@@ -268,6 +275,14 @@ fn validate_runtime_metadata(metadata: &RuntimeMetadata) -> Result<()> {
         return Err(anyhow!("hashlinear runtime n_features must be > 0"));
     }
     Ok(())
+}
+
+fn maybe_tokenize_for_word_analyzer(text: &str, cfg: &RuntimeConfig) -> String {
+    if cfg.analyzer != "word" || !cfg.use_jieba {
+        return text.to_string();
+    }
+
+    JIEBA.get_or_init(Jieba::new).cut(text, false).join(" ")
 }
 
 fn normalize_spaces(input: &str) -> String {

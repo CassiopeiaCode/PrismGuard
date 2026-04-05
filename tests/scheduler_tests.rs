@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/profile.rs"]
@@ -6,6 +8,7 @@ mod profile;
 mod scheduler;
 #[path = "../src/sample_rpc.rs"]
 mod sample_rpc;
+#[cfg(feature = "storage-debug")]
 #[path = "../src/storage.rs"]
 mod storage;
 #[path = "../src/training.rs"]

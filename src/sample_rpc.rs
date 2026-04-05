@@ -62,6 +62,7 @@ pub struct SampleRpcResponse {
 }
 
 impl SampleRpcResponse {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn ok(result: Value) -> Self {
         Self {
             ok: true,
@@ -70,6 +71,7 @@ impl SampleRpcResponse {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn err(message: impl Into<String>) -> Self {
         Self {
             ok: false,
@@ -135,6 +137,7 @@ pub fn cleanup_stale_unix_socket(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn dispatch_request<F>(request: SampleRpcRequest, mut handler: F) -> SampleRpcResponse
 where
     F: FnMut(&SampleRpcRequest) -> Result<Value>,
@@ -200,121 +203,31 @@ pub fn dispatch_request_with_storage(request: SampleRpcRequest) -> SampleRpcResp
 
 #[cfg(feature = "storage-debug")]
 fn cleanup_excess_samples_in_rocksdb(db_path: &str, max_items: usize) -> Result<usize> {
-    use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, Options, WriteBatch};
-
-    let mut options = Options::default();
-    options.create_if_missing(false);
-    options.set_comparator("rocksdict", Box::new(|lhs, rhs| lhs.cmp(rhs)));
-    let db = DBWithThreadMode::<MultiThreaded>::open(&options, db_path)
-        .with_context(|| format!("failed to open RocksDB {db_path}"))?;
-
-    let mut samples = Vec::new();
-    for entry in db.iterator(IteratorMode::Start) {
-        let Ok((raw_key, raw_value)) = entry else {
-            continue;
-        };
-        let key = decode_rocksdict_string(&raw_key)?;
-        if !key.starts_with("sample:") {
-            continue;
-        }
-
-        let value_str = decode_rocksdict_string(&raw_value)?;
-        let value: Value = serde_json::from_str(&value_str)
-            .with_context(|| format!("failed to decode sample JSON for key {key}"))?;
-        samples.push((key, value));
-    }
-
-    if samples.len() <= max_items {
-        return Ok(0);
-    }
-
-    samples.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-    let removed_samples = &samples[..samples.len() - max_items];
-    let removed = removed_samples.len();
-
-    let mut removed_pass = 0usize;
-    let mut removed_violation = 0usize;
-    let mut batch = WriteBatch::default();
-    for (key, value) in removed_samples {
-        let label = value.get("label").and_then(Value::as_i64).unwrap_or_default();
-        match label {
-            0 => removed_pass += 1,
-            1 => removed_violation += 1,
-            _ => {}
-        }
-        batch.delete(encode_rocksdict_string(key));
-    }
-
-    let total_count = read_rocks_u64(&db, "meta:count").unwrap_or(samples.len() as u64);
-    let pass_count = read_rocks_u64(&db, "meta:count:0").unwrap_or_default();
-    let violation_count = read_rocks_u64(&db, "meta:count:1").unwrap_or_default();
-    let next_total = total_count.saturating_sub(removed as u64);
-    let next_pass = pass_count.saturating_sub(removed_pass as u64);
-    let next_violation = violation_count.saturating_sub(removed_violation as u64);
-
-    batch.put(
-        encode_rocksdict_string("meta:count"),
-        encode_rocksdict_string(&next_total.to_string()),
-    );
-    batch.put(
-        encode_rocksdict_string("meta:count:0"),
-        encode_rocksdict_string(&next_pass.to_string()),
-    );
-    batch.put(
-        encode_rocksdict_string("meta:count:1"),
-        encode_rocksdict_string(&next_violation.to_string()),
-    );
-
-    db.write(batch)
-        .with_context(|| format!("failed to cleanup excess samples in {db_path}"))?;
-    Ok(removed)
+    let storage = crate::storage::SampleStorage::open_read_write(db_path)?;
+    storage.cleanup_excess_samples(max_items)
 }
 
-#[cfg(feature = "storage-debug")]
-fn read_rocks_u64(
-    db: &rocksdb::DBWithThreadMode<rocksdb::MultiThreaded>,
-    key: &str,
-) -> Option<u64> {
-    db.get(encode_rocksdict_string(key))
-        .ok()
-        .flatten()
-        .and_then(|raw| decode_rocksdict_string(&raw).ok())
-        .and_then(|value| value.parse::<u64>().ok())
-}
-
-#[cfg(feature = "storage-debug")]
-fn encode_rocksdict_string(value: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(value.len() + 1);
-    out.push(0x02);
-    out.extend_from_slice(value.as_bytes());
-    out
-}
-
-#[cfg(feature = "storage-debug")]
-fn decode_rocksdict_string(raw: &[u8]) -> Result<String> {
-    let payload = raw
-        .strip_prefix(&[0x02])
-        .ok_or_else(|| anyhow!("invalid rocksdict string prefix"))?;
-    String::from_utf8(payload.to_vec()).context("invalid rocksdict utf-8 payload")
-}
-
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_request_line(request: &SampleRpcRequest) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(request).context("failed to encode sample RPC request")?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn decode_request_line(line: &[u8]) -> Result<SampleRpcRequest> {
     serde_json::from_slice(trim_ascii_whitespace_end(line))
         .context("failed to decode sample RPC request")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_response_line(response: &SampleRpcResponse) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec(response).context("failed to encode sample RPC response")?;
     bytes.push(b'\n');
     Ok(bytes)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn decode_response_line(line: &[u8]) -> Result<SampleRpcResponse> {
     serde_json::from_slice(trim_ascii_whitespace_end(line))
         .context("failed to decode sample RPC response")
@@ -355,6 +268,7 @@ pub async fn send_unix_request(
     decode_response_line(&line)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn serve_one_unix_request<F>(
     socket_path: &Path,
     handler: F,
@@ -368,6 +282,7 @@ where
     handle_unix_stream(stream, handler).await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn serve_unix_requests_until_shutdown<F, Fut>(
     socket_path: &Path,
     handler: F,
@@ -408,6 +323,7 @@ where
     serve_unix_requests_until_shutdown(socket_path, dispatch_request_with_storage, shutdown).await
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_unix_stream<F>(stream: UnixStream, handler: F) -> Result<()>
 where
     F: FnOnce(SampleRpcRequest) -> Result<SampleRpcResponse>,

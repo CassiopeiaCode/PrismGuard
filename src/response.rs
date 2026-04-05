@@ -33,18 +33,23 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
     let output_items = object
         .get("output")
         .and_then(Value::as_array)
-        .and_then(|items| items.last());
+        .cloned()
+        .unwrap_or_default();
+    let last_relevant_index = output_items.iter().rposition(|item| {
+        matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("message") | Some("function_call") | Some("reasoning")
+        )
+    });
 
     let mut message = Map::new();
     message.insert("role".to_string(), json!("assistant"));
-    if let Some(last_item) = output_items {
+    if let Some(last_relevant_index) = last_relevant_index {
+        let last_item = &output_items[last_relevant_index];
         match last_item.get("type").and_then(Value::as_str) {
             Some("message") => {
-                let content_parts = last_item
-                    .get("content")
-                    .and_then(Value::as_array)
+                let content_parts = response_message_parts(last_item.get("content"))
                     .into_iter()
-                    .flatten()
                     .filter_map(|part| match part.get("type").and_then(Value::as_str) {
                         Some("output_text") => part.get("text").and_then(Value::as_str).map(|text| {
                             json!({
@@ -80,6 +85,36 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
                                         })
                                     })
                                 })
+                            })
+                            .or_else(|| {
+                                part.get("url").and_then(Value::as_str).map(|url| {
+                                    let mut image_url = Map::new();
+                                    image_url.insert("url".to_string(), json!(url));
+                                    if let Some(detail) = part.get("detail").cloned() {
+                                        image_url.insert("detail".to_string(), detail);
+                                    }
+                                    json!({
+                                        "type": "image_url",
+                                        "image_url": image_url
+                                    })
+                                })
+                            })
+                            .or_else(|| {
+                                part.get("image")
+                                    .and_then(Value::as_object)
+                                    .and_then(|image| image.get("url"))
+                                    .and_then(Value::as_str)
+                                    .map(|url| {
+                                        let mut image_url = Map::new();
+                                        image_url.insert("url".to_string(), json!(url));
+                                        if let Some(detail) = part.get("detail").cloned() {
+                                            image_url.insert("detail".to_string(), detail);
+                                        }
+                                        json!({
+                                            "type": "image_url",
+                                            "image_url": image_url
+                                        })
+                                    })
                             }),
                         _ => None,
                     })
@@ -103,24 +138,36 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
                 }
             }
             Some("function_call") => {
-                let arguments = last_item
-                    .get("arguments")
-                    .map(stringify_function_arguments)
-                    .unwrap_or_else(|| json!(""));
+                let start_index = output_items[..=last_relevant_index]
+                    .iter()
+                    .rposition(|item| item.get("type").and_then(Value::as_str) != Some("function_call"))
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                let tool_calls = output_items[start_index..=last_relevant_index]
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+                    .map(|item| {
+                        let arguments = item
+                            .get("arguments")
+                            .map(stringify_function_arguments)
+                            .unwrap_or_else(|| json!(""));
+                        json!({
+                            "id": item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .cloned()
+                                .unwrap_or_else(|| json!("")),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name").cloned().unwrap_or_else(|| json!("")),
+                                "arguments": arguments
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 message.insert(
                     "tool_calls".to_string(),
-                    json!([{
-                        "id": last_item
-                            .get("call_id")
-                            .or_else(|| last_item.get("id"))
-                            .cloned()
-                            .unwrap_or_else(|| json!("")),
-                        "type": "function",
-                        "function": {
-                            "name": last_item.get("name").cloned().unwrap_or_else(|| json!("")),
-                            "arguments": arguments
-                        }
-                    }]),
+                    Value::Array(tool_calls),
                 );
             }
             Some("reasoning") => {
@@ -181,6 +228,20 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
     }
 
     Ok(response)
+}
+
+fn response_message_parts(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::Array(parts)) => parts.clone(),
+        Some(Value::Object(obj)) => {
+            if let Some(items) = obj.get("items").and_then(Value::as_array) {
+                items.clone()
+            } else {
+                vec![Value::Object(obj.clone())]
+            }
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn stringify_function_arguments(arguments: &Value) -> Value {

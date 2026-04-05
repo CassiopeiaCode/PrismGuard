@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 mod config;
 mod format;
 mod profile;
@@ -33,7 +35,7 @@ use crate::training::run_training_subprocess_from_args;
 
 enum StartupMode {
     Server,
-    TrainProfile { profile_name: String },
+    TrainProfile,
 }
 
 #[tokio::main]
@@ -41,7 +43,7 @@ async fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     match select_startup_mode(&args)? {
         StartupMode::Server => run_server().await,
-        StartupMode::TrainProfile { .. } => run_training_subprocess_from_args(&args).await,
+        StartupMode::TrainProfile => run_training_subprocess_from_args(&args).await,
     }
 }
 
@@ -103,11 +105,9 @@ fn select_startup_mode(args: &[String]) -> Result<StartupMode> {
     match args.get(1).map(String::as_str) {
         None => Ok(StartupMode::Server),
         Some("train-profile") => {
-            let profile_name = args
-                .get(2)
-                .cloned()
+            args.get(2)
                 .ok_or_else(|| anyhow!("usage: {} train-profile <profile-name>", binary_name(args)))?;
-            Ok(StartupMode::TrainProfile { profile_name })
+            Ok(StartupMode::TrainProfile)
         }
         Some(other) => Err(anyhow!("unknown subcommand: {other}")),
     }

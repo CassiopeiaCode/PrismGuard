@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
@@ -10,6 +12,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::moderation::bow;
+use crate::moderation::fasttext;
 use crate::moderation::hashlinear;
 use crate::profile::ModerationProfile;
 #[cfg(feature = "storage-debug")]
@@ -17,11 +21,18 @@ use crate::storage::SampleStorage;
 
 const MAX_LLM_CONCURRENCY: usize = 5;
 const CACHE_SIZE: usize = 1024;
+const MAX_CACHE_PROFILES: usize = 50;
 
 static LLM_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static MODERATION_CACHE: OnceLock<Mutex<HashMap<String, IndexMap<String, SmartModerationResult>>>> =
+static MODERATION_CACHE: OnceLock<Mutex<IndexMap<String, IndexMap<String, SmartModerationResult>>>> =
     OnceLock::new();
+#[cfg(feature = "storage-debug")]
 static HISTORY_STORAGE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+static REQUEST_RANDOM_STATE: OnceLock<AtomicU64> = OnceLock::new();
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(test)]
+static TEST_RANDOM_VALUES: OnceLock<Mutex<VecDeque<f64>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SmartModerationResult {
@@ -91,18 +102,20 @@ async fn decide_moderation(
     http_client: &Client,
     env_map: &HashMap<String, String>,
 ) -> Result<SmartModerationResult, SmartModerationError> {
-    if should_force_ai_review(text, profile) {
+    if should_force_ai_review(profile) {
         return run_ai_moderation_with_history(text, profile, http_client, env_map).await;
     }
 
-    if let Some(result) = run_local_model(text, profile) {
-        return Ok(result);
+    if profile.local_model_exists() {
+        if let Some(result) = run_local_model(text, profile) {
+            return Ok(result);
+        }
     }
 
     run_ai_moderation_with_history(text, profile, http_client, env_map).await
 }
 
-fn should_force_ai_review(text: &str, profile: &ModerationProfile) -> bool {
+fn should_force_ai_review(profile: &ModerationProfile) -> bool {
     let rate = profile.config.probability.ai_review_rate;
     if rate <= 0.0 {
         return false;
@@ -111,30 +124,23 @@ fn should_force_ai_review(text: &str, profile: &ModerationProfile) -> bool {
         return true;
     }
 
-    let seed = profile.config.probability.random_seed.to_le_bytes();
-    let digest = md5::compute([seed.as_slice(), text.as_bytes()].concat());
-    let value = u64::from_le_bytes([
-        digest.0[0],
-        digest.0[1],
-        digest.0[2],
-        digest.0[3],
-        digest.0[4],
-        digest.0[5],
-        digest.0[6],
-        digest.0[7],
-    ]);
-    let unit = (value as f64) / (u64::MAX as f64);
-    unit < rate
+    next_random_unit() < rate
 }
 
 fn run_local_model(text: &str, profile: &ModerationProfile) -> Option<SmartModerationResult> {
-    if profile.config.local_model_type != "hashlinear" {
-        return None;
-    }
-
-    let probability = match hashlinear::predict_proba(text, profile) {
-        Ok(Some(probability)) => probability,
-        Ok(None) | Err(_) => return None,
+    let (probability, source) = match profile.config.local_model_type.as_str() {
+        "fasttext" => match fasttext::predict_proba(text, profile) {
+            Ok(Some(probability)) => (probability, "fasttext_model"),
+            Ok(None) | Err(_) => return None,
+        },
+        "hashlinear" => match hashlinear::predict_proba(text, profile) {
+            Ok(Some(probability)) => (probability, "hashlinear_model"),
+            Ok(None) | Err(_) => return None,
+        },
+        _ => match bow::predict_proba(text, profile) {
+            Ok(Some(probability)) => (probability, "bow_model"),
+            Ok(None) | Err(_) => return None,
+        },
     };
     let low = profile.config.probability.low_risk_threshold;
     let high = profile.config.probability.high_risk_threshold;
@@ -143,8 +149,8 @@ fn run_local_model(text: &str, profile: &ModerationProfile) -> Option<SmartModer
         return Some(SmartModerationResult {
             violation: false,
             category: None,
-            reason: Some(format!("hashlinear: low risk (p={probability:.3})")),
-            source: "hashlinear_model".to_string(),
+            reason: Some(format!("{source}: low risk (p={probability:.3})")),
+            source: source.to_string(),
             confidence: Some(probability),
         });
     }
@@ -152,8 +158,8 @@ fn run_local_model(text: &str, profile: &ModerationProfile) -> Option<SmartModer
         return Some(SmartModerationResult {
             violation: true,
             category: None,
-            reason: Some(format!("hashlinear: high risk (p={probability:.3})")),
-            source: "hashlinear_model".to_string(),
+            reason: Some(format!("{source}: high risk (p={probability:.3})")),
+            source: source.to_string(),
             confidence: Some(probability),
         });
     }
@@ -187,15 +193,17 @@ async fn llm_moderate(
         profile.config.ai.base_url.trim_end_matches('/')
     );
 
+    let mut attempted_models = Vec::new();
     let mut last_error = None;
-    for attempt in 0..=max_retries {
-        let model = &models[attempt % models.len()];
+    for _attempt in 0..=max_retries {
+        let model = pick_model_for_attempt(&models, &attempted_models);
+        attempted_models.push(model.clone());
         let response = http_client
             .post(&endpoint)
             .bearer_auth(&api_key)
             .timeout(timeout)
             .json(&json!({
-                "model": model,
+                "model": &model,
                 "messages": [{
                     "role": "user",
                     "content": prompt
@@ -392,7 +400,7 @@ fn extract_json_object(content: &str) -> Option<&str> {
 }
 
 fn check_cache(profile_name: &str, text: &str) -> Option<SmartModerationResult> {
-    let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(IndexMap::new()));
     let key = cache_key(text);
     let mut guard = cache.lock().expect("moderation cache");
     let profile_cache = guard.get_mut(profile_name)?;
@@ -402,9 +410,12 @@ fn check_cache(profile_name: &str, text: &str) -> Option<SmartModerationResult> 
 }
 
 fn save_cache(profile_name: &str, text: &str, result: &SmartModerationResult) {
-    let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(IndexMap::new()));
     let key = cache_key(text);
     let mut guard = cache.lock().expect("moderation cache");
+    if !guard.contains_key(profile_name) && guard.len() >= MAX_CACHE_PROFILES {
+        guard.shift_remove_index(0);
+    }
     let profile_cache = guard
         .entry(profile_name.to_string())
         .or_insert_with(IndexMap::new);
@@ -419,6 +430,51 @@ fn cache_key(text: &str) -> String {
     format!("{:x}", md5::compute(text.as_bytes()))
 }
 
+fn next_random_unit() -> f64 {
+    #[cfg(test)]
+    if let Some(value) = take_test_random_value() {
+        return value.clamp(0.0, 1.0 - f64::EPSILON);
+    }
+
+    let state = REQUEST_RANDOM_STATE.get_or_init(|| AtomicU64::new(initial_random_seed()));
+    let mut current = state.load(Ordering::Relaxed);
+    loop {
+        let mut next = current;
+        next ^= next >> 12;
+        next ^= next << 25;
+        next ^= next >> 27;
+        next = next.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        match state.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return ((next >> 11) as f64) / ((1u64 << 53) as f64),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn initial_random_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    nanos ^ 0xA076_1D64_78BD_642F
+}
+
+fn pick_model_for_attempt(models: &[String], attempted_models: &[String]) -> String {
+    let remaining = models
+        .iter()
+        .filter(|model| !attempted_models.iter().any(|attempted| attempted == *model))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let pool = if remaining.is_empty() {
+        models.iter().map(String::as_str).collect::<Vec<_>>()
+    } else {
+        remaining
+    };
+    let index = ((next_random_unit() * pool.len() as f64).floor() as usize).min(pool.len() - 1);
+    pool[index].to_string()
+}
+
+#[cfg(feature = "storage-debug")]
 fn history_storage_lock(profile_name: &str) -> Arc<Mutex<()>> {
     let locks = HISTORY_STORAGE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = locks.lock().expect("history storage locks");
@@ -426,4 +482,111 @@ fn history_storage_lock(profile_name: &str) -> Arc<Mutex<()>> {
         .entry(profile_name.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+#[cfg(test)]
+fn take_test_random_value() -> Option<f64> {
+    let queue = TEST_RANDOM_VALUES.get_or_init(|| Mutex::new(VecDeque::new()));
+    queue.lock().expect("test random values").pop_front()
+}
+
+#[cfg(test)]
+pub fn set_test_random_values(values: &[f64]) {
+    let queue = TEST_RANDOM_VALUES.get_or_init(|| Mutex::new(VecDeque::new()));
+    let mut guard = queue.lock().expect("test random values");
+    guard.clear();
+    guard.extend(values.iter().copied());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use indexmap::IndexMap;
+
+    use crate::profile::{ModerationProfile, ProfileConfig};
+
+    use super::{
+        pick_model_for_attempt, save_cache, set_test_random_values, should_force_ai_review,
+        SmartModerationResult, MODERATION_CACHE,
+    };
+
+    fn test_profile() -> ModerationProfile {
+        ModerationProfile {
+            profile_name: "test".to_string(),
+            base_dir: PathBuf::from("/tmp/smart-test-profile"),
+            config: ProfileConfig::default(),
+        }
+    }
+
+    fn sample_result() -> SmartModerationResult {
+        SmartModerationResult {
+            violation: true,
+            category: Some("test".to_string()),
+            reason: Some("cached".to_string()),
+            source: "ai".to_string(),
+            confidence: Some(0.9),
+        }
+    }
+
+    fn clear_cache() {
+        let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(IndexMap::new()));
+        cache.lock().expect("moderation cache").clear();
+    }
+
+    #[test]
+    fn ai_review_rate_uses_fresh_request_time_random_draws() {
+        let mut profile = test_profile();
+        profile.config.probability.ai_review_rate = 0.5;
+
+        set_test_random_values(&[0.9, 0.1]);
+
+        assert!(!should_force_ai_review(&profile));
+        assert!(should_force_ai_review(&profile));
+    }
+
+    #[test]
+    fn retry_model_selection_prefers_untried_models_before_repeats() {
+        let models = vec![
+            "model-a".to_string(),
+            "model-b".to_string(),
+            "model-c".to_string(),
+        ];
+        let mut attempted = Vec::new();
+
+        set_test_random_values(&[0.60, 0.40, 0.95, 0.10]);
+
+        let first = pick_model_for_attempt(&models, &attempted);
+        attempted.push(first.clone());
+        let second = pick_model_for_attempt(&models, &attempted);
+        attempted.push(second.clone());
+        let third = pick_model_for_attempt(&models, &attempted);
+        attempted.push(third.clone());
+        let fourth = pick_model_for_attempt(&models, &attempted);
+
+        assert_eq!(first, "model-b");
+        assert_eq!(second, "model-a");
+        assert_eq!(third, "model-c");
+        assert_eq!(fourth, "model-a");
+    }
+
+    #[test]
+    fn moderation_cache_limits_profile_bucket_count() {
+        clear_cache();
+
+        for idx in 0..=50 {
+            save_cache(&format!("profile-{idx}"), "same text", &sample_result());
+        }
+
+        let cache = MODERATION_CACHE.get_or_init(|| Mutex::new(IndexMap::new()));
+        let guard = cache.lock().expect("moderation cache");
+        let profiles = guard.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(profiles.len(), 50);
+        assert!(!profiles.iter().any(|name| name == "profile-0"));
+        assert!(profiles.iter().any(|name| name == "profile-50"));
+
+        drop(guard);
+        clear_cache();
+    }
 }

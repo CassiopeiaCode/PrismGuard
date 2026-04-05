@@ -11,7 +11,7 @@ bench = false
 
 [features]
 default = ["storage-debug"]
-storage-debug = ["dep:rocksdb"]
+storage-debug = ["dep:rocksdb", "dep:rusqlite"]
 
 [dependencies]
 anyhow = "1.0"
@@ -24,10 +24,12 @@ flate2 = "1.0"
 futures-util = "0.3"
 hyper = "0.14"
 indexmap = "=2.2.6"
+jieba-rs = "=0.6.8"
 libc = "0.2"
 md5 = "0.7"
 reqwest = { version = "0.11.27", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rocksdb = { version = "=0.21.0", default-features = false, optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal", "net"] }

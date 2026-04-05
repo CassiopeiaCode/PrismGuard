@@ -25,8 +25,10 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
     let mut created = 0_i64;
     let mut out = String::new();
     let mut started = false;
+    let mut finished = false;
     let mut item_to_call_id = HashMap::<String, String>::new();
     let mut call_names = HashMap::<String, String>::new();
+    let mut call_indexes = HashMap::<String, usize>::new();
     let mut started_tool_calls = HashSet::<String>::new();
     let mut pending_tool_args = HashMap::<String, Vec<String>>::new();
 
@@ -42,6 +44,9 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
             .unwrap_or("");
 
         if data == "[DONE]" {
+            if finished {
+                continue;
+            }
             out.push_str("data: [DONE]\n\n");
             continue;
         }
@@ -156,6 +161,11 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                let call_index = payload
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0);
                 let name = item
                     .get("name")
                     .and_then(Value::as_str)
@@ -167,6 +177,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                 }
                 if !call_id.is_empty() && !name.is_empty() {
                     call_names.insert(call_id.clone(), name.clone());
+                    call_indexes.insert(call_id.clone(), call_index);
                 }
 
                 ensure_created(&mut created);
@@ -184,6 +195,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                         response_id.as_str(),
                         model.as_str(),
                         created,
+                        call_indexes.get(&call_id).copied().unwrap_or(0),
                         call_id.as_str(),
                         name.as_str(),
                         "",
@@ -200,6 +212,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                             response_id.as_str(),
                             model.as_str(),
                             created,
+                            call_indexes.get(&call_id).copied().unwrap_or(0),
                             call_id.as_str(),
                             name.as_str(),
                             delta.as_str(),
@@ -225,9 +238,14 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                 let delta = payload
                     .get("delta")
                     .or_else(|| payload.get("arguments"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                    .map(|value| match value {
+                        Value::String(text) => text.clone(),
+                        Value::Object(_) | Value::Array(_) => {
+                            serde_json::to_string(value).unwrap_or_else(|_| String::new())
+                        }
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
                 if delta.is_empty() {
                     continue;
                 }
@@ -238,6 +256,15 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                     .map(str::to_string)
                     .or_else(|| call_names.get(&call_id).cloned())
                     .unwrap_or_default();
+                let call_index = payload
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .or_else(|| call_indexes.get(&call_id).copied())
+                    .unwrap_or(0);
+                if !call_id.is_empty() {
+                    call_indexes.entry(call_id.clone()).or_insert(call_index);
+                }
 
                 ensure_created(&mut created);
                 emit_chat_start_chunk(
@@ -264,6 +291,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                         response_id.as_str(),
                         model.as_str(),
                         created,
+                        call_index,
                         call_id.as_str(),
                         name.as_str(),
                         "",
@@ -280,6 +308,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                     response_id.as_str(),
                     model.as_str(),
                     created,
+                    call_index,
                     call_id.as_str(),
                     name.as_str(),
                     delta.as_str(),
@@ -321,6 +350,7 @@ fn transform_openai_responses_to_openai_chat(raw: &[u8]) -> Vec<u8> {
                 out.push_str(&chunk.to_string());
                 out.push_str("\n\n");
                 out.push_str("data: [DONE]\n\n");
+                finished = true;
             }
             _ => {}
         }
@@ -384,6 +414,7 @@ fn emit_tool_call_chunk(
     response_id: &str,
     model: &str,
     created: i64,
+    call_index: usize,
     call_id: &str,
     name: &str,
     arguments: &str,
@@ -397,7 +428,7 @@ fn emit_tool_call_chunk(
             "index": 0,
             "delta": {
                 "tool_calls": [{
-                    "index": 0,
+                    "index": call_index,
                     "id": call_id,
                     "type": "function",
                     "function": {

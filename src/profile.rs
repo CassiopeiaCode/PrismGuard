@@ -346,8 +346,20 @@ impl ModerationProfile {
         self.base_dir.join("bow_vectorizer.pkl")
     }
 
+    pub fn bow_runtime_json_path(&self) -> PathBuf {
+        self.base_dir.join("bow_runtime.json")
+    }
+
+    pub fn bow_runtime_coef_path(&self) -> PathBuf {
+        self.base_dir.join("bow_runtime.coef.f32")
+    }
+
     pub fn fasttext_model_path(&self) -> PathBuf {
         self.base_dir.join("fasttext_model.bin")
+    }
+
+    pub fn fasttext_runtime_json_path(&self) -> PathBuf {
+        self.base_dir.join("fasttext_runtime.json")
     }
 
     pub fn training_model_path(&self) -> PathBuf {
@@ -358,6 +370,7 @@ impl ModerationProfile {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn training_max_db_items(&self) -> Result<usize> {
         match self.config.local_model_type.as_str() {
             "fasttext" => Ok(self.config.fasttext_training.max_db_items),
@@ -405,11 +418,7 @@ impl ModerationProfile {
     pub fn local_model_exists(&self) -> bool {
         match self.config.local_model_type.as_str() {
             "fasttext" => self.fasttext_model_path().exists(),
-            "hashlinear" => {
-                self.hashlinear_model_path().exists()
-                    || (self.hashlinear_runtime_json_path().exists()
-                        && self.hashlinear_runtime_coef_path().exists())
-            }
+            "hashlinear" => self.hashlinear_model_path().exists(),
             _ => self.bow_model_path().exists() && self.bow_vectorizer_path().exists(),
         }
     }

@@ -1,9 +1,12 @@
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, Options};
+use rocksdb::{DBWithThreadMode, IteratorMode, MultiThreaded, Options, WriteBatch};
+use rusqlite::Connection;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -34,6 +37,7 @@ pub struct SampleStorage {
 impl SampleStorage {
     pub fn open_read_write(rocks_path: impl AsRef<Path>) -> Result<Self> {
         let rocks_path = rocks_path.as_ref().to_path_buf();
+        migrate_legacy_sqlite_if_needed(&rocks_path)?;
         if let Some(parent) = rocks_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create RocksDB parent dir {}", parent.display()))?;
@@ -56,6 +60,7 @@ impl SampleStorage {
 
     pub fn open_read_only(rocks_path: impl AsRef<Path>) -> Result<Self> {
         let rocks_path = rocks_path.as_ref().to_path_buf();
+        migrate_legacy_sqlite_if_needed(&rocks_path)?;
         let mut options = Options::default();
         options.create_if_missing(false);
         options.set_comparator("rocksdict", Box::new(bytewise_compare));
@@ -117,7 +122,7 @@ impl SampleStorage {
         let pass_samples = self.load_samples_by_label(0, usize::min(pass_count as usize, target_per_label));
         let violation_samples =
             self.load_samples_by_label(1, usize::min(violation_count as usize, target_per_label));
-        self.interleave_deterministically(pass_samples, violation_samples)
+        self.shuffle_combined(pass_samples, violation_samples)
     }
 
     pub fn load_balanced_random_samples(&self, max_samples: usize) -> Vec<SampleRecord> {
@@ -134,10 +139,10 @@ impl SampleStorage {
         let pass_take = usize::min(pass_count as usize, target_per_label);
         let violation_take = usize::min(violation_count as usize, target_per_label);
 
-        let pass_samples = self.select_pseudo_random(self.load_samples_by_label(0, pass_count as usize), pass_take);
+        let pass_samples = self.select_random(self.load_samples_by_label(0, pass_count as usize), pass_take);
         let violation_samples =
-            self.select_pseudo_random(self.load_samples_by_label(1, violation_count as usize), violation_take);
-        self.interleave_deterministically(pass_samples, violation_samples)
+            self.select_random(self.load_samples_by_label(1, violation_count as usize), violation_take);
+        self.shuffle_combined(pass_samples, violation_samples)
     }
 
     pub fn load_balanced_samples(&self, max_samples: usize) -> Vec<SampleRecord> {
@@ -161,10 +166,10 @@ impl SampleStorage {
         }
 
         let pass_samples =
-            self.select_pseudo_random(self.load_samples_by_label(0, pass_count as usize), balanced_count);
+            self.select_random(self.load_samples_by_label(0, pass_count as usize), balanced_count);
         let violation_samples =
-            self.select_pseudo_random(self.load_samples_by_label(1, violation_count as usize), balanced_count);
-        self.interleave_deterministically(pass_samples, violation_samples)
+            self.select_random(self.load_samples_by_label(1, violation_count as usize), balanced_count);
+        self.shuffle_combined(pass_samples, violation_samples)
     }
 
     pub fn sample_by_id(&self, id: u64) -> Result<Option<SampleRecord>> {
@@ -175,10 +180,33 @@ impl SampleStorage {
     pub fn find_by_text(&self, text: &str) -> Result<Option<SampleRecord>> {
         let text_hash = format!("{:x}", md5::compute(text.as_bytes()));
         let pointer_key = format!("text_latest:{text_hash}");
-        let Some(sample_id) = self.get_u64(&pointer_key) else {
+        let Some(pointer_raw) = self
+            .db
+            .get(encode_rocksdict_string(&pointer_key))
+            .with_context(|| format!("failed to read key {pointer_key}"))?
+        else {
             return Ok(None);
         };
-        self.sample_by_id(sample_id)
+
+        if let Ok(sample_id) = decode_rocksdict_string(&pointer_raw)?.parse::<u64>() {
+            if let Some(sample) = self.sample_by_id(sample_id)? {
+                if sample.value.get("text").and_then(Value::as_str) == Some(text) {
+                    return Ok(Some(sample));
+                }
+            }
+        }
+
+        let mut candidate_id = self.next_id().saturating_sub(1);
+        while candidate_id > 0 {
+            if let Some(sample) = self.sample_by_id(candidate_id)? {
+                if sample.value.get("text").and_then(Value::as_str) == Some(text) {
+                    return Ok(Some(sample));
+                }
+            }
+            candidate_id -= 1;
+        }
+
+        Ok(None)
     }
 
     pub fn save_sample(&self, text: &str, label: i64, category: Option<&str>) -> Result<()> {
@@ -191,6 +219,7 @@ impl SampleStorage {
             "label": label,
             "category": category,
             "created_at": created_at,
+            "text_hash": text_hash,
         });
 
         self.put_string(&format!("sample:{sample_id:020}"), &sample.to_string())?;
@@ -208,6 +237,26 @@ impl SampleStorage {
         self.put_string("meta:count:1", &count_1.to_string())?;
         self.put_string("meta:next_id", &(sample_id + 1).to_string())?;
         Ok(())
+    }
+
+    pub fn cleanup_excess_samples(&self, max_items: usize) -> Result<usize> {
+        let total = self.sample_count().unwrap_or_default() as usize;
+        if total <= max_items {
+            return Ok(0);
+        }
+
+        let (pass_count, violation_count) = self.label_counts();
+        let target_per_label = max_items / 2;
+
+        let mut removed = 0usize;
+        if pass_count as usize > target_per_label {
+            removed += self.delete_samples_for_label(0, pass_count as usize - target_per_label)?;
+        }
+        if violation_count as usize > target_per_label {
+            removed += self.delete_samples_for_label(1, violation_count as usize - target_per_label)?;
+        }
+
+        Ok(removed)
     }
 
     pub fn first_samples(&self, limit: usize) -> Vec<SampleRecord> {
@@ -289,6 +338,89 @@ impl SampleStorage {
             .with_context(|| format!("failed to write key {key}"))
     }
 
+    fn delete_samples_for_label(&self, label: i64, count: usize) -> Result<usize> {
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let available = self.load_samples_by_label(label, usize::MAX);
+        if available.is_empty() {
+            return Ok(0);
+        }
+
+        let to_delete = self.select_random(available, count);
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let mut batch = WriteBatch::default();
+        let mut deleted_ids = HashSet::with_capacity(to_delete.len());
+        let mut affected_hashes = HashSet::new();
+        let mut removed = 0usize;
+
+        for sample in &to_delete {
+            let Some(sample_id) = sample.id else {
+                continue;
+            };
+            deleted_ids.insert(sample_id);
+            batch.delete(encode_rocksdict_string(&sample.key));
+            removed += 1;
+
+            if let Some(text_hash) = sample_text_hash(sample) {
+                let pointer_key = format!("text_latest:{text_hash}");
+                if self.get_u64(&pointer_key) == Some(sample_id) {
+                    affected_hashes.insert(text_hash);
+                }
+            }
+        }
+
+        let total_count = self.get_u64("meta:count").unwrap_or_default();
+        let count_0 = self.get_u64("meta:count:0").unwrap_or_default();
+        let count_1 = self.get_u64("meta:count:1").unwrap_or_default();
+
+        let next_total = total_count.saturating_sub(removed as u64);
+        let next_count_0 = if label == 0 {
+            count_0.saturating_sub(removed as u64)
+        } else {
+            count_0
+        };
+        let next_count_1 = if label == 1 {
+            count_1.saturating_sub(removed as u64)
+        } else {
+            count_1
+        };
+
+        batch.put(
+            encode_rocksdict_string("meta:count"),
+            encode_rocksdict_string(&next_total.to_string()),
+        );
+        batch.put(
+            encode_rocksdict_string("meta:count:0"),
+            encode_rocksdict_string(&next_count_0.to_string()),
+        );
+        batch.put(
+            encode_rocksdict_string("meta:count:1"),
+            encode_rocksdict_string(&next_count_1.to_string()),
+        );
+
+        let refreshed = self.refresh_text_latest_after_deletes(&deleted_ids, &affected_hashes);
+        for (text_hash, sample_id) in refreshed {
+            let pointer_key = format!("text_latest:{text_hash}");
+            match sample_id {
+                Some(sample_id) => batch.put(
+                    encode_rocksdict_string(&pointer_key),
+                    encode_rocksdict_string(&sample_id.to_string()),
+                ),
+                None => batch.delete(encode_rocksdict_string(&pointer_key)),
+            }
+        }
+
+        self.db
+            .write(batch)
+            .context("failed to write cleanup batch to RocksDB")?;
+        Ok(removed)
+    }
+
     fn load_samples_by_label(&self, label: i64, limit: usize) -> Vec<SampleRecord> {
         if limit == 0 {
             return Vec::new();
@@ -307,48 +439,61 @@ impl SampleStorage {
         out
     }
 
-    fn select_pseudo_random(&self, mut samples: Vec<SampleRecord>, take: usize) -> Vec<SampleRecord> {
+    fn select_random(&self, mut samples: Vec<SampleRecord>, take: usize) -> Vec<SampleRecord> {
         if samples.len() <= take {
             return samples;
         }
 
-        samples.sort_by(|lhs, rhs| {
-            let lhs_key = pseudo_random_key(lhs);
-            let rhs_key = pseudo_random_key(rhs);
-            lhs_key
-                .cmp(&rhs_key)
-                .then_with(|| lhs.id.cmp(&rhs.id))
-                .then_with(|| lhs.key.cmp(&rhs.key))
-        });
+        shuffle_in_place(&mut samples);
         samples.truncate(take);
         samples
     }
 
-    fn interleave_deterministically(
+    fn shuffle_combined(
         &self,
         pass_samples: Vec<SampleRecord>,
         violation_samples: Vec<SampleRecord>,
     ) -> Vec<SampleRecord> {
-        let mut combined = Vec::with_capacity(pass_samples.len() + violation_samples.len());
-        let mut pass_iter = pass_samples.into_iter();
-        let mut violation_iter = violation_samples.into_iter();
+        let mut combined = pass_samples;
+        combined.extend(violation_samples);
+        shuffle_in_place(&mut combined);
+        combined
+    }
 
-        loop {
-            let mut pushed = false;
-            if let Some(sample) = violation_iter.next() {
-                combined.push(sample);
-                pushed = true;
-            }
-            if let Some(sample) = pass_iter.next() {
-                combined.push(sample);
-                pushed = true;
-            }
-            if !pushed {
-                break;
-            }
+    fn refresh_text_latest_after_deletes(
+        &self,
+        deleted_ids: &HashSet<u64>,
+        affected_hashes: &HashSet<String>,
+    ) -> HashMap<String, Option<u64>> {
+        let mut resolved = HashMap::new();
+        if affected_hashes.is_empty() {
+            return resolved;
         }
 
-        combined
+        let mut remaining = affected_hashes.clone();
+        let mut sample_id = self.next_id().saturating_sub(1);
+        while sample_id > 0 && !remaining.is_empty() {
+            if deleted_ids.contains(&sample_id) {
+                sample_id -= 1;
+                continue;
+            }
+
+            if let Ok(Some(sample)) = self.sample_by_id(sample_id) {
+                if let Some(text_hash) = sample_text_hash(&sample) {
+                    if remaining.remove(&text_hash) {
+                        resolved.insert(text_hash, Some(sample_id));
+                    }
+                }
+            }
+
+            sample_id -= 1;
+        }
+
+        for text_hash in remaining {
+            resolved.insert(text_hash, None);
+        }
+
+        resolved
     }
 
     fn raw_keys(&self, limit: usize) -> Vec<String> {
@@ -366,15 +511,211 @@ impl SampleStorage {
     }
 }
 
+fn migrate_legacy_sqlite_if_needed(rocks_path: &Path) -> Result<()> {
+    if rocks_path.exists() {
+        return Ok(());
+    }
+
+    let sqlite_path = legacy_sqlite_path(rocks_path);
+    if !sqlite_path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = rocks_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create RocksDB parent dir {}", parent.display()))?;
+    }
+
+    let temp_rocks = rocks_path.with_extension("rocks.migrating");
+    if temp_rocks.exists() {
+        std::fs::remove_dir_all(&temp_rocks).with_context(|| {
+            format!(
+                "failed to remove stale temporary RocksDB dir {}",
+                temp_rocks.display()
+            )
+        })?;
+    }
+
+    let connection = Connection::open(&sqlite_path)
+        .with_context(|| format!("failed to open legacy SQLite {}", sqlite_path.display()))?;
+    let mut statement = connection.prepare(
+        "SELECT id, text, label, category, created_at FROM samples ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(LegacySqliteSample {
+            id: row.get::<_, i64>(0)?,
+            text: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            label: row.get::<_, Option<i64>>(2)?.unwrap_or_default(),
+            category: row.get::<_, Option<String>>(3)?,
+            created_at: row.get::<_, Option<String>>(4)?,
+        })
+    })?;
+
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    options.set_comparator("rocksdict", Box::new(bytewise_compare));
+    let temp_db = DBWithThreadMode::<MultiThreaded>::open(&options, &temp_rocks)
+        .with_context(|| format!("failed to create temporary RocksDB {}", temp_rocks.display()))?;
+
+    let mut batch = WriteBatch::default();
+    let mut next_id = 1u64;
+    let mut count_0 = 0u64;
+    let mut count_1 = 0u64;
+    for row in rows {
+        let sample = row.with_context(|| {
+            format!(
+                "failed to read row from legacy SQLite {}",
+                sqlite_path.display()
+            )
+        })?;
+        let id = u64::try_from(sample.id).context("legacy SQLite sample id must be non-negative")?;
+        let text_hash = format!("{:x}", md5::compute(sample.text.as_bytes()));
+        let created_at = sample
+            .created_at
+            .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+        let payload = serde_json::json!({
+            "id": id,
+            "text": sample.text,
+            "label": sample.label,
+            "category": sample.category,
+            "created_at": created_at,
+            "text_hash": text_hash,
+        })
+        .to_string();
+        batch.put(
+            encode_rocksdict_string(&format!("sample:{id:020}")),
+            encode_rocksdict_string(&payload),
+        );
+        batch.put(
+            encode_rocksdict_string(&format!("text_latest:{text_hash}")),
+            encode_rocksdict_string(&id.to_string()),
+        );
+        if sample.label == 0 {
+            count_0 += 1;
+        } else {
+            count_1 += 1;
+        }
+        next_id = next_id.max(id.saturating_add(1));
+    }
+
+    batch.put(
+        encode_rocksdict_string("meta:next_id"),
+        encode_rocksdict_string(&next_id.to_string()),
+    );
+    batch.put(
+        encode_rocksdict_string("meta:count"),
+        encode_rocksdict_string(&(count_0 + count_1).to_string()),
+    );
+    batch.put(
+        encode_rocksdict_string("meta:count:0"),
+        encode_rocksdict_string(&count_0.to_string()),
+    );
+    batch.put(
+        encode_rocksdict_string("meta:count:1"),
+        encode_rocksdict_string(&count_1.to_string()),
+    );
+    temp_db
+        .write(batch)
+        .with_context(|| format!("failed to populate temporary RocksDB {}", temp_rocks.display()))?;
+    drop(temp_db);
+
+    std::fs::rename(&temp_rocks, rocks_path).with_context(|| {
+        format!(
+            "failed to move temporary RocksDB {} to {}",
+            temp_rocks.display(),
+            rocks_path.display()
+        )
+    })?;
+
+    let sqlite_backup = sqlite_path.with_extension("db.bak");
+    let _ = std::fs::rename(&sqlite_path, &sqlite_backup);
+    let _ = std::fs::remove_file(sqlite_path.with_file_name(format!(
+        "{}-shm",
+        sqlite_path.file_name().and_then(|name| name.to_str()).unwrap_or("history.db")
+    )));
+    let _ = std::fs::remove_file(sqlite_path.with_file_name(format!(
+        "{}-wal",
+        sqlite_path.file_name().and_then(|name| name.to_str()).unwrap_or("history.db")
+    )));
+
+    Ok(())
+}
+
+fn legacy_sqlite_path(rocks_path: &Path) -> PathBuf {
+    match rocks_path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if name.ends_with(".rocks") => rocks_path.with_file_name(format!(
+            "{}.db",
+            name.trim_end_matches(".rocks")
+        )),
+        Some(name) => rocks_path.with_file_name(format!("{name}.db")),
+        None => rocks_path.with_extension("db"),
+    }
+}
+
+struct LegacySqliteSample {
+    id: i64,
+    text: String,
+    label: i64,
+    category: Option<String>,
+    created_at: Option<String>,
+}
+
 fn bytewise_compare(lhs: &[u8], rhs: &[u8]) -> Ordering {
     lhs.cmp(rhs)
 }
 
-fn pseudo_random_key(sample: &SampleRecord) -> [u8; 16] {
-    let mut seed = sample.id.unwrap_or(0).to_string();
-    seed.push(':');
-    seed.push_str(sample.value.get("text").and_then(Value::as_str).unwrap_or(""));
-    md5::compute(seed.as_bytes()).0
+fn shuffle_in_place(samples: &mut [SampleRecord]) {
+    if samples.len() <= 1 {
+        return;
+    }
+    let mut rng = XorShift64::new(initial_shuffle_seed());
+    for idx in (1..samples.len()).rev() {
+        let swap_idx = (rng.next_u64() as usize) % (idx + 1);
+        samples.swap(idx, swap_idx);
+    }
+}
+
+fn initial_shuffle_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        ^ 0xA076_1D64_78BD_642F
+}
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut next = self.state;
+        next ^= next >> 12;
+        next ^= next << 25;
+        next ^= next >> 27;
+        next = next.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        self.state = next;
+        next
+    }
+}
+
+fn sample_text_hash(sample: &SampleRecord) -> Option<String> {
+    sample
+        .value
+        .get("text_hash")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            sample
+                .value
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| format!("{:x}", md5::compute(text.as_bytes())))
+        })
 }
 
 fn encode_rocksdict_string(value: &str) -> Vec<u8> {

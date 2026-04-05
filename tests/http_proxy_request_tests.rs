@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/format.rs"]
@@ -12,6 +14,7 @@ mod response;
 mod routes;
 #[path = "../src/sample_rpc.rs"]
 mod sample_rpc;
+#[cfg(feature = "storage-debug")]
 #[path = "../src/storage.rs"]
 mod storage;
 #[path = "../src/training.rs"]
@@ -25,7 +28,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -36,7 +39,10 @@ use axum::{Json, Router};
 use config::Settings;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+#[cfg(feature = "storage-debug")]
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
+#[cfg(feature = "storage-debug")]
+use rusqlite::{params, Connection};
 use routes::{router as proxy_router, AppState};
 use serde_json::{json, Value};
 
@@ -90,6 +96,51 @@ async fn compressed_json_request_is_decoded_and_preserves_upstream_prefix() {
     let request = seen.last().expect("upstream request");
     assert_eq!(request.path, "/secret_endpoint/v1/chat/completions");
     assert_eq!(request.json_body["messages"][0]["content"], "hello");
+}
+
+#[tokio::test]
+async fn openai_chat_system_messages_map_to_claude_system_string_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "claude_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [
+                {"role": "system", "content": "Be terse"},
+                {"role": "system", "content": "Stay factual"},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/messages");
+    assert_eq!(request.json_body["system"], "Be terse\nStay factual");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ])
+    );
 }
 
 #[tokio::test]
@@ -415,6 +466,55 @@ async fn debug_profile_exposes_training_and_model_status() {
 }
 
 #[tokio::test]
+async fn debug_profile_hashlinear_runtime_only_is_not_treated_as_local_model() {
+    let profile_name = format!("debug-profile-hashlinear-runtime-only-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "min_samples": 1
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    write_hashlinear_runtime(&profile_dir, 0.0, &[0.0]);
+    std::fs::write(
+        profile_dir.join(".train_status.json"),
+        json!({
+            "status": "ok",
+            "timestamp": 1710000000,
+            "sample_count": 5
+        })
+        .to_string(),
+    )
+    .expect("write training status");
+
+    let proxy_base = spawn_proxy_server().await;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .get(format!("{proxy_base}/debug/profile/{profile_name}"))
+        .send()
+        .await
+        .expect("debug profile response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["profile_name"], profile_name);
+    assert_eq!(body["local_model_exists"], false);
+    assert_eq!(body["training_decision"]["should_train"], true);
+    assert_eq!(body["training_decision"]["reason"], "model_missing");
+}
+
+#[tokio::test]
 async fn upstream_non_200_json_is_passed_through_without_rewrapping() {
     let upstream_base = spawn_fixed_upstream(
         StatusCode::TOO_MANY_REQUESTS,
@@ -626,12 +726,12 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
     std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
         .expect("write prompt");
 
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
         "TEST_MOD_AI_API_KEY".to_string(),
         "test-key".to_string(),
     )]))
     .await;
-    let upstream_base = unused_http_base();
     let config = percent_encode(&json!({
         "smart_moderation": {
             "enabled": true,
@@ -946,6 +1046,1117 @@ async fn smart_moderation_uses_local_hashlinear_runtime_before_llm() {
 }
 
 #[tokio::test]
+async fn smart_moderation_hashlinear_runtime_only_falls_back_to_llm_like_python() {
+    let profile_name = format!("smart-hashlinear-runtime-only-{}", unique_test_suffix());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let llm_base = spawn_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"hashlinear-runtime-only\", \"reason\": \"llm fallback blocked\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    write_hashlinear_runtime(&profile_dir, -5.0, &[10.0]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "runtime only should fall back to ai"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "hashlinear-runtime-only"
+    );
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "llm fallback blocked"
+    );
+}
+
+#[tokio::test]
+async fn smart_moderation_uses_local_bow_runtime_before_llm() {
+    let profile_name = format!("smart-bow-local-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{}/v1", unused_http_base()),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 1,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "bow",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
+    std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
+        .expect("write bow vectorizer");
+    write_bow_runtime(&profile_dir, 0.0, &["blocked", "phrase"], &[4.0, 4.0], &[3.0, 3.0]);
+
+    let proxy_base = spawn_proxy_server().await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "blocked phrase should be decided by bow"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["source_format"], "openai_chat");
+    assert_eq!(body["error"]["moderation_details"]["source"], "bow_model");
+    assert!(
+        body["error"]["moderation_details"]["confidence"]
+            .as_f64()
+            .expect("confidence")
+            > 0.8
+    );
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
+    let profile_name = format!("smart-bow-fallback-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let llm_base = spawn_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"bow-fallback\", \"reason\": \"llm fallback blocked\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "bow",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
+    std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
+        .expect("write bow vectorizer");
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "missing bow runtime should fallback"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(body["error"]["moderation_details"]["category"], "bow-fallback");
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "llm fallback blocked"
+    );
+}
+
+#[tokio::test]
+async fn smart_moderation_uses_local_fasttext_runtime_before_llm() {
+    let profile_name = format!("smart-fasttext-local-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{}/v1", unused_http_base()),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 1,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "fasttext",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
+        .expect("write fasttext model");
+    write_fasttext_runtime(&profile_dir, 0.0, &[("blocked", 6.0), ("phrase", 6.0)]);
+
+    let proxy_base = spawn_proxy_server().await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "blocked phrase should hit fasttext"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "fasttext_model");
+    assert!(
+        body["error"]["moderation_details"]["confidence"]
+            .as_f64()
+            .expect("confidence")
+            > 0.8
+    );
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_fasttext_runtime_is_missing() {
+    let profile_name = format!("smart-fasttext-fallback-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let llm_base = spawn_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"fasttext-fallback\", \"reason\": \"llm fallback blocked\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "fasttext",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
+        .expect("write fasttext model");
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "missing fasttext runtime should fallback"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "fasttext-fallback"
+    );
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "llm fallback blocked"
+    );
+}
+
+#[tokio::test]
+async fn smart_moderation_allows_low_risk_local_bow_without_llm() {
+    let profile_name = format!("smart-bow-allow-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{}/v1", unused_http_base()),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 1,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "bow",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
+    std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
+        .expect("write bow vectorizer");
+    write_bow_runtime(&profile_dir, -6.0, &["blocked", "phrase"], &[1.0, 1.0], &[0.5, 0.5]);
+
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "blocked phrase but low risk bow should pass"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+}
+
+#[tokio::test]
+async fn smart_moderation_allows_low_risk_local_fasttext_without_llm() {
+    let profile_name = format!("smart-fasttext-allow-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{}/v1", unused_http_base()),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 1,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "fasttext",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
+        .expect("write fasttext model");
+    write_fasttext_runtime(&profile_dir, -8.0, &[("blocked", 1.0), ("phrase", 1.0)]);
+
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "blocked phrase but low risk fasttext should pass"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_low_threshold() {
+    let profile_name = format!(
+        "smart-bow-low-threshold-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = -1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"threshold fallback allow\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "bow",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": boundary_probability,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
+    std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
+        .expect("write bow vectorizer");
+    write_bow_runtime(&profile_dir, boundary_intercept, &["edge"], &[1.0], &[0.0]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "edge"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_high_threshold() {
+    let profile_name = format!(
+        "smart-fasttext-high-threshold-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = 1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"high threshold fallback allow\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "fasttext",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": boundary_probability
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
+        .expect("write fasttext model");
+    write_fasttext_runtime(&profile_dir, boundary_intercept, &[]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "anything"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_high_threshold() {
+    let profile_name = format!(
+        "smart-bow-high-threshold-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = 1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"bow high threshold fallback allow\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "bow",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": boundary_probability
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
+    std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
+        .expect("write bow vectorizer");
+    write_bow_runtime(&profile_dir, boundary_intercept, &["edge"], &[1.0], &[0.0]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "edge"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_low_threshold() {
+    let profile_name = format!(
+        "smart-fasttext-low-threshold-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = -1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"fasttext low threshold fallback allow\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "fasttext",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": boundary_probability,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
+        .expect("write fasttext model");
+    write_fasttext_runtime(&profile_dir, boundary_intercept, &[]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "anything"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+}
+
+#[tokio::test]
+async fn smart_moderation_blocks_with_ai_details_when_bow_probability_equals_high_threshold() {
+    let profile_name = format!(
+        "smart-bow-high-threshold-blocked-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = 1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"bow-edge\", \"reason\": \"equal high threshold should use ai\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "bow",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": boundary_probability
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
+    std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
+        .expect("write bow vectorizer");
+    write_bow_runtime(&profile_dir, boundary_intercept, &["edge"], &[1.0], &[0.0]);
+
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "edge"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(body["error"]["moderation_details"]["category"], "bow-edge");
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "equal high threshold should use ai"
+    );
+    assert!(seen.lock().expect("seen lock").is_empty());
+}
+
+#[tokio::test]
+async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equals_low_threshold() {
+    let profile_name = format!(
+        "smart-fasttext-low-threshold-blocked-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = -1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"fasttext-edge\", \"reason\": \"equal low threshold should use ai\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "fasttext",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": boundary_probability,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
+        .expect("write fasttext model");
+    write_fasttext_runtime(&profile_dir, boundary_intercept, &[]);
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "anything"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(body["error"]["moderation_details"]["category"], "fasttext-edge");
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "equal low threshold should use ai"
+    );
+}
+
+#[tokio::test]
 async fn smart_moderation_allows_low_risk_local_hashlinear_without_llm() {
     let profile_name = format!("smart-hashlinear-allow-{}", std::process::id());
     let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
@@ -1101,6 +2312,378 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_is_uncertain() {
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
     assert_eq!(body["error"]["moderation_details"]["category"], "policy");
     assert_eq!(body["error"]["moderation_details"]["reason"], "llm fallback blocked");
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_low_threshold() {
+    let profile_name = format!(
+        "smart-hashlinear-low-threshold-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = -1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"hashlinear low threshold fallback allow\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": boundary_probability,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
+        .expect("write model marker");
+    write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "anything"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+}
+
+#[tokio::test]
+async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_high_threshold() {
+    let profile_name = format!(
+        "smart-hashlinear-high-threshold-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = 1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"hashlinear high threshold fallback allow\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": boundary_probability
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
+        .expect("write model marker");
+    write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "anything"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+}
+
+#[tokio::test]
+async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equals_low_threshold() {
+    let profile_name = format!(
+        "smart-hashlinear-low-threshold-blocked-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = -1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"hashlinear-edge-low\", \"reason\": \"equal low threshold should use ai\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": boundary_probability,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
+        .expect("write model marker");
+    write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "anything"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "hashlinear-edge-low"
+    );
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "equal low threshold should use ai"
+    );
+}
+
+#[tokio::test]
+async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equals_high_threshold() {
+    let profile_name = format!(
+        "smart-hashlinear-high-threshold-blocked-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let boundary_intercept = 1.3862944_f32;
+    let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": true, \"category\": \"hashlinear-edge-high\", \"reason\": \"equal high threshold should use ai\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": boundary_probability
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
+        .expect("write model marker");
+    write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "anything"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(*hits.lock().expect("hits lock"), 1);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "hashlinear-edge-high"
+    );
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "equal high threshold should use ai"
+    );
 }
 
 #[tokio::test]
@@ -1297,6 +2880,7 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
     assert_eq!(*hits.lock().expect("hits lock"), 1);
 }
 
+#[cfg(feature = "storage-debug")]
 #[tokio::test]
 async fn smart_moderation_reuses_history_sample_before_llm() {
     let profile_name = format!("smart-history-hit-{}", std::process::id());
@@ -1391,6 +2975,102 @@ async fn smart_moderation_reuses_history_sample_before_llm() {
     assert_eq!(*hits.lock().expect("hits lock"), 0);
 }
 
+#[cfg(feature = "storage-debug")]
+#[tokio::test]
+async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
+    let profile_name = format!("smart-history-sqlite-hit-{}", unique_test_suffix());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
+        "choices": [{
+            "message": {
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"llm should not be called\"}"
+            }
+        }]
+    }))
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 1.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+    seed_legacy_sqlite_sample_db(
+        &profile_dir.join("history.db"),
+        "legacy sqlite history hit",
+        1,
+        Some("legacy-sqlite"),
+        "2026-04-03 12:34:56",
+    );
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "legacy sqlite history hit"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["moderation_details"]["source"], "ai");
+    assert_eq!(body["error"]["moderation_details"]["category"], "legacy-sqlite");
+    assert!(
+        body["error"]["moderation_details"]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("From DB")
+    );
+    assert_eq!(*hits.lock().expect("hits lock"), 0);
+}
+
+#[cfg(feature = "storage-debug")]
 #[tokio::test]
 async fn smart_moderation_persists_ai_result_into_history_sample_db() {
     let profile_name = format!("smart-history-write-{}", std::process::id());
@@ -1568,6 +3248,100 @@ async fn smart_moderation_retries_llm_after_server_error_like_python() {
     assert_eq!(body["error"]["moderation_details"]["category"], "retry");
     assert_eq!(body["error"]["moderation_details"]["reason"], "second attempt");
     assert_eq!(*hits.lock().expect("hits lock"), 2);
+}
+
+#[tokio::test]
+async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
+    moderation::smart::set_test_random_values(&[0.75, 0.20, 0.10]);
+
+    let profile_name = format!("smart-llm-retry-models-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let (llm_base, hits, models) = spawn_recording_sequenced_openai_chat_server(vec![
+        (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary-1"}})),
+        (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary-2"}})),
+        (
+            StatusCode::OK,
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "{\"violation\": true, \"category\": \"retry-models\", \"reason\": \"third attempt\"}"
+                    }
+                }]
+            }),
+        ),
+    ])
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "model-a,model-b",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 2
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 1.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let upstream_base = unused_http_base();
+    let config = percent_encode(&json!({
+        "smart_moderation": {
+            "enabled": true,
+            "profile": profile_name
+        }
+    }).to_string());
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(&proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "retry this moderation with multiple models"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["moderation_details"]["category"], "retry-models");
+    assert_eq!(*hits.lock().expect("hits lock"), 3);
+    assert_eq!(
+        *models.lock().expect("models lock"),
+        vec!["model-b".to_string(), "model-a".to_string(), "model-a".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -2185,6 +3959,1221 @@ async fn openai_chat_request_normalizes_tool_tool_choice_for_responses_upstream(
 }
 
 #[tokio::test]
+async fn openai_chat_request_preserves_parallel_tool_calls_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "parallel_tool_calls": true,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        }
+                    }
+                }
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(request.json_body["parallel_tool_calls"], true);
+}
+
+#[tokio::test]
+async fn openai_chat_disable_tools_strips_tool_fields_even_without_format_change() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "disable_tools": true,
+            "from": "openai_chat",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": "{\"city\":\"Shanghai\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "lookup_weather",
+                    "content": "{\"temp\":20}"
+                }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        }
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert!(request.json_body.get("tools").is_none());
+    assert!(request.json_body.get("tool_choice").is_none());
+    assert_eq!(request.json_body["messages"].as_array().map(Vec::len), Some(1));
+    assert_eq!(request.json_body["messages"][0]["role"], "assistant");
+    assert_eq!(request.json_body["messages"][0]["content"], "");
+    assert!(request.json_body["messages"][0].get("tool_calls").is_none());
+}
+
+#[tokio::test]
+async fn gemini_chat_disable_tools_strips_tool_fields_even_without_format_change() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "disable_tools": true,
+            "from": "gemini_chat",
+            "to": "gemini_chat"
+        }
+    }).to_string());
+    let upstream_full =
+        format!("{upstream_base}/v1beta/models/gemini-2.5-flash:generateContent");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "id": "call_1",
+                        "name": "lookup_weather",
+                        "args": {"city": "Shanghai"}
+                    }
+                }]
+            }, {
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "id": "call_1",
+                        "name": "lookup_weather",
+                        "response": {"temp": 20}
+                    }
+                }]
+            }],
+            "tools": [{
+                "functionDeclarations": [{
+                    "name": "lookup_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        }
+                    }
+                }]
+            }],
+            "toolConfig": {
+                "functionCallingConfig": {
+                    "mode": "ANY"
+                }
+            },
+            "generationConfig": {
+                "temperature": 0.2
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1beta/models/gemini-2.5-flash:generateContent");
+    assert!(request.json_body.get("tools").is_none());
+    assert!(request.json_body.get("toolConfig").is_none());
+    assert_eq!(request.json_body["contents"], json!([]));
+    assert_eq!(request.json_body["generationConfig"], json!({"temperature": 0.2}));
+}
+
+#[tokio::test]
+async fn openai_responses_function_call_output_maps_to_openai_chat_tool_message() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "name": "lookup_weather",
+                "output": "{\"temp\":20}"
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.json_body["messages"][0]["role"], "tool");
+    assert_eq!(request.json_body["messages"][0]["tool_call_id"], "call_1");
+    assert_eq!(request.json_body["messages"][0]["name"], "lookup_weather");
+    assert_eq!(request.json_body["messages"][0]["content"], "{\"temp\":20}");
+}
+
+#[tokio::test]
+async fn openai_responses_function_call_maps_to_openai_chat_assistant_tool_calls() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "lookup_weather",
+                "arguments": "{\"city\":\"Shanghai\"}"
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.json_body["messages"][0]["role"], "assistant");
+    assert_eq!(request.json_body["messages"][0]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        request.json_body["messages"][0]["tool_calls"][0]["function"]["name"],
+        "lookup_weather"
+    );
+    assert_eq!(
+        request.json_body["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Shanghai\"}"
+    );
+}
+
+#[tokio::test]
+async fn openai_chat_tool_messages_map_to_responses_top_level_tool_items_with_status() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup_weather",
+                            "arguments": "{\"city\":\"Shanghai\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "lookup_weather",
+                    "content": "{\"temp\":20}"
+                }
+            ]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(
+        request.json_body["input"],
+        json!([
+            {
+                "type": "function_call",
+                "id": "call_1",
+                "call_id": "call_1",
+                "name": "lookup_weather",
+                "arguments": "{\"city\":\"Shanghai\"}",
+                "status": "completed"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "name": "lookup_weather",
+                "output": "{\"temp\":20}",
+                "status": "completed"
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_top_level_input_image_object_maps_to_openai_chat_image_part() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "input_image",
+                "image_url": {
+                    "url": "https://example.com/cat.png",
+                    "detail": "high"
+                }
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.json_body["messages"][0]["role"], "user");
+    assert_eq!(request.json_body["messages"][0]["content"][0]["type"], "image_url");
+    assert_eq!(
+        request.json_body["messages"][0]["content"][0]["image_url"]["url"],
+        "https://example.com/cat.png"
+    );
+    assert_eq!(
+        request.json_body["messages"][0]["content"][0]["image_url"]["detail"],
+        "high"
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_message_content_items_object_maps_to_openai_chat_parts() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": {
+                    "items": [
+                        {"type": "input_text", "text": "Describe this image"},
+                        {
+                            "type": "input_image",
+                            "image_url": "https://example.com/cat.png",
+                            "detail": "high"
+                        }
+                    ]
+                }
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/cat.png",
+                        "detail": "high"
+                    }
+                }
+            ]
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_reasoning_item_maps_to_openai_chat_assistant_text() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "reasoning",
+                "summary": [
+                    {"text": "Need weather lookup"},
+                    {"text": "Then summarize briefly"}
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "assistant",
+            "content": "Need weather lookup\nThen summarize briefly"
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_preserves_extra_generation_fields_when_mapping_to_openai_chat() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "metadata": {"trace_id": "abc"},
+            "response_format": {"type": "json_object"},
+            "input": "Hello"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.json_body["temperature"], json!(0.3));
+    assert_eq!(request.json_body["top_p"], json!(0.8));
+    assert_eq!(request.json_body["metadata"], json!({"trace_id": "abc"}));
+    assert_eq!(request.json_body["response_format"], json!({"type": "json_object"}));
+}
+
+#[tokio::test]
+async fn openai_responses_single_input_object_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello from dict"}]
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": "Hello from dict"
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_message_text_field_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": {
+                "type": "message",
+                "role": "user",
+                "text": "Hello from message.text"
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": "Hello from message.text"
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_input_image_flat_url_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "url": "https://example.com/flat-input.png",
+                    "detail": "high"
+                }]
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/flat-input.png",
+                    "detail": "high"
+                }
+            }]
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_input_image_nested_image_url_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image": {
+                        "url": "https://example.com/nested-input.png"
+                    },
+                    "detail": "low"
+                }]
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/nested-input.png",
+                    "detail": "low"
+                }
+            }]
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_image_url_part_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": "https://example.com/direct-image-url.png",
+                    "detail": "auto"
+                }]
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/direct-image-url.png",
+                    "detail": "auto"
+                }
+            }]
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_image_url_object_part_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/direct-image-url-object.png",
+                        "detail": "high"
+                    }
+                }]
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/direct-image-url-object.png",
+                    "detail": "high"
+                }
+            }]
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_image_url_nested_image_url_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image": {
+                        "url": "https://example.com/direct-image-nested.png"
+                    },
+                    "detail": "low"
+                }]
+            }
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "https://example.com/direct-image-nested.png",
+                    "detail": "low"
+                }
+            }]
+        }])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_function_call_output_content_items_map_to_openai_chat_tool_text_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "name": "lookup_weather",
+                "output": {
+                    "items": [
+                        {"type": "output_text", "text": "Sunny"},
+                        {"type": "output_text", "text": "25C"}
+                    ]
+                }
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([
+            {"role": "tool", "tool_call_id": "call_1", "name": "lookup_weather", "content": "Sunny\n25C"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_function_call_output_single_object_text_maps_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_obj_text_1",
+                "name": "lookup_weather",
+                "output": {
+                    "type": "output_text",
+                    "text": "Sunny from object"
+                }
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([
+            {"role": "tool", "tool_call_id": "call_obj_text_1", "name": "lookup_weather", "content": "Sunny from object"}
+        ])
+    );
+}
+
+#[tokio::test]
+async fn openai_chat_tool_result_array_maps_to_claude_array_content_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "claude_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "lookup_weather",
+                "content": [
+                    {"type": "text", "text": "Sunny"},
+                    {"type": "text", "text": "25C"}
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/messages");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "Sunny"},
+                    {"type": "text", "text": "25C"}
+                ]
+            }]
+        }])
+    );
+}
+
+#[tokio::test]
+async fn claude_tool_use_non_object_input_maps_to_openai_chat_empty_arguments_like_python() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "claude_chat",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/messages");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .header("anthropic-version", "2023-06-01")
+        .json(&json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "lookup_weather",
+                    "input": ["Shanghai"]
+                }]
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.json_body["messages"],
+        json!([{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "arguments": "{}"
+                }
+            }]
+        }])
+    );
+}
+
+
+#[tokio::test]
+async fn openai_responses_function_call_object_arguments_map_to_openai_chat_tool_call_json_string() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+    let upstream_full = format!("{upstream_base}/v1/responses");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_obj_1",
+                "name": "lookup_weather",
+                "arguments": {
+                    "city": "Shanghai",
+                    "unit": "c"
+                }
+            }]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(
+        request.json_body["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"Shanghai\",\"unit\":\"c\"}"
+    );
+}
+
+#[tokio::test]
 async fn patch_method_is_rejected_to_match_python_router() {
     let (upstream_base, seen) = spawn_upstream_patch_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
@@ -2547,6 +5536,62 @@ async fn spawn_sequenced_openai_chat_server(
     (format!("http://{}", addr), hits)
 }
 
+async fn spawn_recording_sequenced_openai_chat_server(
+    responses: Vec<(StatusCode, Value)>,
+) -> (String, Arc<Mutex<usize>>, Arc<Mutex<Vec<String>>>) {
+    let hits = Arc::new(Mutex::new(0usize));
+    let seen_models = Arc::new(Mutex::new(Vec::new()));
+    let remaining = Arc::new(Mutex::new(responses));
+    let app_hits = hits.clone();
+    let app_seen_models = seen_models.clone();
+    let app_remaining = remaining.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Bytes| {
+            let hits = app_hits.clone();
+            let seen_models = app_seen_models.clone();
+            let remaining = app_remaining.clone();
+            async move {
+                *hits.lock().expect("hits lock") += 1;
+                let request_body: Value = serde_json::from_slice(&body).expect("json body");
+                let model = request_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .expect("request model")
+                    .to_string();
+                seen_models.lock().expect("seen models lock").push(model);
+                let (status, body) = {
+                    let mut guard = remaining.lock().expect("remaining lock");
+                    if guard.is_empty() {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({"error": {"message": "no response scripted"}}),
+                        )
+                    } else {
+                        guard.remove(0)
+                    }
+                };
+                (status, Json(body))
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recording sequenced openai chat server");
+    let addr = listener.local_addr().expect("recording sequenced openai chat addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("recording sequenced openai chat server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (format!("http://{}", addr), hits, seen_models)
+}
+
 async fn upstream_echo(
     State(state): State<UpstreamState>,
     uri: Uri,
@@ -2669,6 +5714,74 @@ fn write_hashlinear_runtime(profile_dir: &PathBuf, intercept: f32, coef: &[f32])
         .expect("write hashlinear runtime coef");
 }
 
+fn write_bow_runtime(
+    profile_dir: &PathBuf,
+    intercept: f32,
+    vocabulary: &[&str],
+    idf: &[f32],
+    coef: &[f32],
+) {
+    assert_eq!(vocabulary.len(), idf.len(), "vocabulary/idf len mismatch");
+    assert_eq!(vocabulary.len(), coef.len(), "vocabulary/coef len mismatch");
+
+    std::fs::write(
+        profile_dir.join("bow_runtime.json"),
+        json!({
+            "runtime_version": 1,
+            "source_model": profile_dir.join("bow_model.pkl"),
+            "source_vectorizer": profile_dir.join("bow_vectorizer.pkl"),
+            "intercept": intercept,
+            "classes": [0, 1],
+            "tokenizer": {
+                "lowercase": true,
+                "split_whitespace": true,
+                "char_ngram_range": []
+            },
+            "vocabulary": vocabulary,
+            "idf": idf
+        })
+        .to_string(),
+    )
+    .expect("write bow runtime json");
+
+    let mut bytes = Vec::with_capacity(coef.len() * std::mem::size_of::<f32>());
+    for value in coef {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(profile_dir.join("bow_runtime.coef.f32"), bytes)
+        .expect("write bow runtime coef");
+}
+
+fn write_fasttext_runtime(profile_dir: &PathBuf, intercept: f32, weights: &[(&str, f32)]) {
+    std::fs::write(
+        profile_dir.join("fasttext_runtime.json"),
+        json!({
+            "runtime_version": 1,
+            "source_model": profile_dir.join("fasttext_model.bin"),
+            "intercept": intercept,
+            "classes": [0, 1],
+            "tokenizer": {
+                "lowercase": true,
+                "split_whitespace": true
+            },
+            "weights": weights.iter().map(|(token, weight)| json!({
+                "token": token,
+                "weight": weight
+            })).collect::<Vec<_>>()
+        })
+        .to_string(),
+    )
+    .expect("write fasttext runtime json");
+}
+
+fn unique_test_suffix() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current time")
+        .as_nanos()
+}
+
+#[cfg(feature = "storage-debug")]
 fn seed_history_sample_db(
     rocks_dir: &PathBuf,
     text: &str,
@@ -2705,14 +5818,47 @@ fn seed_history_sample_db(
     drop(db);
 }
 
+#[cfg(feature = "storage-debug")]
 fn put_rocks_string(db: &DBWithThreadMode<MultiThreaded>, key: &str, value: &str) {
     db.put(encode_rocksdict_string(key), encode_rocksdict_string(value))
         .expect("put rocks string");
 }
 
+#[cfg(feature = "storage-debug")]
 fn encode_rocksdict_string(value: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(value.len() + 1);
     out.push(0x02);
     out.extend_from_slice(value.as_bytes());
     out
+}
+
+#[cfg(feature = "storage-debug")]
+fn seed_legacy_sqlite_sample_db(
+    db_path: &PathBuf,
+    text: &str,
+    label: i64,
+    category: Option<&str>,
+    created_at: &str,
+) {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).expect("create sqlite parent");
+    }
+    let conn = Connection::open(db_path).expect("open sqlite db");
+    conn.execute_batch(
+        "
+        CREATE TABLE samples (
+            id INTEGER PRIMARY KEY,
+            text TEXT,
+            label INTEGER,
+            category TEXT,
+            created_at TEXT
+        );
+        ",
+    )
+    .expect("create sqlite schema");
+    conn.execute(
+        "INSERT INTO samples (text, label, category, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![text, label, category, created_at],
+    )
+    .expect("insert sqlite sample");
 }
