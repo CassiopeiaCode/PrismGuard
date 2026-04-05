@@ -35,6 +35,7 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
 use config::Settings;
+use format::RequestFormat;
 use routes::{router as proxy_router, AppState};
 use serde_json::json;
 
@@ -84,6 +85,82 @@ async fn openai_responses_sse_is_transformed_back_to_openai_chat_sse() {
         "{body}"
     );
     assert!(body.contains("[DONE]"), "{body}");
+}
+
+#[test]
+fn claude_sse_can_transform_to_openai_chat_sse() {
+    let raw = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::ClaudeChat),
+        Some(RequestFormat::OpenAiChat),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(text.contains("chat.completion.chunk"), "{text}");
+    assert!(text.contains("\"role\":\"assistant\""), "{text}");
+    assert!(text.contains("\"content\":\"hello\""), "{text}");
+    assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+    assert!(text.contains("[DONE]"), "{text}");
+}
+
+#[test]
+fn gemini_sse_can_transform_to_openai_chat_sse() {
+    let raw = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}],\"responseId\":\"gem_1\",\"modelVersion\":\"gemini-2.5-flash\"}\n\n",
+        "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"responseId\":\"gem_1\",\"modelVersion\":\"gemini-2.5-flash\"}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::GeminiChat),
+        Some(RequestFormat::OpenAiChat),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(text.contains("chat.completion.chunk"), "{text}");
+    assert!(text.contains("\"role\":\"assistant\""), "{text}");
+    assert!(text.contains("\"content\":\"hello\""), "{text}");
+    assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+    assert!(text.contains("[DONE]"), "{text}");
+}
+
+#[test]
+fn openai_chat_sse_can_transform_to_openai_responses_sse() {
+    let raw = concat!(
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiChat),
+        Some(RequestFormat::OpenAiResponses),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(text.contains("\"type\":\"response.created\""), "{text}");
+    assert!(text.contains("\"type\":\"response.output_text.delta\""), "{text}");
+    assert!(text.contains("\"type\":\"response.completed\""), "{text}");
+    assert!(text.contains("\"input_tokens\":3"), "{text}");
+    assert!(text.contains("\"output_tokens\":5"), "{text}");
+    assert!(text.contains("[DONE]"), "{text}");
 }
 
 #[tokio::test]
