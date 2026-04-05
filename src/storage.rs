@@ -172,6 +172,32 @@ impl SampleStorage {
         self.shuffle_combined(pass_samples, violation_samples)
     }
 
+    pub fn load_latest_samples(&self, limit: usize) -> Vec<SampleRecord> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        let mut sample_id = self.next_id().saturating_sub(1);
+        while sample_id > 0 && out.len() < limit {
+            if let Ok(Some(sample)) = self.sample_by_id(sample_id) {
+                out.push(sample);
+            }
+            sample_id -= 1;
+        }
+        out
+    }
+
+    pub fn load_random_samples(&self, limit: usize) -> Vec<SampleRecord> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let total = self.sample_count().unwrap_or_default() as usize;
+        let latest = self.load_latest_samples(total);
+        self.select_random(latest, limit)
+    }
+
     pub fn sample_by_id(&self, id: u64) -> Result<Option<SampleRecord>> {
         let key = format!("sample:{id:020}");
         self.sample_by_key(&key)

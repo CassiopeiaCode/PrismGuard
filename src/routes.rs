@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::Settings;
+use crate::moderation::{bow, fasttext, hashlinear};
 use crate::profile::ModerationProfile;
 use crate::proxy::{proxy_entry, proxy_entry_root};
 #[cfg(all(feature = "storage-debug", not(test)))]
@@ -50,6 +51,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/debug/profile/:profile",
             get(debug_profile).fallback(method_not_allowed),
+        )
+        .route(
+            "/debug/profile/:profile/metrics",
+            get(debug_profile_metrics).fallback(method_not_allowed),
         )
         .route(
             "/debug/url-config",
@@ -117,6 +122,9 @@ async fn openapi_json() -> impl IntoResponse {
             },
             "/debug/profile/{profile}": {
                 "get": {"summary": "Debug Profile"}
+            },
+            "/debug/profile/{profile}/metrics": {
+                "get": {"summary": "Debug Profile Metrics"}
             },
             "/debug/storage/{profile}/meta": {
                 "get": {"summary": "Debug Storage Meta"}
@@ -277,6 +285,136 @@ async fn debug_profile(
         "training_decision": training_decision,
         "config": profile.config
     })))
+}
+
+#[cfg_attr(any(test, not(feature = "storage-debug")), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+struct DebugProfileMetricsQuery {
+    #[serde(default = "default_metrics_sample_size")]
+    sample_size: usize,
+    #[serde(default = "default_metrics_threshold")]
+    threshold: f64,
+    #[serde(default = "default_metrics_sampling")]
+    sampling: String,
+}
+
+#[cfg(all(feature = "storage-debug", not(test)))]
+async fn debug_profile_metrics(
+    State(state): State<AppState>,
+    Path(profile): Path<String>,
+    Query(query): Query<DebugProfileMetricsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let profile = ModerationProfile::load(&state.settings.root_dir, &profile)?;
+    let sample_size = query.sample_size.max(1);
+    let threshold = query.threshold.clamp(0.0, 1.0);
+    let sampling = normalize_metrics_sampling(&query.sampling)?;
+    let storage = SampleStorage::open_read_only(profile.history_rocks_path())?;
+    let samples = match sampling {
+        "latest_full" => storage.load_latest_samples(sample_size),
+        "balanced" => storage.load_balanced_random_samples(sample_size),
+        _ => storage.load_random_samples(sample_size),
+    };
+    if samples.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("no samples available for profile {}", profile.profile_name),
+        )
+        .with_code("METRICS_ERROR")
+        .with_error_type("metrics_error"));
+    }
+
+    let mut tp = 0usize;
+    let mut tn = 0usize;
+    let mut fp = 0usize;
+    let mut fn_ = 0usize;
+    for sample in &samples {
+        let text = sample
+            .value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let actual = sample
+            .value
+            .get("label")
+            .and_then(Value::as_i64)
+            .unwrap_or_default()
+            != 0;
+        let probability = predict_profile_probability(text, &profile).map_err(ApiError::from)?;
+        let predicted = probability >= threshold;
+        match (predicted, actual) {
+            (true, true) => tp += 1,
+            (false, false) => tn += 1,
+            (true, false) => fp += 1,
+            (false, true) => fn_ += 1,
+        }
+    }
+
+    let evaluated = samples.len();
+    let accuracy = ratio(tp + tn, evaluated);
+    let precision = ratio(tp, tp + fp);
+    let recall = ratio(tp, tp + fn_);
+    let f1 = if precision + recall > 0.0 {
+        2.0 * precision * recall / (precision + recall)
+    } else {
+        0.0
+    };
+
+    Ok(Json(json!({
+        "profile": profile.profile_name,
+        "local_model_type": profile.config.local_model_type,
+        "sampling": sampling,
+        "sample_size": sample_size,
+        "evaluated": evaluated,
+        "threshold": threshold,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": tp,
+        "tn": tn,
+        "fp": fp,
+        "fn": fn_,
+    })))
+}
+
+fn default_metrics_sample_size() -> usize { 1000 }
+
+fn default_metrics_threshold() -> f64 { 0.5 }
+
+fn default_metrics_sampling() -> String { "random_full".to_string() }
+
+fn normalize_metrics_sampling(raw: &str) -> Result<&'static str, ApiError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "random" | "random_full" => Ok("random_full"),
+        "latest" | "latest_full" => Ok("latest_full"),
+        "balanced" => Ok("balanced"),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("unsupported sampling mode: {other}"),
+        )
+        .with_code("METRICS_ERROR")
+        .with_error_type("metrics_error")),
+    }
+}
+
+fn predict_profile_probability(text: &str, profile: &ModerationProfile) -> anyhow::Result<f64> {
+    match profile.config.local_model_type.as_str() {
+        "fasttext" => fasttext::predict_proba(text, profile)?
+            .ok_or_else(|| anyhow::anyhow!("fasttext runtime not available for {}", profile.profile_name)),
+        "hashlinear" => hashlinear::predict_proba(text, profile)?
+            .ok_or_else(|| anyhow::anyhow!("hashlinear runtime not available for {}", profile.profile_name)),
+        "bow" => bow::predict_proba(text, profile)?
+            .ok_or_else(|| anyhow::anyhow!("bow runtime not available for {}", profile.profile_name)),
+        other => Err(anyhow::anyhow!("unsupported local_model_type for metrics: {other}")),
+    }
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
 }
 
 #[cfg(all(feature = "storage-debug", not(test)))]
