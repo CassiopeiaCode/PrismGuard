@@ -204,7 +204,8 @@ fn scheduler_skips_profile_when_training_is_already_running() {
         }),
     );
 
-    let decision = scheduler::training_launch_allowed(&profile).expect("training launch decision");
+    let decision = scheduler::training_launch_allowed(&profile, current_unix_secs())
+        .expect("training launch decision");
 
     assert!(!decision);
 }

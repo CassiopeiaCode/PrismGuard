@@ -11,6 +11,8 @@ use crate::profile::ModerationProfile;
 use crate::sample_rpc::SampleRpcConfig;
 use crate::training::{evaluate_training_need, fetch_training_sample_count_via_rpc};
 
+const RUNNING_STATUS_STALE_SECS: u64 = 2 * 60 * 60;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingSubprocessCommand {
     pub program: String,
@@ -95,7 +97,7 @@ pub fn cooldown_allows_training(
     Ok(elapsed_secs >= cooldown_secs)
 }
 
-pub fn training_launch_allowed(profile: &ModerationProfile) -> Result<bool> {
+pub fn training_launch_allowed(profile: &ModerationProfile, now_unix_secs: u64) -> Result<bool> {
     let Some(status) = profile.training_status() else {
         return Ok(true);
     };
@@ -104,7 +106,46 @@ pub fn training_launch_allowed(profile: &ModerationProfile) -> Result<bool> {
         return Ok(true);
     };
 
-    Ok(state != "running")
+    if state != "running" {
+        return Ok(true);
+    }
+
+    let Some(timestamp) = status.get("timestamp").and_then(|value| value.as_u64()) else {
+        return Ok(true);
+    };
+    if now_unix_secs.saturating_sub(timestamp) >= RUNNING_STATUS_STALE_SECS {
+        return Ok(true);
+    }
+
+    let Some(pid) = status
+        .get("pid")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return Ok(false);
+    };
+
+    Ok(!training_process_matches_profile(pid, &profile.profile_name))
+}
+
+fn training_process_matches_profile(pid: u32, profile_name: &str) -> bool {
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    let Ok(raw) = fs::read(cmdline_path) else {
+        return false;
+    };
+    if raw.is_empty() {
+        return false;
+    }
+
+    let args = raw
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| std::str::from_utf8(part).ok())
+        .collect::<Vec<_>>();
+
+    args.windows(2).any(|window| {
+        window[0] == "train-profile" && window[1] == profile_name
+    })
 }
 
 pub fn build_training_subprocess_command(
@@ -139,7 +180,7 @@ pub async fn plan_training_round(
     let mut planned = Vec::new();
 
     for scanned in scan_profiles(root_dir)? {
-        if !training_launch_allowed(&scanned.profile)? {
+        if !training_launch_allowed(&scanned.profile, now_unix_secs)? {
             continue;
         }
 

@@ -247,60 +247,110 @@ pub async fn run_training_subprocess_from_args(args: &[String]) -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow!("usage: {} train-profile <profile-name>", binary_name(args)))?;
     let root_dir = std::env::current_dir().context("failed to resolve current dir")?;
-    let settings = crate::config::Settings::load(&root_dir)?;
-    let rpc = SampleRpcConfig::from_settings(&settings)?;
-    let profile = ModerationProfile::load(&root_dir, &profile_name)?;
+    let result = async {
+        let settings = crate::config::Settings::load(&root_dir)?;
+        let rpc = SampleRpcConfig::from_settings(&settings)?;
+        let profile = ModerationProfile::load(&root_dir, &profile_name)?;
 
-    let initial_sample_count = fetch_training_sample_count_via_rpc(&rpc, &profile)
-        .await
-        .unwrap_or(0);
-    write_training_status(
-        &profile,
-        &serde_json::json!({
-            "status": "running",
-            "message": "training in progress",
-            "timestamp": current_unix_secs(),
-            "profile": profile.profile_name,
-            "model_type": profile.config.local_model_type,
-            "sample_count": initial_sample_count
-        }),
-    )?;
+        let initial_sample_count = fetch_training_sample_count_via_rpc(&rpc, &profile)
+            .await
+            .unwrap_or(0);
+        write_training_status(
+            &profile,
+            &serde_json::json!({
+                "status": "running",
+                "message": "training in progress",
+                "timestamp": current_unix_secs(),
+                "started_at": current_unix_secs(),
+                "pid": std::process::id(),
+                "profile": profile.profile_name,
+                "model_type": profile.config.local_model_type,
+                "sample_count": initial_sample_count
+            }),
+        )?;
 
-    match run_profile_training(&rpc, &profile).await {
-        Ok(output) => {
-            write_training_status(
-                &profile,
-                &serde_json::json!({
-                    "status": "success",
-                    "message": "training completed",
-                    "timestamp": current_unix_secs(),
-                    "profile": profile.profile_name,
-                    "model_type": profile.config.local_model_type,
-                    "sample_count": output.sample_count,
-                    "pass_count": output.pass_count,
-                    "violation_count": output.violation_count,
-                    "runtime_json_path": output.runtime_json_path,
-                    "runtime_coef_path": output.runtime_coef_path,
-                    "model_marker_path": output.model_marker_path
-                }),
-            )?;
-            Ok(())
-        }
-        Err(err) => {
-            write_training_status(
-                &profile,
-                &serde_json::json!({
-                    "status": "failed",
-                    "message": format!("{err:#}"),
-                    "timestamp": current_unix_secs(),
-                    "profile": profile.profile_name,
-                    "model_type": profile.config.local_model_type,
-                    "sample_count": initial_sample_count
-                }),
-            )?;
-            Err(err)
+        match run_profile_training(&rpc, &profile).await {
+            Ok(output) => {
+                write_training_status(
+                    &profile,
+                    &serde_json::json!({
+                        "status": "success",
+                        "message": "training completed",
+                        "timestamp": current_unix_secs(),
+                        "profile": profile.profile_name,
+                        "model_type": profile.config.local_model_type,
+                        "sample_count": output.sample_count,
+                        "pass_count": output.pass_count,
+                        "violation_count": output.violation_count,
+                        "runtime_json_path": output.runtime_json_path,
+                        "runtime_coef_path": output.runtime_coef_path,
+                        "model_marker_path": output.model_marker_path
+                    }),
+                )?;
+                Ok(())
+            }
+            Err(err) => {
+                write_training_status(
+                    &profile,
+                    &serde_json::json!({
+                        "status": "failed",
+                        "message": format!("{err:#}"),
+                        "timestamp": current_unix_secs(),
+                        "profile": profile.profile_name,
+                        "model_type": profile.config.local_model_type,
+                        "sample_count": initial_sample_count
+                    }),
+                )?;
+                Err(err)
+            }
         }
     }
+    .await;
+
+    if let Err(err) = &result {
+        let _ = write_training_failure_status(
+            &root_dir,
+            &profile_name,
+            format!("{err:#}"),
+        );
+    }
+
+    result
+}
+
+fn write_training_failure_status(
+    root_dir: &Path,
+    profile_name: &str,
+    message: String,
+) -> Result<()> {
+    let status_path = root_dir
+        .join("configs")
+        .join("mod_profiles")
+        .join(profile_name)
+        .join(".train_status.json");
+    if let Some(parent) = status_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create profile dir {}", parent.display()))?;
+    }
+
+    let payload = serde_json::json!({
+        "status": "failed",
+        "message": message,
+        "timestamp": current_unix_secs(),
+        "profile": profile_name,
+    });
+    let tmp_path = status_path.with_extension("json.tmp");
+    let encoded = serde_json::to_vec_pretty(&payload).context("failed to encode training failure status")?;
+    fs::write(&tmp_path, encoded)
+        .with_context(|| format!("failed to write training failure status tmp {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &status_path).with_context(|| {
+        format!(
+            "failed to replace training failure status {} with {}",
+            status_path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub fn train_hashlinear_runtime(
