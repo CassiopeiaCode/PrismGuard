@@ -95,6 +95,18 @@ pub fn cooldown_allows_training(
     Ok(elapsed_secs >= cooldown_secs)
 }
 
+pub fn training_launch_allowed(profile: &ModerationProfile) -> Result<bool> {
+    let Some(status) = profile.training_status() else {
+        return Ok(true);
+    };
+
+    let Some(state) = status.get("status").and_then(|value| value.as_str()) else {
+        return Ok(true);
+    };
+
+    Ok(state != "running")
+}
+
 pub fn build_training_subprocess_command(
     root_dir: &str,
     profile_name: &str,
@@ -127,6 +139,10 @@ pub async fn plan_training_round(
     let mut planned = Vec::new();
 
     for scanned in scan_profiles(root_dir)? {
+        if !training_launch_allowed(&scanned.profile)? {
+            continue;
+        }
+
         if !cooldown_allows_training(
             &scanned.profile,
             settings.training_scheduler_failure_cooldown_minutes,
@@ -163,23 +179,51 @@ pub async fn plan_training_round(
     Ok(planned)
 }
 
+pub fn spawn_detached_command(
+    program: &str,
+    args: &[String],
+    profile_name: &str,
+) -> Result<u32> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn detached command for {}", profile_name))?;
+    let pid = child.id();
+    let profile_name = profile_name.to_string();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) => {
+            if !status.success() {
+                warn!(
+                    profile = %profile_name,
+                    status = ?status.code(),
+                    "training subprocess exited unsuccessfully"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                profile = %profile_name,
+                error = %err,
+                "failed to wait for detached training subprocess"
+            );
+        }
+    });
+    Ok(pid)
+}
+
 pub async fn spawn_training_subprocess(
     settings: &Settings,
     profile_name: &str,
-) -> Result<std::process::ExitStatus> {
+) -> Result<u32> {
     let command = build_training_subprocess_command(
         &settings.root_dir.display().to_string(),
         profile_name,
         &settings.training_subprocess_allowed_cpus,
     )?;
-    let status = std::process::Command::new(&command.program)
-        .args(&command.args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .with_context(|| format!("failed to run training subprocess for {}", profile_name))?;
-    Ok(status)
+    spawn_detached_command(&command.program, &command.args, profile_name)
 }
 
 pub async fn run_scheduler_once(settings: &Settings) -> Result<Vec<PlannedTrainingAction>> {
@@ -197,14 +241,8 @@ pub async fn run_scheduler_once(settings: &Settings) -> Result<Vec<PlannedTraini
             "scheduler selected profile for training"
         );
 
-        let status = spawn_training_subprocess(settings, &action.profile_name).await?;
-        if !status.success() {
-            warn!(
-                profile = %action.profile_name,
-                status = ?status.code(),
-                "training subprocess exited unsuccessfully"
-            );
-        }
+        let pid = spawn_training_subprocess(settings, &action.profile_name).await?;
+        info!(profile = %action.profile_name, pid, "scheduler started detached training subprocess");
     }
 
     Ok(planned)

@@ -19,7 +19,7 @@ use profile::ModerationProfile;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sample_rpc::{
     serve_unix_requests_until_shutdown, SampleRpcRequest, SampleRpcResponse,
 };
@@ -185,6 +185,44 @@ fn scheduler_allows_profile_after_failure_cooldown_elapses() {
     let decision = scheduler::cooldown_allows_training(&profile, 30, now).expect("cooldown decision");
 
     assert!(decision);
+}
+
+#[test]
+fn scheduler_skips_profile_when_training_is_already_running() {
+    let profile = write_profile(
+        &format!("scheduler-training-running-{}", std::process::id()),
+        json!({"local_model_type": "hashlinear"}),
+    );
+    write_training_status(
+        &profile,
+        json!({
+            "status": "running",
+            "message": "training in progress",
+            "timestamp": current_unix_secs(),
+            "profile": profile.profile_name,
+            "model_type": "hashlinear"
+        }),
+    );
+
+    let decision = scheduler::training_launch_allowed(&profile).expect("training launch decision");
+
+    assert!(!decision);
+}
+
+#[test]
+fn scheduler_spawn_detached_command_returns_before_child_exits() {
+    let started = Instant::now();
+    let pid = scheduler::spawn_detached_command(
+        "/bin/sh",
+        &["-c".to_string(), "sleep 1".to_string()],
+        "detached-test",
+    )
+    .expect("spawn detached command");
+
+    assert!(pid > 0);
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    std::thread::sleep(Duration::from_millis(1200));
 }
 
 #[test]
