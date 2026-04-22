@@ -217,7 +217,14 @@ async fn llm_moderate(
             Ok(resp) => {
                 match resp.error_for_status() {
                     Ok(resp) => match resp.json::<Value>().await {
-                        Ok(payload) => return parse_openai_moderation_response(payload),
+                        Ok(payload) => match parse_openai_moderation_response(payload) {
+                            Ok(parsed) => return Ok(parsed),
+                            Err(err) => {
+                                last_error = Some(
+                                    anyhow!(err).context("failed to parse llm moderation response"),
+                                );
+                            }
+                        },
                         Err(err) => {
                             last_error = Some(anyhow!(err).context("failed to decode llm moderation response"));
                         }
@@ -335,7 +342,9 @@ async fn save_history_result(
     Ok(())
 }
 
-fn parse_openai_moderation_response(payload: Value) -> Result<SmartModerationResult, SmartModerationError> {
+fn parse_openai_moderation_response(
+    payload: Value,
+) -> Result<SmartModerationResult, SmartModerationError> {
     let content = payload
         .get("choices")
         .and_then(Value::as_array)
@@ -346,7 +355,7 @@ fn parse_openai_moderation_response(payload: Value) -> Result<SmartModerationRes
         .filter(|text| !text.is_empty())
         .ok_or_else(|| anyhow!("llm moderation response missing choices[0].message.content"))?;
 
-    Ok(parse_moderation_content(&content))
+    parse_moderation_content(&content)
 }
 
 fn extract_content_text(content: &Value) -> String {
@@ -367,30 +376,21 @@ fn extract_content_text(content: &Value) -> String {
     }
 }
 
-fn parse_moderation_content(content: &str) -> SmartModerationResult {
-    let parsed = extract_json_object(content)
-        .and_then(|json_text| serde_json::from_str::<Value>(json_text).ok());
+fn parse_moderation_content(
+    content: &str,
+) -> Result<SmartModerationResult, SmartModerationError> {
+    let json_text = extract_json_object(content)
+        .ok_or_else(|| anyhow!("llm moderation content is not a JSON object"))?;
+    let data: Value = serde_json::from_str(json_text)
+        .map_err(|err| anyhow!(err).context("failed to decode moderation JSON"))?;
 
-    if let Some(data) = parsed {
-        return SmartModerationResult {
-            violation: data.get("violation").and_then(Value::as_bool).unwrap_or(false),
-            category: data.get("category").and_then(Value::as_str).map(ToString::to_string),
-            reason: data.get("reason").and_then(Value::as_str).map(ToString::to_string),
-            source: "ai".to_string(),
-            confidence: data.get("confidence").and_then(Value::as_f64),
-        };
-    }
-
-    let lowered = content.to_ascii_lowercase();
-    SmartModerationResult {
-        violation: lowered.contains("违规")
-            || lowered.contains("violation")
-            || lowered.contains("不当"),
-        category: Some("unknown".to_string()),
-        reason: Some(content.chars().take(200).collect()),
+    Ok(SmartModerationResult {
+        violation: data.get("violation").and_then(Value::as_bool).unwrap_or(false),
+        category: data.get("category").and_then(Value::as_str).map(ToString::to_string),
+        reason: data.get("reason").and_then(Value::as_str).map(ToString::to_string),
         source: "ai".to_string(),
-        confidence: None,
-    }
+        confidence: data.get("confidence").and_then(Value::as_f64),
+    })
 }
 
 fn extract_json_object(content: &str) -> Option<&str> {
