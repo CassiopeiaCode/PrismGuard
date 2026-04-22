@@ -2,3 +2,7 @@
 /.env
 /configs/
 /.worktrees/
+/py-scripts/.venv/
+/py-scripts/__pycache__/
+/py-scripts/.pytest_cache/
+/py-scripts/*.egg-info/
