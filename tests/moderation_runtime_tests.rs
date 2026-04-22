@@ -35,13 +35,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{StatusCode, Uri};
+use axum::http::{header::CONTENT_TYPE, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use config::Settings;
+use hyper::Body;
 use routes::{router as proxy_router, AppState};
 use serde_json::{json, Value};
+use tokio::sync::oneshot;
 
 #[derive(Clone, Debug)]
 struct SeenRequest {
@@ -52,6 +54,12 @@ struct SeenRequest {
 #[derive(Clone)]
 struct UpstreamState {
     seen: Arc<Mutex<Vec<SeenRequest>>>,
+}
+
+#[derive(Clone)]
+struct StreamingHangState {
+    seen: Arc<Mutex<Vec<SeenRequest>>>,
+    disconnect_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 fn temp_keywords_path(label: &str) -> PathBuf {
@@ -493,6 +501,31 @@ async fn spawn_proxy_server() -> String {
     format!("http://{}", addr)
 }
 
+async fn spawn_proxy_server_with_env(env_map: HashMap<String, String>) -> String {
+    let app = proxy_router(AppState {
+        settings: Arc::new(test_settings(env_map)),
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client"),
+    });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("proxy server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
 fn test_settings(env_map: HashMap<String, String>) -> Settings {
     Settings {
         host: "127.0.0.1".to_string(),
@@ -516,6 +549,155 @@ fn test_settings(env_map: HashMap<String, String>) -> Settings {
 
 fn percent_encode(input: &str) -> String {
     url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
+}
+
+#[tokio::test]
+async fn smart_moderation_llm_timeout_aborts_streaming_connection() {
+    let profile_name = format!("runtime-ai-timeout-{}", std::process::id());
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(&profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+
+    let (ai_base_url, seen, disconnected) = spawn_streaming_hang_ai_server().await;
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": ai_base_url,
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 1,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "bow",
+            "probability": {
+                "ai_review_rate": 1.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
+        .expect("write prompt");
+
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "sk-test".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
+    let proxy_url = format!("{proxy_base}/{config}${}/v1/chat/completions", unused_http_base());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "this should timeout"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("ai upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.json_body["stream"], true);
+
+    // Ensure the proxy cancels the in-flight SSE request on timeout (connection should be closed).
+    tokio::time::timeout(Duration::from_secs(5), disconnected)
+        .await
+        .expect("disconnect signal")
+        .expect("disconnect recv");
+}
+
+async fn spawn_streaming_hang_ai_server() -> (String, Arc<Mutex<Vec<SeenRequest>>>, oneshot::Receiver<()>) {
+    let (disconnect_tx, disconnect_rx) = oneshot::channel();
+    let state = StreamingHangState {
+        seen: Arc::new(Mutex::new(Vec::new())),
+        disconnect_tx: Arc::new(Mutex::new(Some(disconnect_tx))),
+    };
+    let seen = state.seen.clone();
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(upstream_ai_stream_hang))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ai upstream");
+    let addr = listener.local_addr().expect("ai upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("ai upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    (format!("http://{}/v1", addr), seen, disconnect_rx)
+}
+
+async fn upstream_ai_stream_hang(
+    State(state): State<StreamingHangState>,
+    uri: Uri,
+    body: Bytes,
+) -> impl IntoResponse {
+    let json_body: Value = serde_json::from_slice(&body).expect("json body");
+    state
+        .seen
+        .lock()
+        .expect("seen lock")
+        .push(SeenRequest {
+            path: uri.path().to_string(),
+            json_body,
+        });
+
+    let (mut sender, body) = Body::channel();
+    let disconnect_tx = state.disconnect_tx.clone();
+    tokio::spawn(async move {
+        // The proxy should time out quickly, drop the response, and close the connection.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let test_chunk = Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"{\"}}]}\n\n");
+        if sender.send_data(test_chunk).await.is_err() {
+            if let Some(tx) = disconnect_tx.lock().expect("disconnect lock").take() {
+                let _ = tx.send(());
+            }
+            return;
+        }
+
+        // Keep the stream open (if the client didn't disconnect).
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/event-stream")],
+        body,
+    )
 }
 
 fn unused_http_base() -> String {

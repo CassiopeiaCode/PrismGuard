@@ -7,9 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::time::timeout as tokio_timeout;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::moderation::bow;
@@ -193,54 +195,80 @@ async fn llm_moderate(
         profile.config.ai.base_url.trim_end_matches('/')
     );
 
+    // NOTE:
+    // - Always request a streaming response (SSE) so timing out will cancel the in-flight body read,
+    //   which causes the underlying HTTP connection to be dropped instead of being left hanging.
+    // - Enforce timeout with `tokio::time::timeout` so it cannot "sometimes not timeout".
+    async fn parse_llm_response(
+        response: reqwest::Response,
+    ) -> Result<SmartModerationResult, SmartModerationError> {
+        let response = response
+            .error_for_status()
+            .map_err(|err| SmartModerationError::Other(anyhow!(err)))?;
+
+        let is_sse = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("text/event-stream"))
+            .unwrap_or(false);
+
+        if is_sse {
+            let content = read_openai_chat_sse_content(response)
+                .await
+                .map_err(|err| SmartModerationError::Other(err))?;
+            parse_moderation_content(&content)
+        } else {
+            let payload = response
+                .json::<Value>()
+                .await
+                .map_err(|err| SmartModerationError::Other(anyhow!(err)))?;
+            parse_openai_moderation_response(payload)
+        }
+    }
+
     let mut attempted_models = Vec::new();
     let mut last_error = None;
     for _attempt in 0..=max_retries {
         let model = pick_model_for_attempt(&models, &attempted_models);
         attempted_models.push(model.clone());
-        let response = http_client
-            .post(&endpoint)
-            .bearer_auth(&api_key)
-            .timeout(timeout)
-            .json(&json!({
-                "model": &model,
-                "messages": [{
-                    "role": "user",
-                    "content": prompt
-                }],
-                "temperature": 0
-            }))
-            .send()
-            .await;
+
+        let response = tokio_timeout(timeout, async {
+            let response = http_client
+                .post(&endpoint)
+                .bearer_auth(&api_key)
+                .json(&json!({
+                    "model": &model,
+                    "messages": [{
+                        "role": "user",
+                        "content": prompt
+                    }],
+                    "temperature": 0,
+                    "stream": true
+                }))
+                .send()
+                .await
+                .map_err(|err| SmartModerationError::Other(anyhow!(err)))?;
+
+            parse_llm_response(response).await
+        })
+        .await;
 
         match response {
-            Ok(resp) => {
-                match resp.error_for_status() {
-                    Ok(resp) => match resp.json::<Value>().await {
-                        Ok(payload) => match parse_openai_moderation_response(payload) {
-                            Ok(parsed) => return Ok(parsed),
-                            Err(err) => {
-                                let err = match err {
-                                    SmartModerationError::ConcurrencyLimit(message) => {
-                                        anyhow!(message)
-                                    }
-                                    SmartModerationError::Other(err) => err,
-                                };
-                                last_error = Some(
-                                    err.context("failed to parse llm moderation response"),
-                                );
-                            }
-                        },
-                        Err(err) => {
-                            last_error = Some(anyhow!(err).context("failed to decode llm moderation response"));
-                        }
-                    },
-                    Err(err) => {
-                        last_error = Some(anyhow!(err).context("llm moderation request failed"));
-                    }
-                }
+            Ok(Ok(parsed)) => return Ok(parsed),
+            Ok(Err(err)) => {
+                let err = match err {
+                    SmartModerationError::ConcurrencyLimit(message) => anyhow!(message),
+                    SmartModerationError::Other(err) => err,
+                };
+                last_error = Some(err.context("llm moderation request failed"));
             }
-            Err(err) => last_error = Some(anyhow!(err)),
+            Err(_) => {
+                last_error = Some(anyhow!(
+                    "llm moderation request timed out after {}s (connection aborted)",
+                    timeout.as_secs().max(1)
+                ));
+            }
         }
     }
 
@@ -251,6 +279,84 @@ async fn llm_moderate(
             .unwrap_or_else(|| "unknown error".to_string())
     )
     .into())
+}
+
+async fn read_openai_chat_sse_content(
+    response: reqwest::Response,
+) -> Result<String> {
+    use futures_util::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut content = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buffer.extend_from_slice(&chunk);
+
+        while let Some(newline_idx) = buffer.iter().position(|b| *b == b'\n') {
+            let mut line = buffer.drain(..=newline_idx).collect::<Vec<u8>>();
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+
+            if line.is_empty() {
+                continue;
+            }
+
+            let Ok(line) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            let trimmed = line.trim();
+            let Some(data) = trimmed.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                return Ok(content);
+            }
+
+            let Ok(payload) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if let Some(delta) = extract_openai_chat_stream_delta(&payload) {
+                content.push_str(&delta);
+            }
+        }
+    }
+
+    Ok(content)
+}
+
+fn extract_openai_chat_stream_delta(payload: &Value) -> Option<String> {
+    let choice = payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())?;
+
+    if let Some(delta) = choice.get("delta") {
+        if let Some(content) = delta.get("content") {
+            let text = extract_content_text(content);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    // Some upstreams may return a nonstandard streaming shape.
+    if let Some(message) = choice.get("message") {
+        if let Some(content) = message.get("content") {
+            let text = extract_content_text(content);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    None
 }
 
 async fn run_ai_moderation_with_history(
