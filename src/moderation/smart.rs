@@ -220,8 +220,14 @@ async fn llm_moderate(
                         Ok(payload) => match parse_openai_moderation_response(payload) {
                             Ok(parsed) => return Ok(parsed),
                             Err(err) => {
+                                let err = match err {
+                                    SmartModerationError::ConcurrencyLimit(message) => {
+                                        anyhow!(message)
+                                    }
+                                    SmartModerationError::Other(err) => err,
+                                };
                                 last_error = Some(
-                                    anyhow!(err).context("failed to parse llm moderation response"),
+                                    err.context("failed to parse llm moderation response"),
                                 );
                             }
                         },
