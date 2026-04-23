@@ -482,9 +482,11 @@ async fn build_streaming_proxy_response(
     let mut upstream = Box::pin(upstream_response.bytes_stream()) as ReqByteStream;
     let mut buffered = Vec::new();
     let mut stream_detected = header_says_stream;
-    let check_format = stream_check_format(client_format, upstream_format);
     let mut precheck = if delay_stream_header && status == StatusCode::OK {
-        Some(StreamPrecheck::new(check_format))
+        Some(StreamPrecheck::new(stream_precheck_format(
+            client_format,
+            upstream_format,
+        )))
     } else {
         None
     };
@@ -796,6 +798,15 @@ fn stream_check_format(
     } else {
         upstream_format.unwrap_or(crate::format::RequestFormat::OpenAiChat)
     }
+}
+
+fn stream_precheck_format(
+    client_format: Option<crate::format::RequestFormat>,
+    upstream_format: Option<crate::format::RequestFormat>,
+) -> crate::format::RequestFormat {
+    upstream_format
+        .or(client_format)
+        .unwrap_or(crate::format::RequestFormat::OpenAiChat)
 }
 
 fn stream_read_error(err: reqwest::Error) -> std::io::Error {
