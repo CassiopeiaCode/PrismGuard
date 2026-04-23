@@ -52,7 +52,7 @@ enum InternalEvent {
     Done,
 }
 
-trait InternalSink {
+trait InternalSink: Send {
     fn on_start(&mut self, meta: &Map<String, Value>) -> Vec<Vec<u8>>;
     fn on_text_delta(&mut self, text: &str) -> Vec<Vec<u8>>;
     fn on_tool_call_start(&mut self, call_id: &str, name: &str) -> Vec<Vec<u8>>;

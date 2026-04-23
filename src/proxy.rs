@@ -436,7 +436,6 @@ async fn build_proxy_response(
     request_expects_stream: bool,
     moderation_debug: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let status = upstream_response.status();
     let headers = filtered_response_headers(upstream_response.headers());
     let header_says_stream = is_stream_response(upstream_response.headers());
     if header_says_stream || request_expects_stream {
