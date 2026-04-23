@@ -34,9 +34,58 @@ fn detects_openai_chat_and_rewrites_path_for_responses_target() {
     assert_eq!(plan.target_format, Some(RequestFormat::OpenAiResponses));
     assert!(plan.stream);
     assert_eq!(plan.path, "/proxy/openai/v1/responses");
+    assert_eq!(plan.moderation_text.as_deref(), Some("Be terse.\nPing"));
     assert_eq!(plan.body["instructions"], "Be terse.");
     assert_eq!(plan.body["input"][0]["role"], "user");
     assert_eq!(plan.body["input"][0]["content"][0]["text"], "Ping");
+}
+
+#[test]
+fn preserves_moderation_text_when_chat_transforms_into_responses_instructions() {
+    let plan = process_request(
+        &transform_config(true, "openai_responses"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "gpt-4.1-mini",
+            "stream": false,
+            "messages": [
+                {"role": "system", "content": "forbidden system text"},
+                {"role": "user", "content": "safe user text"}
+            ]
+        }),
+    )
+    .expect("openai chat request should transform");
+
+    assert_eq!(plan.source_format, Some(RequestFormat::OpenAiChat));
+    assert_eq!(plan.target_format, Some(RequestFormat::OpenAiResponses));
+    assert_eq!(
+        plan.moderation_text.as_deref(),
+        Some("forbidden system text\nsafe user text")
+    );
+    assert_eq!(plan.body["instructions"], "forbidden system text");
+}
+
+#[test]
+fn preserves_moderation_text_for_native_openai_responses_requests() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/responses",
+        &[],
+        json!({
+            "model": "gpt-4.1-mini",
+            "instructions": "forbidden instruction text",
+            "input": "safe user text"
+        }),
+    )
+    .expect("responses request should transform");
+
+    assert_eq!(plan.source_format, Some(RequestFormat::OpenAiResponses));
+    assert_eq!(plan.target_format, Some(RequestFormat::ClaudeChat));
+    assert_eq!(
+        plan.moderation_text.as_deref(),
+        Some("forbidden instruction text\nsafe user text")
+    );
 }
 
 #[test]

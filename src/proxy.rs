@@ -134,8 +134,9 @@ async fn proxy_entry_with_cfg(
             .or_else(|| detect_source_format(&path, request_json.as_ref()))
             .unwrap_or("openai_chat")
             .to_string();
-        let moderation_text =
-            extract::extract_text_for_moderation(&request_plan.body, moderation_format.as_str());
+        let moderation_text = request_plan.moderation_text.clone().unwrap_or_else(|| {
+            extract::extract_text_for_moderation(&request_plan.body, moderation_format.as_str())
+        });
         Some((moderation_format, moderation_text))
     } else {
         None

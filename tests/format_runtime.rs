@@ -36,6 +36,7 @@ impl RequestFormat {
 pub struct RequestPlan {
     pub source_format: Option<RequestFormat>,
     pub target_format: Option<RequestFormat>,
+    pub moderation_text: Option<String>,
     pub body: Value,
     pub path: String,
     pub stream: bool,
@@ -98,6 +99,7 @@ pub fn process_request(
     let mut plan = RequestPlan {
         source_format: None,
         target_format: None,
+        moderation_text: None,
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         body,
         path: path.to_string(),
@@ -190,6 +192,7 @@ pub fn process_request(
     plan.stream = internal.stream;
     plan.source_format = Some(source);
     plan.target_format = Some(target);
+    plan.moderation_text = Some(moderation_text_from_internal_request(&internal));
 
     if target != source || disable_tools {
         plan.body = emit_request(target, &internal)
@@ -200,6 +203,40 @@ pub fn process_request(
     }
 
     Ok(plan)
+}
+
+fn moderation_text_from_internal_request(req: &InternalRequest) -> String {
+    let mut texts = Vec::new();
+    for message in &req.messages {
+        for block in &message.content {
+            match block {
+                InternalContentBlock::Text(text) => push_non_empty_text(text, &mut texts),
+                InternalContentBlock::ToolResult { output, .. } => {
+                    collect_moderation_value_text(output, &mut texts);
+                }
+                InternalContentBlock::ToolCall { .. } | InternalContentBlock::ImageUrl { .. } => {}
+            }
+        }
+    }
+    texts.join("\n")
+}
+
+fn collect_moderation_value_text(value: &Value, texts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => push_non_empty_text(text, texts),
+        Value::Array(items) => {
+            for item in items {
+                collect_moderation_value_text(item, texts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_non_empty_text(text: &str, texts: &mut Vec<String>) {
+    if !text.is_empty() {
+        texts.push(text.to_string());
+    }
 }
 
 fn detect_format(from_cfg: Option<&Value>, path: &str, headers: &[(String, String)], body: &Value) -> Option<RequestFormat> {
