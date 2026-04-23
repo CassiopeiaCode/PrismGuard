@@ -754,6 +754,41 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
         .expect("proxy response");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-local-model-source")
+            .and_then(|value| value.to_str().ok()),
+        Some("hashlinear_model")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-local-model-decision")
+            .and_then(|value| value.to_str().ok()),
+        Some("uncertain")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-llm-reviewed")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-prismguard-llm-result")
+            .and_then(|value| value.to_str().ok()),
+        Some("block")
+    );
+    assert!(
+        response
+            .headers()
+            .get("x-prismguard-llm-latency-ms")
+            .is_some(),
+        "expected llm latency header"
+    );
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");

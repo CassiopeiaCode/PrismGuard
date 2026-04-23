@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 #[cfg(all(feature = "storage-debug", not(test)))]
@@ -590,6 +590,7 @@ pub struct ApiError {
     error_type: &'static str,
     source_format: Option<String>,
     moderation_details: Option<Value>,
+    extra_headers: HeaderMap,
 }
 
 impl ApiError {
@@ -601,6 +602,7 @@ impl ApiError {
             error_type: "proxy_error",
             source_format: None,
             moderation_details: None,
+            extra_headers: HeaderMap::new(),
         }
     }
 
@@ -621,6 +623,11 @@ impl ApiError {
 
     pub(crate) fn with_moderation_details(mut self, moderation_details: Option<Value>) -> Self {
         self.moderation_details = moderation_details;
+        self
+    }
+
+    pub(crate) fn with_extra_headers(mut self, extra_headers: HeaderMap) -> Self {
+        self.extra_headers = extra_headers;
         self
     }
 
@@ -650,7 +657,11 @@ impl IntoResponse for ApiError {
             error.insert("moderation_details".to_string(), moderation_details);
         }
         let body = Json(json!({ "error": Value::Object(error) }));
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        for (name, value) in self.extra_headers.iter() {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+        response
     }
 }
 

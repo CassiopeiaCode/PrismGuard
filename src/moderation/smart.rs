@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
@@ -43,17 +44,31 @@ pub struct SmartModerationResult {
     pub reason: Option<String>,
     pub source: String,
     pub confidence: Option<f64>,
+    #[serde(skip_serializing)]
+    pub debug: Option<ModerationDebugInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ModerationDebugInfo {
+    pub local_model_source: Option<String>,
+    pub local_model_confidence: Option<f64>,
+    pub local_model_latency_ms: Option<f64>,
+    pub local_model_decision: Option<String>,
+    pub llm_reviewed: bool,
+    pub llm_result: Option<String>,
+    pub llm_latency_ms: Option<f64>,
+    pub llm_error: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum SmartModerationError {
     ConcurrencyLimit(String),
-    Other(anyhow::Error),
+    Other(anyhow::Error, Option<ModerationDebugInfo>),
 }
 
 impl From<anyhow::Error> for SmartModerationError {
     fn from(value: anyhow::Error) -> Self {
-        Self::Other(value)
+        Self::Other(value, None)
     }
 }
 
@@ -105,16 +120,20 @@ async fn decide_moderation(
     env_map: &HashMap<String, String>,
 ) -> Result<SmartModerationResult, SmartModerationError> {
     if should_force_ai_review(profile) {
-        return run_ai_moderation_with_history(text, profile, http_client, env_map).await;
+        return run_ai_moderation_with_history(text, profile, http_client, env_map, None).await;
     }
 
     if profile.local_model_exists() {
-        if let Some(result) = run_local_model(text, profile) {
+        let (result, debug) = evaluate_local_model(text, profile);
+        if let Some(mut result) = result {
+            result.debug = Some(debug);
             return Ok(result);
         }
+
+        return run_ai_moderation_with_history(text, profile, http_client, env_map, Some(debug)).await;
     }
 
-    run_ai_moderation_with_history(text, profile, http_client, env_map).await
+    run_ai_moderation_with_history(text, profile, http_client, env_map, None).await
 }
 
 fn should_force_ai_review(profile: &ModerationProfile) -> bool {
@@ -129,43 +148,92 @@ fn should_force_ai_review(profile: &ModerationProfile) -> bool {
     next_random_unit() < rate
 }
 
-fn run_local_model(text: &str, profile: &ModerationProfile) -> Option<SmartModerationResult> {
+fn evaluate_local_model(
+    text: &str,
+    profile: &ModerationProfile,
+) -> (Option<SmartModerationResult>, ModerationDebugInfo) {
+    let started = Instant::now();
     let (probability, source) = match profile.config.local_model_type.as_str() {
         "fasttext" => match fasttext::predict_proba(text, profile) {
             Ok(Some(probability)) => (probability, "fasttext_model"),
-            Ok(None) | Err(_) => return None,
+            Ok(None) | Err(_) => {
+                return (
+                    None,
+                    ModerationDebugInfo {
+                        local_model_source: Some("fasttext_model".to_string()),
+                        local_model_decision: Some("skipped".to_string()),
+                        ..Default::default()
+                    },
+                )
+            }
         },
         "hashlinear" => match hashlinear::predict_proba(text, profile) {
             Ok(Some(probability)) => (probability, "hashlinear_model"),
-            Ok(None) | Err(_) => return None,
+            Ok(None) | Err(_) => {
+                return (
+                    None,
+                    ModerationDebugInfo {
+                        local_model_source: Some("hashlinear_model".to_string()),
+                        local_model_decision: Some("skipped".to_string()),
+                        ..Default::default()
+                    },
+                )
+            }
         },
         _ => match bow::predict_proba(text, profile) {
             Ok(Some(probability)) => (probability, "bow_model"),
-            Ok(None) | Err(_) => return None,
+            Ok(None) | Err(_) => {
+                return (
+                    None,
+                    ModerationDebugInfo {
+                        local_model_source: Some("bow_model".to_string()),
+                        local_model_decision: Some("skipped".to_string()),
+                        ..Default::default()
+                    },
+                )
+            }
         },
     };
     let low = profile.config.probability.low_risk_threshold;
     let high = profile.config.probability.high_risk_threshold;
+    let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut debug = ModerationDebugInfo {
+        local_model_source: Some(source.to_string()),
+        local_model_confidence: Some(probability),
+        local_model_latency_ms: Some(latency_ms),
+        ..Default::default()
+    };
 
     if probability < low {
-        return Some(SmartModerationResult {
-            violation: false,
-            category: None,
-            reason: Some(format!("{source}: low risk (p={probability:.3})")),
-            source: source.to_string(),
-            confidence: Some(probability),
-        });
+        debug.local_model_decision = Some("allow".to_string());
+        return (
+            Some(SmartModerationResult {
+                violation: false,
+                category: None,
+                reason: Some(format!("{source}: low risk (p={probability:.3})")),
+                source: source.to_string(),
+                confidence: Some(probability),
+                debug: None,
+            }),
+            debug,
+        );
     }
     if probability > high {
-        return Some(SmartModerationResult {
-            violation: true,
-            category: None,
-            reason: Some(format!("{source}: high risk (p={probability:.3})")),
-            source: source.to_string(),
-            confidence: Some(probability),
-        });
+        debug.local_model_decision = Some("block".to_string());
+        return (
+            Some(SmartModerationResult {
+                violation: true,
+                category: None,
+                reason: Some(format!("{source}: high risk (p={probability:.3})")),
+                source: source.to_string(),
+                confidence: Some(probability),
+                debug: None,
+            }),
+            debug,
+        );
     }
-    None
+    debug.local_model_decision = Some("uncertain".to_string());
+    (None, debug)
 }
 
 async fn llm_moderate(
@@ -204,7 +272,7 @@ async fn llm_moderate(
     ) -> Result<SmartModerationResult, SmartModerationError> {
         let response = response
             .error_for_status()
-            .map_err(|err| SmartModerationError::Other(anyhow!(err)))?;
+            .map_err(|err| SmartModerationError::Other(anyhow!(err), None))?;
 
         let is_sse = response
             .headers()
@@ -216,19 +284,20 @@ async fn llm_moderate(
         if is_sse {
             let content = read_openai_chat_sse_content(response)
                 .await
-                .map_err(|err| SmartModerationError::Other(err))?;
+                .map_err(|err| SmartModerationError::Other(err, None))?;
             parse_moderation_content(&content)
         } else {
             let payload = response
                 .json::<Value>()
                 .await
-                .map_err(|err| SmartModerationError::Other(anyhow!(err)))?;
+                .map_err(|err| SmartModerationError::Other(anyhow!(err), None))?;
             parse_openai_moderation_response(payload)
         }
     }
 
     let mut attempted_models = Vec::new();
     let mut last_error = None;
+    let started = Instant::now();
     for _attempt in 0..=max_retries {
         let model = pick_model_for_attempt(&models, &attempted_models);
         attempted_models.push(model.clone());
@@ -248,18 +317,26 @@ async fn llm_moderate(
                 }))
                 .send()
                 .await
-                .map_err(|err| SmartModerationError::Other(anyhow!(err)))?;
+                .map_err(|err| SmartModerationError::Other(anyhow!(err), None))?;
 
             parse_llm_response(response).await
         })
         .await;
 
         match response {
-            Ok(Ok(parsed)) => return Ok(parsed),
+            Ok(Ok(mut parsed)) => {
+                parsed.debug = Some(ModerationDebugInfo {
+                    llm_reviewed: true,
+                    llm_result: Some(if parsed.violation { "block".to_string() } else { "allow".to_string() }),
+                    llm_latency_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
+                    ..Default::default()
+                });
+                return Ok(parsed);
+            }
             Ok(Err(err)) => {
                 let err = match err {
                     SmartModerationError::ConcurrencyLimit(message) => anyhow!(message),
-                    SmartModerationError::Other(err) => err,
+                    SmartModerationError::Other(err, _) => err,
                 };
                 last_error = Some(err.context("llm moderation request failed"));
             }
@@ -364,11 +441,43 @@ async fn run_ai_moderation_with_history(
     profile: &ModerationProfile,
     http_client: &Client,
     env_map: &HashMap<String, String>,
+    inherited_debug: Option<ModerationDebugInfo>,
 ) -> Result<SmartModerationResult, SmartModerationError> {
-    if let Some(result) = load_history_result(text, profile).await? {
+    if let Some(mut result) = load_history_result(text, profile).await? {
+        let mut debug = inherited_debug.unwrap_or_default();
+        debug.llm_reviewed = true;
+        debug.llm_result = Some(if result.violation {
+            "block".to_string()
+        } else {
+            "allow".to_string()
+        });
+        result.debug = Some(debug);
         return Ok(result);
     }
-    let result = llm_moderate(text, profile, http_client, env_map).await?;
+    let mut result = llm_moderate(text, profile, http_client, env_map).await.map_err(|err| {
+        let mut debug = inherited_debug.clone().unwrap_or_default();
+        debug.llm_reviewed = true;
+        debug.llm_result = Some("error".to_string());
+        debug.llm_error = Some(truncate_header_value(&match &err {
+            SmartModerationError::ConcurrencyLimit(message) => message.clone(),
+            SmartModerationError::Other(error, _) => format!("{error:#}"),
+        }));
+        match err {
+            SmartModerationError::ConcurrencyLimit(message) => {
+                SmartModerationError::Other(anyhow!(message), Some(debug))
+            }
+            SmartModerationError::Other(error, _) => SmartModerationError::Other(error, Some(debug)),
+        }
+    })?;
+    let mut debug = inherited_debug.unwrap_or_default();
+    let latency = result
+        .debug
+        .as_ref()
+        .and_then(|value| value.llm_latency_ms);
+    debug.llm_reviewed = true;
+    debug.llm_result = Some(if result.violation { "block".to_string() } else { "allow".to_string() });
+    debug.llm_latency_ms = latency;
+    result.debug = Some(debug);
     save_history_result(text, profile, &result).await?;
     Ok(result)
 }
@@ -410,10 +519,11 @@ async fn load_history_result(
                 .map(|created_at| format!("From DB: {created_at}")),
             source: "ai".to_string(),
             confidence: None,
+            debug: None,
         }))
     })
     .await
-    .map_err(|err| SmartModerationError::Other(anyhow!("history storage read task failed: {err}")))?
+    .map_err(|err| SmartModerationError::Other(anyhow!("history storage read task failed: {err}"), None))?
 }
 
 #[cfg(not(feature = "storage-debug"))]
@@ -442,7 +552,7 @@ async fn save_history_result(
         Ok(())
     })
     .await
-    .map_err(|err| SmartModerationError::Other(anyhow!("history storage write task failed: {err}")))?
+    .map_err(|err| SmartModerationError::Other(anyhow!("history storage write task failed: {err}"), None))?
 }
 
 #[cfg(not(feature = "storage-debug"))]
@@ -502,6 +612,7 @@ fn parse_moderation_content(
         reason: data.get("reason").and_then(Value::as_str).map(ToString::to_string),
         source: "ai".to_string(),
         confidence: data.get("confidence").and_then(Value::as_f64),
+        debug: None,
     })
 }
 
@@ -516,8 +627,9 @@ fn check_cache(profile_name: &str, text: &str) -> Option<SmartModerationResult> 
     let key = cache_key(text);
     let mut guard = cache.lock().expect("moderation cache");
     let profile_cache = guard.get_mut(profile_name)?;
-    let result = profile_cache.shift_remove(&key)?;
+    let mut result = profile_cache.shift_remove(&key)?;
     profile_cache.insert(key, result.clone());
+    result.debug = None;
     Some(result)
 }
 
@@ -532,10 +644,16 @@ fn save_cache(profile_name: &str, text: &str, result: &SmartModerationResult) {
         .entry(profile_name.to_string())
         .or_insert_with(IndexMap::new);
     profile_cache.shift_remove(&key);
-    profile_cache.insert(key, result.clone());
+    let mut cached = result.clone();
+    cached.debug = None;
+    profile_cache.insert(key, cached);
     while profile_cache.len() > CACHE_SIZE {
         profile_cache.shift_remove_index(0);
     }
+}
+
+fn truncate_header_value(value: &str) -> String {
+    value.chars().take(160).collect()
 }
 
 fn cache_key(text: &str) -> String {
@@ -639,6 +757,7 @@ mod tests {
             reason: Some("cached".to_string()),
             source: "ai".to_string(),
             confidence: Some(0.9),
+            debug: None,
         }
     }
 

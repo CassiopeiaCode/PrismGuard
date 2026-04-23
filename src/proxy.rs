@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::format::{process_request, RequestProcessError};
 use crate::moderation::{basic, extract, smart};
+use crate::moderation::smart::ModerationDebugInfo;
 use crate::response::maybe_transform_json_response;
 use crate::routes::{parse_url_config, ApiError, AppState};
 use crate::streaming::maybe_transform_sse;
@@ -121,6 +122,7 @@ async fn proxy_entry_with_cfg(
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let mut moderation_debug = HeaderMap::new();
     let moderation_context = if basic_mod_enabled || smart_mod_enabled {
         let moderation_format = request_plan
             .source_format
@@ -162,6 +164,7 @@ async fn proxy_entry_with_cfg(
         .await
         {
             Ok(Some(result)) if result.violation => {
+                moderation_debug = moderation_debug_headers(result.debug.as_ref());
                 return Err(ApiError::moderation_blocked(
                     smart_moderation_error_message(&result),
                     Some(moderation_format.as_str()),
@@ -171,19 +174,35 @@ async fn proxy_entry_with_cfg(
                         "category": result.category,
                         "confidence": result.confidence,
                     })),
-                ));
+                )
+                .with_extra_headers(moderation_debug));
             }
-            Ok(_) => {}
+            Ok(Some(result)) => {
+                moderation_debug = moderation_debug_headers(result.debug.as_ref());
+            }
+            Ok(None) => {}
             Err(smart::SmartModerationError::ConcurrencyLimit(message)) => {
+                let mut debug = HeaderMap::new();
+                debug.insert(
+                    HeaderName::from_static("x-prismguard-llm-reviewed"),
+                    HeaderValue::from_static("true"),
+                );
+                debug.insert(
+                    HeaderName::from_static("x-prismguard-llm-result"),
+                    HeaderValue::from_static("error"),
+                );
                 return Err(ApiError::moderation_blocked(
                     message,
                     Some(moderation_format.as_str()),
                     Some(json!({
                         "source": "concurrency_limit"
                     })),
-                ));
+                )
+                .with_extra_headers(debug));
             }
-            Err(smart::SmartModerationError::Other(err)) => return Err(ApiError::from(err)),
+            Err(smart::SmartModerationError::Other(err, debug)) => {
+                return Err(ApiError::from(err).with_extra_headers(moderation_debug_headers(debug.as_ref())));
+            }
         }
     }
     let is_stream = request_plan.stream;
@@ -247,6 +266,7 @@ async fn proxy_entry_with_cfg(
         request_plan.target_format,
         delay_stream_header,
         is_stream,
+        &moderation_debug,
     )
     .await
 }
@@ -335,6 +355,52 @@ fn filtered_request_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
+fn append_extra_headers(target: &mut HeaderMap, extra: &HeaderMap) {
+    for (name, value) in extra.iter() {
+        target.append(name.clone(), value.clone());
+    }
+}
+
+fn format_optional_f64(value: Option<f64>) -> Option<HeaderValue> {
+    value
+        .map(|value| format!("{value:.3}"))
+        .and_then(|value| HeaderValue::from_str(&value).ok())
+}
+
+fn moderation_debug_headers(debug: Option<&ModerationDebugInfo>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let Some(debug) = debug else {
+        return headers;
+    };
+
+    if let Some(value) = debug.local_model_source.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+        headers.insert(HeaderName::from_static("x-prismguard-local-model-source"), value);
+    }
+    if let Some(value) = debug.local_model_decision.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+        headers.insert(HeaderName::from_static("x-prismguard-local-model-decision"), value);
+    }
+    if let Some(value) = format_optional_f64(debug.local_model_confidence) {
+        headers.insert(HeaderName::from_static("x-prismguard-local-model-confidence"), value);
+    }
+    if let Some(value) = format_optional_f64(debug.local_model_latency_ms) {
+        headers.insert(HeaderName::from_static("x-prismguard-local-model-latency-ms"), value);
+    }
+    headers.insert(
+        HeaderName::from_static("x-prismguard-llm-reviewed"),
+        HeaderValue::from_static(if debug.llm_reviewed { "true" } else { "false" }),
+    );
+    if let Some(value) = debug.llm_result.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+        headers.insert(HeaderName::from_static("x-prismguard-llm-result"), value);
+    }
+    if let Some(value) = format_optional_f64(debug.llm_latency_ms) {
+        headers.insert(HeaderName::from_static("x-prismguard-llm-latency-ms"), value);
+    }
+    if let Some(value) = debug.llm_error.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+        headers.insert(HeaderName::from_static("x-prismguard-llm-error"), value);
+    }
+    headers
+}
+
 fn should_forward_planned_json(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::POST | Method::PUT | Method::DELETE)
 }
@@ -364,6 +430,7 @@ async fn build_proxy_response(
     upstream_format: Option<crate::format::RequestFormat>,
     delay_stream_header: bool,
     request_expects_stream: bool,
+    moderation_debug: &HeaderMap,
 ) -> Result<Response, ApiError> {
     let status = upstream_response.status();
     let upstream_content_type = upstream_response
@@ -383,7 +450,11 @@ async fn build_proxy_response(
 
     if treat_as_stream {
         if status != StatusCode::OK {
-            return build_response(status, &headers, boxed(Body::from(body)));
+            return build_response(
+                status,
+                &stream_success_headers(&headers, moderation_debug),
+                boxed(Body::from(body)),
+            );
         }
         if delay_stream_header {
             if let Some(message) = validate_stream_content(&body, upstream_format) {
@@ -397,13 +468,13 @@ async fn build_proxy_response(
         if let Some(transformed) = maybe_transform_sse(&body, upstream_format, client_format) {
             build_response(
                 status,
-                &stream_success_headers(&headers),
+                &stream_success_headers(&headers, moderation_debug),
                 boxed(Body::from(transformed)),
             )
         } else {
             build_response(
                 status,
-                &stream_success_headers(&headers),
+                &stream_success_headers(&headers, moderation_debug),
                 boxed(Body::from(body)),
             )
         }
@@ -441,7 +512,7 @@ async fn build_proxy_response(
                 })?;
                 return build_response(
                     status,
-                    &json_success_headers(),
+                    &json_success_headers(moderation_debug),
                     boxed(Body::from(encoded)),
                 );
             }
@@ -472,11 +543,15 @@ async fn build_proxy_response(
             })?;
             return build_response(
                 status,
-                &json_success_headers(),
+                &json_success_headers(moderation_debug),
                 boxed(Body::from(encoded)),
             );
         }
-        build_response(status, &headers, boxed(Body::from(body)))
+        build_response(
+            status,
+            &stream_success_headers(&headers, moderation_debug),
+            boxed(Body::from(body)),
+        )
     }
 }
 
@@ -512,22 +587,24 @@ fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap 
     out
 }
 
-fn json_success_headers() -> HeaderMap {
+fn json_success_headers(extra: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    append_extra_headers(&mut headers, extra);
     headers
 }
 
-fn stream_success_headers(headers: &HeaderMap) -> HeaderMap {
+fn stream_success_headers(headers: &HeaderMap, extra: &HeaderMap) -> HeaderMap {
     let mut headers = headers.clone();
     headers.remove(axum::http::header::CONTENT_TYPE);
     headers.insert(
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),
     );
+    append_extra_headers(&mut headers, extra);
     headers
 }
 
