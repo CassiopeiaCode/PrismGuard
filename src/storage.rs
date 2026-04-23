@@ -156,9 +156,9 @@ impl SampleStorage {
             return Vec::new();
         }
 
-        let target_per_label = usize::max(
-            usize::max(pass_samples.len(), violation_samples.len()),
+        let target_per_label = usize::min(
             max_samples / 2,
+            usize::max(pass_samples.len(), violation_samples.len()),
         );
         if target_per_label == 0 {
             return Vec::new();

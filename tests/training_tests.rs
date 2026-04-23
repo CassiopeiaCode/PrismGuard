@@ -2456,7 +2456,7 @@ fn sample_rpc_dispatches_balanced_random_duplicate_samples_with_real_storage() {
         SampleRpcRequest::LoadBalancedRandomDuplicateSamples {
             profile: "default".to_string(),
             db_path: rocks_dir.display().to_string(),
-            max_samples: 6,
+            max_samples: 4,
         },
     );
 
@@ -2465,7 +2465,7 @@ fn sample_rpc_dispatches_balanced_random_duplicate_samples_with_real_storage() {
         .as_array()
         .cloned()
         .expect("samples array");
-    assert_eq!(samples.len(), 6);
+    assert_eq!(samples.len(), 4);
 
     let pass_count = samples
         .iter()
@@ -2475,15 +2475,15 @@ fn sample_rpc_dispatches_balanced_random_duplicate_samples_with_real_storage() {
         .iter()
         .filter(|sample| sample["label"].as_i64() == Some(1))
         .count();
-    assert_eq!(pass_count, 3);
-    assert_eq!(violation_count, 3);
+    assert_eq!(pass_count, 2);
+    assert_eq!(violation_count, 2);
 
     let violation_ids = samples
         .iter()
         .filter(|sample| sample["label"].as_i64() == Some(1))
         .map(|sample| sample["id"].as_u64().expect("sample id"))
         .collect::<Vec<_>>();
-    assert_eq!(violation_ids.len(), 3);
+    assert_eq!(violation_ids.len(), 2);
     assert!(violation_ids.iter().all(|id| *id == 4));
 
     std::fs::remove_dir_all(&rocks_dir).expect("cleanup rocks dir");
