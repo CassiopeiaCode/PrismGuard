@@ -204,6 +204,30 @@ fn training_builds_sample_request_from_profile_strategy() {
     );
 }
 
+#[test]
+fn training_builds_sample_request_from_random_duplicate_strategy() {
+    let profile = write_profile(
+        &format!("training-request-random-duplicate-{}", std::process::id()),
+        json!({
+            "local_model_type": "hashlinear",
+            "hashlinear_training": {
+                "max_samples": 32,
+                "sample_loading": "random_duplicate"
+            }
+        }),
+    );
+
+    let request = build_training_sample_request(&profile).expect("build sample request");
+    assert_eq!(
+        request,
+        SampleRpcRequest::LoadBalancedRandomDuplicateSamples {
+            profile: profile.profile_name.clone(),
+            db_path: profile.history_rocks_path().display().to_string(),
+            max_samples: 32,
+        }
+    );
+}
+
 #[tokio::test]
 async fn training_fetches_samples_over_unix_socket() {
     let profile = write_profile(
@@ -2407,6 +2431,60 @@ fn sample_rpc_dispatches_balanced_random_samples_with_real_storage() {
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), 6);
+
+    std::fs::remove_dir_all(&rocks_dir).expect("cleanup rocks dir");
+}
+
+#[cfg(feature = "storage-debug")]
+#[test]
+fn sample_rpc_dispatches_balanced_random_duplicate_samples_with_real_storage() {
+    let rocks_dir = PathBuf::from(format!(
+        "/tmp/prismguard-sample-rpc-random-duplicate-{}",
+        std::process::id()
+    ));
+    seed_sample_db(
+        &rocks_dir,
+        &[
+            json!({"id": 1, "text": "pass-1", "label": 0, "category": null, "created_at": "2026-04-03 10:00:00"}),
+            json!({"id": 2, "text": "pass-2", "label": 0, "category": null, "created_at": "2026-04-03 10:01:00"}),
+            json!({"id": 3, "text": "pass-3", "label": 0, "category": null, "created_at": "2026-04-03 10:02:00"}),
+            json!({"id": 4, "text": "violation-1", "label": 1, "category": "unsafe", "created_at": "2026-04-03 10:03:00"}),
+        ],
+    );
+
+    let response = sample_rpc::dispatch_request_with_storage(
+        SampleRpcRequest::LoadBalancedRandomDuplicateSamples {
+            profile: "default".to_string(),
+            db_path: rocks_dir.display().to_string(),
+            max_samples: 6,
+        },
+    );
+
+    assert!(response.ok, "unexpected response: {response:?}");
+    let samples = response.result.expect("response result")["samples"]
+        .as_array()
+        .cloned()
+        .expect("samples array");
+    assert_eq!(samples.len(), 6);
+
+    let pass_count = samples
+        .iter()
+        .filter(|sample| sample["label"].as_i64() == Some(0))
+        .count();
+    let violation_count = samples
+        .iter()
+        .filter(|sample| sample["label"].as_i64() == Some(1))
+        .count();
+    assert_eq!(pass_count, 3);
+    assert_eq!(violation_count, 3);
+
+    let violation_ids = samples
+        .iter()
+        .filter(|sample| sample["label"].as_i64() == Some(1))
+        .map(|sample| sample["id"].as_u64().expect("sample id"))
+        .collect::<Vec<_>>();
+    assert_eq!(violation_ids.len(), 3);
+    assert!(violation_ids.iter().all(|id| *id == 4));
 
     std::fs::remove_dir_all(&rocks_dir).expect("cleanup rocks dir");
 }

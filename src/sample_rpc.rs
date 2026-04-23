@@ -50,6 +50,11 @@ pub enum SampleRpcRequest {
         db_path: String,
         max_samples: usize,
     },
+    LoadBalancedRandomDuplicateSamples {
+        profile: String,
+        db_path: String,
+        max_samples: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -185,6 +190,16 @@ pub fn dispatch_request_with_storage(request: SampleRpcRequest) -> SampleRpcResp
             Ok(serde_json::json!({
                 "samples": storage
                     .load_balanced_random_samples(*max_samples)
+                    .into_iter()
+                    .map(|sample| sample.value)
+                    .collect::<Vec<_>>()
+            }))
+        }
+        SampleRpcRequest::LoadBalancedRandomDuplicateSamples { db_path, max_samples, .. } => {
+            let storage = crate::storage::SampleStorage::open_read_only(db_path)?;
+            Ok(serde_json::json!({
+                "samples": storage
+                    .load_balanced_random_duplicate_samples(*max_samples)
                     .into_iter()
                     .map(|sample| sample.value)
                     .collect::<Vec<_>>()

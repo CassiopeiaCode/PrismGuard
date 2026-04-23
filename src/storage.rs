@@ -145,6 +145,31 @@ impl SampleStorage {
         self.shuffle_combined(pass_samples, violation_samples)
     }
 
+    pub fn load_balanced_random_duplicate_samples(&self, max_samples: usize) -> Vec<SampleRecord> {
+        if max_samples == 0 {
+            return Vec::new();
+        }
+
+        let pass_samples = self.load_samples_by_label(0, usize::MAX);
+        let violation_samples = self.load_samples_by_label(1, usize::MAX);
+        if pass_samples.is_empty() || violation_samples.is_empty() {
+            return Vec::new();
+        }
+
+        let target_per_label = usize::max(
+            usize::max(pass_samples.len(), violation_samples.len()),
+            max_samples / 2,
+        );
+        if target_per_label == 0 {
+            return Vec::new();
+        }
+
+        let pass_samples = self.expand_with_random_duplicates(pass_samples, target_per_label);
+        let violation_samples =
+            self.expand_with_random_duplicates(violation_samples, target_per_label);
+        self.shuffle_combined(pass_samples, violation_samples)
+    }
+
     pub fn load_balanced_samples(&self, max_samples: usize) -> Vec<SampleRecord> {
         if max_samples <= 0 {
             return Vec::new();
@@ -473,6 +498,29 @@ impl SampleStorage {
         shuffle_in_place(&mut samples);
         samples.truncate(take);
         samples
+    }
+
+    fn expand_with_random_duplicates(
+        &self,
+        samples: Vec<SampleRecord>,
+        target_size: usize,
+    ) -> Vec<SampleRecord> {
+        if samples.is_empty() || target_size == 0 {
+            return Vec::new();
+        }
+
+        let mut expanded = self.select_random(samples.clone(), usize::min(samples.len(), target_size));
+        if expanded.len() >= target_size {
+            return expanded;
+        }
+
+        let mut duplicate_pool = samples;
+        while expanded.len() < target_size {
+            shuffle_in_place(&mut duplicate_pool);
+            let remaining = target_size - expanded.len();
+            expanded.extend(duplicate_pool.iter().take(remaining).cloned());
+        }
+        expanded
     }
 
     fn shuffle_combined(

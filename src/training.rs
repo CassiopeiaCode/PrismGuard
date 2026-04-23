@@ -123,6 +123,11 @@ pub fn build_training_sample_request(profile: &ModerationProfile) -> Result<Samp
             db_path,
             max_samples,
         },
+        "random_duplicate" => SampleRpcRequest::LoadBalancedRandomDuplicateSamples {
+            profile: profile_name,
+            db_path,
+            max_samples,
+        },
         _ => SampleRpcRequest::LoadBalancedSamples {
             profile: profile_name,
             db_path,
