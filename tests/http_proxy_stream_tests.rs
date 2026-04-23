@@ -27,14 +27,16 @@ mod streaming;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header::CONTENT_TYPE, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
+use bytes::Bytes;
 use config::Settings;
+use futures_util::stream::{self, StreamExt};
 use format::RequestFormat;
 use routes::{router as proxy_router, AppState};
 use serde_json::json;
@@ -161,6 +163,40 @@ fn openai_chat_sse_can_transform_to_openai_responses_sse() {
     assert!(text.contains("\"input_tokens\":3"), "{text}");
     assert!(text.contains("\"output_tokens\":5"), "{text}");
     assert!(text.contains("[DONE]"), "{text}");
+}
+
+#[test]
+fn incremental_sse_transform_matches_whole_body_transform() {
+    let raw = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_inc\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_inc\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let whole = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiResponses),
+        Some(RequestFormat::OpenAiChat),
+    )
+    .expect("whole transform");
+
+    let mut incremental =
+        streaming::StreamTranscoder::new(RequestFormat::OpenAiResponses, RequestFormat::OpenAiChat);
+    let mut split = Vec::new();
+    let bytes = raw.as_bytes();
+    for chunk in bytes.chunks(17) {
+        split.extend(incremental.feed_chunk(chunk));
+    }
+    split.extend(incremental.flush());
+
+    assert_eq!(
+        String::from_utf8(split).expect("split utf8"),
+        String::from_utf8(whole).expect("whole utf8"),
+    );
 }
 
 #[tokio::test]
@@ -708,6 +744,134 @@ async fn responses_completed_event_emits_done_even_without_upstream_done_marker(
 }
 
 #[tokio::test]
+async fn passthrough_sse_starts_before_upstream_finishes() {
+    let upstream_base = spawn_delayed_sse_upstream(vec![
+        (0, "data: first\n\n"),
+        (250, "data: second\n\n"),
+        (250, "data: [DONE]\n\n"),
+    ])
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+
+    let (first_ms, total_ms, body) = measure_stream_timing(
+        &format!("{proxy_base}/${upstream_base}/v1/chat/completions"),
+        &json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+
+    assert!(body.contains("data: first"), "{body}");
+    assert!(body.contains("data: [DONE]"), "{body}");
+    assert!(
+        first_ms < total_ms.saturating_sub(150),
+        "expected first chunk well before stream end, first={first_ms} total={total_ms}"
+    );
+}
+
+#[tokio::test]
+async fn transformed_sse_starts_before_upstream_finishes() {
+    let upstream_base = spawn_delayed_responses_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses"
+        }
+    }).to_string());
+
+    let (first_ms, total_ms, body) = measure_stream_timing(
+        &format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"),
+        &json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+
+    assert!(body.contains("chat.completion.chunk"), "{body}");
+    assert!(body.contains("\"content\":\"hello\""), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
+    assert!(
+        first_ms < total_ms.saturating_sub(150),
+        "expected transformed stream to start before completion, first={first_ms} total={total_ms}"
+    );
+}
+
+#[tokio::test]
+async fn delay_stream_header_passthrough_still_starts_before_upstream_finishes() {
+    let upstream_base = spawn_delayed_sse_upstream(vec![
+        (0, "data: abc\n\n"),
+        (250, "data: def\n\n"),
+        (250, "data: [DONE]\n\n"),
+    ])
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let (first_ms, total_ms, body) = measure_stream_timing(
+        &format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"),
+        &json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+
+    assert!(body.contains("data: abc"), "{body}");
+    assert!(body.contains("data: [DONE]"), "{body}");
+    assert!(
+        first_ms < total_ms.saturating_sub(150),
+        "expected delayed-header passthrough to start before completion, first={first_ms} total={total_ms}"
+    );
+}
+
+#[tokio::test]
+async fn delay_stream_header_transformed_stream_still_starts_before_upstream_finishes() {
+    let upstream_base = spawn_delayed_responses_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let (first_ms, total_ms, body) = measure_stream_timing(
+        &format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"),
+        &json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+
+    assert!(body.contains("chat.completion.chunk"), "{body}");
+    assert!(body.contains("\"content\":\"hello\""), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
+    assert!(
+        first_ms < total_ms.saturating_sub(150),
+        "expected delayed-header transformed stream to start before completion, first={first_ms} total={total_ms}"
+    );
+}
+
+#[tokio::test]
 async fn responses_function_call_events_map_to_chat_tool_call_deltas() {
     let upstream_base = spawn_tool_call_sse_upstream().await;
     let proxy_base = spawn_proxy_server().await;
@@ -1210,6 +1374,64 @@ async fn spawn_large_unrecognized_sse_upstream() -> String {
     spawn_raw_sse_upstream(leaked).await
 }
 
+async fn spawn_delayed_sse_upstream(chunks: Vec<(u64, &'static str)>) -> String {
+    let app = Router::new().route(
+        "/*path",
+        post(move || {
+            let chunks = chunks.clone();
+            async move {
+                let stream = stream::iter(chunks.into_iter()).then(|(delay_ms, chunk)| async move {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(chunk.as_bytes()))
+                });
+
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::wrap_stream(stream))
+                    .expect("delayed sse response")
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind delayed sse upstream");
+    let addr = listener.local_addr().expect("delayed sse upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("delayed sse upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_delayed_responses_sse_upstream() -> String {
+    spawn_delayed_sse_upstream(vec![
+        (
+            0,
+            "event: response.created\n\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_delayed\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        ),
+        (
+            250,
+            "event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"item_id\":\"msg_delayed\",\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        ),
+        (
+            250,
+            "event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_delayed\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n",
+        ),
+        (250, "data: [DONE]\n\n"),
+    ])
+    .await
+}
+
 async fn spawn_raw_sse_upstream(body: &'static str) -> String {
     spawn_status_sse_upstream(StatusCode::OK, body).await
 }
@@ -1684,4 +1906,43 @@ fn test_settings() -> Settings {
 
 fn percent_encode(input: &str) -> String {
     url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
+}
+
+async fn measure_stream_timing(url: &str, body: &serde_json::Value) -> (u128, u128, String) {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client")
+        .post(url)
+        .json(body)
+        .send()
+        .await
+        .expect("stream response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let started = Instant::now();
+    let mut first_ms = None;
+    let mut body_bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("stream chunk");
+        if first_ms.is_none() {
+            first_ms = Some(started.elapsed().as_millis());
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    (
+        first_ms.expect("first chunk time"),
+        started.elapsed().as_millis(),
+        String::from_utf8(body_bytes).expect("utf8 body"),
+    )
 }

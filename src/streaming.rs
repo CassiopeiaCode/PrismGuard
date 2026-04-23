@@ -17,7 +17,9 @@ pub fn maybe_transform_sse(
     }
 
     let mut transcoder = StreamTranscoder::new(from_format, to_format);
-    Some(transcoder.feed(raw))
+    let mut out = transcoder.feed_chunk(raw);
+    out.extend(transcoder.flush());
+    Some(out)
 }
 
 #[derive(Debug, Clone)]
@@ -59,29 +61,41 @@ trait InternalSink {
     fn on_done(&mut self) -> Vec<Vec<u8>>;
 }
 
-struct StreamTranscoder {
+pub struct StreamTranscoder {
     from_format: RequestFormat,
     sink: Box<dyn InternalSink>,
     meta: Map<String, Value>,
     started: bool,
     seen_tool_calls: HashMap<String, Map<String, Value>>,
+    pending: Vec<u8>,
 }
 
 impl StreamTranscoder {
-    fn new(from_format: RequestFormat, to_format: RequestFormat) -> Self {
+    pub fn new(from_format: RequestFormat, to_format: RequestFormat) -> Self {
         Self {
             from_format,
             sink: create_sink(to_format),
             meta: Map::new(),
             started: false,
             seen_tool_calls: HashMap::new(),
+            pending: Vec::new(),
         }
     }
 
-    fn feed(&mut self, raw: &[u8]) -> Vec<u8> {
-        let text = String::from_utf8_lossy(raw);
+    pub fn feed_chunk(&mut self, raw: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(raw);
         let mut out = Vec::new();
-        for frame in parse_sse_frames(&text) {
+        for frame in take_complete_sse_frames(&mut self.pending) {
+            for event in self.decode_frame(frame) {
+                out.extend(self.emit_internal_event(event));
+            }
+        }
+        out.concat()
+    }
+
+    pub fn flush(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for frame in take_trailing_sse_frames(&mut self.pending) {
             for event in self.decode_frame(frame) {
                 out.extend(self.emit_internal_event(event));
             }
@@ -671,6 +685,47 @@ fn parse_sse_frames(text: &str) -> Vec<SseFrame> {
         });
     }
     frames
+}
+
+fn take_complete_sse_frames(pending: &mut Vec<u8>) -> Vec<SseFrame> {
+    let mut frames = Vec::new();
+
+    while let Some(end) = find_sse_frame_end(pending) {
+        let frame_bytes = pending.drain(..end).collect::<Vec<_>>();
+        let text = String::from_utf8_lossy(&frame_bytes);
+        frames.extend(parse_sse_frames(&text));
+    }
+
+    frames
+}
+
+fn take_trailing_sse_frames(pending: &mut Vec<u8>) -> Vec<SseFrame> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+
+    let frame_bytes = std::mem::take(pending);
+    let text = String::from_utf8_lossy(&frame_bytes);
+    parse_sse_frames(&text)
+}
+
+fn find_sse_frame_end(buffer: &[u8]) -> Option<usize> {
+    let mut idx = 0;
+    while idx < buffer.len() {
+        if idx + 1 < buffer.len() && buffer[idx] == b'\n' && buffer[idx + 1] == b'\n' {
+            return Some(idx + 2);
+        }
+        if idx + 3 < buffer.len()
+            && buffer[idx] == b'\r'
+            && buffer[idx + 1] == b'\n'
+            && buffer[idx + 2] == b'\r'
+            && buffer[idx + 3] == b'\n'
+        {
+            return Some(idx + 4);
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn decode_to_internal(
