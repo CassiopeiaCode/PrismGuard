@@ -794,20 +794,39 @@ fn estimate_tokens_from_text(text: &str) -> Option<i64> {
         return None;
     }
 
-    let mut estimate = 0_i64;
+    let mut ascii_chars = 0.0_f64;
+    let mut cjk_chars = 0.0_f64;
+    let mut spaces = 0.0_f64;
+
     for ch in trimmed.chars() {
-        if ch.is_ascii_whitespace() {
-            continue;
-        }
-        if ch.is_ascii() {
-            estimate += 1;
+        if ch.is_whitespace() {
+            spaces += 1.0;
+        } else if is_cjk_character(ch) {
+            cjk_chars += 1.0;
+        } else if ch.is_ascii() {
+            ascii_chars += 1.0;
         } else {
-            estimate += 2;
+            ascii_chars += 1.0;
         }
     }
 
-    let estimated_tokens = ((estimate + 3) / 4).max(1);
-    Some(estimated_tokens)
+    let estimated_tokens = (0.28 * ascii_chars + 1.4 * cjk_chars + 0.15 * spaces + 4.0).ceil() as i64;
+    Some(estimated_tokens.max(1))
+}
+
+fn is_cjk_character(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+            | 0x2CEB0..=0x2EBEF
+            | 0x30000..=0x3134F
+    )
 }
 
 async fn collect_stream_bytes(
