@@ -16,7 +16,7 @@ pub fn maybe_transform_sse(
         return None;
     }
 
-    let mut transcoder = StreamTranscoder::new(from_format, to_format);
+    let mut transcoder = StreamTranscoder::new(from_format, to_format, None);
     let mut out = transcoder.feed_chunk(raw);
     out.extend(transcoder.flush());
     Some(out)
@@ -71,11 +71,26 @@ pub struct StreamTranscoder {
 }
 
 impl StreamTranscoder {
-    pub fn new(from_format: RequestFormat, to_format: RequestFormat) -> Self {
+    pub fn new(
+        from_format: RequestFormat,
+        to_format: RequestFormat,
+        estimated_prompt_tokens: Option<i64>,
+    ) -> Self {
+        let mut meta = Map::new();
+        if let Some(tokens) = estimated_prompt_tokens.filter(|tokens| *tokens > 0) {
+            meta.insert(
+                "usage".to_string(),
+                json!({
+                    "prompt_tokens": tokens,
+                    "completion_tokens": 0,
+                    "total_tokens": tokens
+                }),
+            );
+        }
         Self {
             from_format,
             sink: create_sink(to_format),
-            meta: Map::new(),
+            meta,
             started: false,
             seen_tool_calls: HashMap::new(),
             pending: Vec::new(),
@@ -491,6 +506,10 @@ impl InternalSink for ClaudeSink {
             return Vec::new();
         }
         self.started = true;
+        let usage = meta
+            .get("usage")
+            .and_then(chat_usage_to_claude_stream_usage)
+            .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0}));
         vec![encode_json_sse_with_event(
             &json!({
                 "type": "message_start",
@@ -498,7 +517,8 @@ impl InternalSink for ClaudeSink {
                     "id": self.id,
                     "model": self.model,
                     "role": "assistant",
-                    "content": []
+                    "content": [],
+                    "usage": usage
                 }
             }),
             "message_start",
@@ -559,9 +579,8 @@ impl InternalSink for ClaudeSink {
             _ => "end_turn",
         };
         let usage_obj = usage
-            .and_then(|usage| usage.get("output_tokens").cloned())
-            .map(|output_tokens| json!({"output_tokens": output_tokens}))
-            .unwrap_or_else(|| json!({"output_tokens": 0}));
+            .and_then(chat_usage_to_claude_stream_usage)
+            .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0}));
         vec![
             encode_json_sse_with_event(
                 &json!({
@@ -768,6 +787,9 @@ fn decode_openai_chat(
     } else {
         meta.entry("created".to_string())
             .or_insert_with(|| json!(now_timestamp()));
+    }
+    if let Some(usage) = event.get("usage").cloned() {
+        meta.insert("usage".to_string(), usage);
     }
 
     let mut out = vec![InternalEvent::Start { meta: meta.clone() }];
@@ -1277,6 +1299,17 @@ fn chat_usage_to_responses_usage(usage: &Value) -> Option<Value> {
         "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or_else(|| usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0))),
         "output_tokens": usage.get("completion_tokens").cloned().unwrap_or_else(|| usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0))),
         "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0)),
+    }))
+}
+
+fn chat_usage_to_claude_stream_usage(usage: &Value) -> Option<Value> {
+    let usage = usage.as_object()?;
+    let prompt_details = usage.get("prompt_tokens_details").and_then(Value::as_object);
+    Some(json!({
+        "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or_else(|| usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0))),
+        "output_tokens": usage.get("completion_tokens").cloned().unwrap_or_else(|| usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0))),
+        "cache_creation_input_tokens": prompt_details.and_then(|details| details.get("cached_creation_tokens").cloned()).unwrap_or_else(|| json!(0)),
+        "cache_read_input_tokens": prompt_details.and_then(|details| details.get("cached_tokens").cloned()).unwrap_or_else(|| json!(0)),
     }))
 }
 

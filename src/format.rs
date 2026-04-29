@@ -53,6 +53,7 @@ struct InternalRequest {
     stream: bool,
     tools: Vec<InternalTool>,
     tool_choice: Option<Value>,
+    thinking: Option<Value>,
     extra: Map<String, Value>,
 }
 
@@ -480,6 +481,7 @@ fn parse_openai_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         tools,
         tool_choice: body.get("tool_choice").cloned(),
+        thinking: None,
         extra: filter_keys(body, &["messages", "model", "stream", "tools", "tool_choice"]),
     })
 }
@@ -615,7 +617,8 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         tools: parse_claude_tools(body.get("tools")),
         tool_choice: body.get("tool_choice").cloned(),
-        extra: filter_keys(body, &["system", "messages", "model", "stream", "tools", "tool_choice"]),
+        thinking: body.get("thinking").cloned(),
+        extra: filter_keys(body, &["system", "messages", "model", "stream", "tools", "tool_choice", "thinking"]),
     })
 }
 
@@ -683,7 +686,8 @@ fn parse_claude_code(body: &Map<String, Value>) -> Result<InternalRequest> {
         stream: false,
         tools: Vec::new(),
         tool_choice: options.get("tool_choice").cloned(),
-        extra: filter_keys(&options, &["model", "systemPrompt", "mcpServers", "tool_choice"]),
+        thinking: options.get("thinking").cloned(),
+        extra: filter_keys(&options, &["model", "systemPrompt", "mcpServers", "tool_choice", "thinking"]),
     })
 }
 
@@ -762,6 +766,7 @@ fn parse_openai_responses(body: &Map<String, Value>) -> Result<InternalRequest> 
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         tools: parse_responses_tools(body.get("tools")),
         tool_choice: body.get("tool_choice").cloned(),
+        thinking: None,
         extra,
     })
 }
@@ -1049,6 +1054,7 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
         stream: path.contains("streamGenerateContent"),
         tools: parse_gemini_tools(body.get("tools")),
         tool_choice: body.get("toolConfig").cloned(),
+        thinking: None,
         extra,
     })
 }
@@ -1085,6 +1091,9 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
     }
     if let Some(tool_choice) = &req.tool_choice {
         body.insert("tool_choice".to_string(), tool_choice.clone());
+    }
+    if let Some(reasoning) = normalize_claude_thinking_for_openai(req.thinking.as_ref()) {
+        body.insert("reasoning".to_string(), reasoning);
     }
     body.extend(req.extra.clone());
     Value::Object(body)
@@ -1165,6 +1174,9 @@ fn emit_openai_responses(req: &InternalRequest) -> Value {
             "tool_choice".to_string(),
             normalize_tool_choice_for_openai_responses(tool_choice),
         );
+    }
+    if let Some(reasoning) = normalize_claude_thinking_for_openai(req.thinking.as_ref()) {
+        body.insert("reasoning".to_string(), reasoning);
     }
     Value::Object(body)
 }
@@ -1282,6 +1294,7 @@ fn strip_tools(req: InternalRequest) -> InternalRequest {
         stream: req.stream,
         tools: Vec::new(),
         tool_choice: None,
+        thinking: req.thinking,
         extra: req.extra,
     }
 }
@@ -1678,6 +1691,17 @@ fn normalize_tool_choice_for_openai_responses(tool_choice: &Value) -> Value {
     }
 }
 
+fn normalize_claude_thinking_for_openai(thinking: Option<&Value>) -> Option<Value> {
+    let thinking = thinking?.as_object()?;
+    match thinking.get("type").and_then(Value::as_str) {
+        Some("enabled") => {
+            let budget_tokens = thinking.get("budget_tokens").and_then(Value::as_i64)?;
+            Some(json!({"max_tokens": budget_tokens}))
+        }
+        _ => None,
+    }
+}
+
 fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<String, Value> {
     if extra.is_empty() {
         return Map::new();
@@ -1933,5 +1957,55 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn transforms_claude_thinking_into_openai_chat_reasoning() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        });
+        let body = json!({
+            "model": "gpt-4.1-mini",
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 2048
+            },
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let plan = process_request(&config, "/v1/messages", &[], body).expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+        assert_eq!(plan.body.get("thinking"), None);
+        assert_eq!(plan.body.get("reasoning"), Some(&json!({"max_tokens": 2048})));
+    }
+
+    #[test]
+    fn transforms_claude_thinking_into_openai_responses_reasoning() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_responses"
+            }
+        });
+        let body = json!({
+            "model": "gpt-4.1-mini",
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 1024
+            },
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let plan = process_request(&config, "/v1/messages", &[], body).expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiResponses));
+        assert_eq!(plan.body.get("thinking"), None);
+        assert_eq!(plan.body.get("reasoning"), Some(&json!({"max_tokens": 1024})));
     }
 }

@@ -108,6 +108,10 @@ async fn proxy_entry_with_cfg(
                 }
             }
         })?;
+    let estimated_prompt_tokens = estimate_prompt_tokens_for_stream(
+        request_plan.target_format.or(request_plan.source_format),
+        &request_plan.body,
+    );
     let basic_mod_cfg = parsed
         .config
         .get("basic_moderation")
@@ -271,6 +275,7 @@ async fn proxy_entry_with_cfg(
         request_plan.target_format,
         delay_stream_header,
         is_stream,
+        estimated_prompt_tokens,
         &moderation_debug,
     )
     .await
@@ -435,6 +440,7 @@ async fn build_proxy_response(
     upstream_format: Option<crate::format::RequestFormat>,
     delay_stream_header: bool,
     request_expects_stream: bool,
+    estimated_prompt_tokens: Option<i64>,
     moderation_debug: &HeaderMap,
 ) -> Result<Response, ApiError> {
     let headers = filtered_response_headers(upstream_response.headers());
@@ -446,6 +452,7 @@ async fn build_proxy_response(
             upstream_format,
             delay_stream_header,
             header_says_stream,
+            estimated_prompt_tokens,
             &headers,
             moderation_debug,
         )
@@ -471,6 +478,7 @@ async fn build_streaming_proxy_response(
     upstream_format: Option<crate::format::RequestFormat>,
     delay_stream_header: bool,
     header_says_stream: bool,
+    estimated_prompt_tokens: Option<i64>,
     headers: &HeaderMap,
     moderation_debug: &HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -568,6 +576,7 @@ async fn build_streaming_proxy_response(
             upstream,
             upstream_format.expect("upstream format for transformed stream"),
             client_format.expect("client format for transformed stream"),
+            estimated_prompt_tokens,
         )
     } else {
         build_passthrough_stream_body(buffered, upstream)
@@ -708,6 +717,7 @@ fn build_transformed_stream_body(
     upstream: ReqByteStream,
     from_format: crate::format::RequestFormat,
     to_format: crate::format::RequestFormat,
+    estimated_prompt_tokens: Option<i64>,
 ) -> BoxBody {
     struct TransformState {
         buffered: VecDeque<Bytes>,
@@ -720,7 +730,7 @@ fn build_transformed_stream_body(
     let state = TransformState {
         buffered: VecDeque::from(buffered),
         upstream,
-        transcoder: StreamTranscoder::new(from_format, to_format),
+        transcoder: StreamTranscoder::new(from_format, to_format, estimated_prompt_tokens),
         ready: VecDeque::new(),
         flushed: false,
     };
@@ -766,6 +776,38 @@ fn build_transformed_stream_body(
     });
 
     boxed(Body::wrap_stream(stream))
+}
+
+fn estimate_prompt_tokens_for_stream(
+    format: Option<crate::format::RequestFormat>,
+    body: &Value,
+) -> Option<i64> {
+    let format = format?;
+    let request_format = format.as_str();
+    let text = extract::extract_text_for_moderation(body, request_format);
+    estimate_tokens_from_text(&text)
+}
+
+fn estimate_tokens_from_text(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut estimate = 0_i64;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_whitespace() {
+            continue;
+        }
+        if ch.is_ascii() {
+            estimate += 1;
+        } else {
+            estimate += 2;
+        }
+    }
+
+    let estimated_tokens = ((estimate + 3) / 4).max(1);
+    Some(estimated_tokens)
 }
 
 async fn collect_stream_bytes(

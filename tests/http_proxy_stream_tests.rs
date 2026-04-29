@@ -93,11 +93,11 @@ async fn openai_responses_sse_is_transformed_back_to_openai_chat_sse() {
 fn claude_sse_can_transform_to_openai_chat_sse() {
     let raw = concat!(
         "event: message_start\n",
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
         "event: content_block_delta\n",
         "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
         "event: message_delta\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":7}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":3,\"output_tokens\":7,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":1}}\n\n",
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n\n"
     );
@@ -114,7 +114,72 @@ fn claude_sse_can_transform_to_openai_chat_sse() {
     assert!(text.contains("\"role\":\"assistant\""), "{text}");
     assert!(text.contains("\"content\":\"hello\""), "{text}");
     assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+    assert!(text.contains("\"usage\":{\"input_tokens\":3,\"output_tokens\":7"), "{text}");
     assert!(text.contains("[DONE]"), "{text}");
+}
+
+#[test]
+fn openai_chat_sse_emits_claude_message_start_usage_and_final_usage() {
+    let raw = concat!(
+        "data: {\"id\":\"chatcmpl_usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":0,\"total_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":1,\"cached_creation_tokens\":2}}}\n\n",
+        "data: {\"id\":\"chatcmpl_usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8,\"prompt_tokens_details\":{\"cached_tokens\":1,\"cached_creation_tokens\":2}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiChat),
+        Some(RequestFormat::ClaudeChat),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(
+        text.contains("\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl_usage\",\"model\":\"gpt-4.1-mini\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":1"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn claude_stream_message_start_uses_estimated_prompt_tokens_when_upstream_usage_is_missing() {
+    let upstream_base = spawn_openai_chat_no_initial_usage_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "claude_chat",
+            "to": "openai_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/messages"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello world from claude"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"type\":\"message_start\""), "{body}");
+    assert!(body.contains("\"usage\":{\"input_tokens\":"), "{body}");
+    assert!(
+        !body.contains("\"usage\":{\"input_tokens\":0,\"output_tokens\":0}"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -185,7 +250,7 @@ fn incremental_sse_transform_matches_whole_body_transform() {
     .expect("whole transform");
 
     let mut incremental =
-        streaming::StreamTranscoder::new(RequestFormat::OpenAiResponses, RequestFormat::OpenAiChat);
+        streaming::StreamTranscoder::new(RequestFormat::OpenAiResponses, RequestFormat::OpenAiChat, None);
     let mut split = Vec::new();
     let bytes = raw.as_bytes();
     for chunk in bytes.chunks(17) {
@@ -1815,6 +1880,43 @@ async fn spawn_usage_shape_sse_upstream() -> String {
             .serve(app.into_make_service())
             .await
             .expect("usage shape upstream server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    format!("http://{}", addr)
+}
+
+async fn spawn_openai_chat_no_initial_usage_sse_upstream() -> String {
+    let payload = concat!(
+        "data: {\"id\":\"chatcmpl_no_usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_no_usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_no_usage\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":5,\"total_tokens\":11}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let app = Router::new().route(
+        "/*path",
+        post(move || async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(payload.to_string()))
+                .expect("chat no initial usage sse response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind chat no initial usage upstream");
+    let addr = listener
+        .local_addr()
+        .expect("chat no initial usage upstream addr");
+    tokio::spawn(async move {
+        axum::Server::from_tcp(listener.into_std().expect("std listener"))
+            .expect("server from tcp")
+            .serve(app.into_make_service())
+            .await
+            .expect("chat no initial usage upstream server");
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
