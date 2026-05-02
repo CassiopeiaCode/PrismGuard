@@ -492,6 +492,14 @@ struct ClaudeSink {
     id: String,
     model: String,
     started: bool,
+    next_index: usize,
+    active_block: Option<ClaudeActiveBlock>,
+}
+
+#[derive(Clone)]
+enum ClaudeActiveBlock {
+    Text { index: usize },
+    Tool { index: usize, call_id: String },
 }
 
 impl InternalSink for ClaudeSink {
@@ -515,6 +523,7 @@ impl InternalSink for ClaudeSink {
                 "type": "message_start",
                 "message": {
                     "id": self.id,
+                    "type": "message",
                     "model": self.model,
                     "role": "assistant",
                     "content": [],
@@ -529,22 +538,71 @@ impl InternalSink for ClaudeSink {
         if text.is_empty() {
             return Vec::new();
         }
-        vec![encode_json_sse_with_event(
+        let mut out = Vec::new();
+        let index = match self.active_block.as_ref() {
+            Some(ClaudeActiveBlock::Text { index }) => *index,
+            Some(ClaudeActiveBlock::Tool { .. }) => {
+                out.extend(self.close_active_block());
+                let index = self.next_index;
+                self.next_index += 1;
+                self.active_block = Some(ClaudeActiveBlock::Text { index });
+                out.push(encode_json_sse_with_event(
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "text",
+                            "text": ""
+                        }
+                    }),
+                    "content_block_start",
+                ));
+                index
+            }
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.active_block = Some(ClaudeActiveBlock::Text { index });
+                out.push(encode_json_sse_with_event(
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "text",
+                            "text": ""
+                        }
+                    }),
+                    "content_block_start",
+                ));
+                index
+            }
+        };
+        out.push(encode_json_sse_with_event(
             &json!({
                 "type": "content_block_delta",
+                "index": index,
                 "delta": {
                     "type": "text_delta",
                     "text": text
                 }
             }),
             "content_block_delta",
-        )]
+        ));
+        out
     }
 
     fn on_tool_call_start(&mut self, call_id: &str, name: &str) -> Vec<Vec<u8>> {
-        vec![encode_json_sse_with_event(
+        let mut out = self.close_active_block();
+        let index = self.next_index;
+        self.next_index += 1;
+        self.active_block = Some(ClaudeActiveBlock::Tool {
+            index,
+            call_id: call_id.to_string(),
+        });
+        out.push(encode_json_sse_with_event(
             &json!({
                 "type": "content_block_start",
+                "index": index,
                 "content_block": {
                     "type": "tool_use",
                     "id": call_id,
@@ -553,16 +611,24 @@ impl InternalSink for ClaudeSink {
                 }
             }),
             "content_block_start",
-        )]
+        ));
+        out
     }
 
     fn on_tool_call_args_delta(&mut self, _call_id: &str, _name: &str, delta: &str) -> Vec<Vec<u8>> {
         if delta.is_empty() {
             return Vec::new();
         }
+        let Some(ClaudeActiveBlock::Tool { index, call_id }) = self.active_block.as_ref() else {
+            return Vec::new();
+        };
+        if call_id != _call_id {
+            return Vec::new();
+        }
         vec![encode_json_sse_with_event(
             &json!({
                 "type": "content_block_delta",
+                "index": index,
                 "delta": {
                     "type": "input_json_delta",
                     "partial_json": delta
@@ -581,21 +647,39 @@ impl InternalSink for ClaudeSink {
         let usage_obj = usage
             .and_then(chat_usage_to_claude_stream_usage)
             .unwrap_or_else(|| json!({"input_tokens": 0, "output_tokens": 0}));
-        vec![
-            encode_json_sse_with_event(
-                &json!({
-                    "type": "message_delta",
-                    "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
-                    "usage": usage_obj
-                }),
-                "message_delta",
-            ),
-            encode_json_sse_with_event(&json!({"type": "message_stop"}), "message_stop"),
-        ]
+        let mut out = self.close_active_block();
+        out.push(encode_json_sse_with_event(
+            &json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+                "usage": usage_obj
+            }),
+            "message_delta",
+        ));
+        out.push(encode_json_sse_with_event(&json!({"type": "message_stop"}), "message_stop"));
+        out
     }
 
     fn on_done(&mut self) -> Vec<Vec<u8>> {
         vec![encode_sse("[DONE]", None)]
+    }
+}
+
+impl ClaudeSink {
+    fn close_active_block(&mut self) -> Vec<Vec<u8>> {
+        let Some(active) = self.active_block.take() else {
+            return Vec::new();
+        };
+        let index = match active {
+            ClaudeActiveBlock::Text { index } | ClaudeActiveBlock::Tool { index, .. } => index,
+        };
+        vec![encode_json_sse_with_event(
+            &json!({
+                "type": "content_block_stop",
+                "index": index
+            }),
+            "content_block_stop",
+        )]
     }
 }
 
