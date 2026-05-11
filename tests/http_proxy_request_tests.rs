@@ -58,6 +58,22 @@ struct UpstreamState {
     seen: Arc<Mutex<Vec<SeenRequest>>>,
 }
 
+fn local_profile_dir_or_skip(profile_name: &str) -> Option<PathBuf> {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        eprintln!(
+            "skipping local-profile integration test on GitHub Actions: {profile_name}"
+        );
+        return None;
+    }
+
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    Some(profile_dir)
+}
+
 #[tokio::test]
 async fn compressed_json_request_is_decoded_and_preserves_upstream_prefix() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
@@ -412,11 +428,9 @@ async fn root_path_without_proxy_config_returns_config_parse_error() {
 #[tokio::test]
 async fn debug_profile_exposes_training_and_model_status() {
     let profile_name = format!("debug-profile-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     std::fs::write(
         profile_dir.join("profile.json"),
         json!({
@@ -468,11 +482,9 @@ async fn debug_profile_exposes_training_and_model_status() {
 #[tokio::test]
 async fn debug_profile_hashlinear_runtime_only_is_not_treated_as_local_model() {
     let profile_name = format!("debug-profile-hashlinear-runtime-only-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     std::fs::write(
         profile_dir.join("profile.json"),
         json!({
@@ -682,11 +694,9 @@ async fn basic_moderation_ignores_tool_role_content_like_python() {
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
     let profile_name = format!("smart-llm-fallback-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
@@ -807,11 +817,9 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_and_allows_clean_request() {
     let profile_name = format!("smart-llm-allow-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
@@ -888,11 +896,9 @@ async fn smart_moderation_falls_back_to_llm_and_allows_clean_request() {
 #[tokio::test]
 async fn smart_moderation_returns_concurrency_limit_like_python() {
     let profile_name = format!("smart-llm-concurrency-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_delayed_openai_chat_server(
         json!({
@@ -1005,11 +1011,9 @@ async fn smart_moderation_returns_concurrency_limit_like_python() {
 #[tokio::test]
 async fn smart_moderation_uses_local_hashlinear_runtime_before_llm() {
     let profile_name = format!("smart-hashlinear-local-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -1083,11 +1087,9 @@ async fn smart_moderation_uses_local_hashlinear_runtime_before_llm() {
 #[tokio::test]
 async fn smart_moderation_hashlinear_runtime_only_falls_back_to_llm_like_python() {
     let profile_name = format!("smart-hashlinear-runtime-only-{}", unique_test_suffix());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
@@ -1173,11 +1175,9 @@ async fn smart_moderation_hashlinear_runtime_only_falls_back_to_llm_like_python(
 #[tokio::test]
 async fn smart_moderation_uses_local_bow_runtime_before_llm() {
     let profile_name = format!("smart-bow-local-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -1252,11 +1252,9 @@ async fn smart_moderation_uses_local_bow_runtime_before_llm() {
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
     let profile_name = format!("smart-bow-fallback-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
@@ -1341,11 +1339,9 @@ async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
 #[tokio::test]
 async fn smart_moderation_uses_local_fasttext_runtime_before_llm() {
     let profile_name = format!("smart-fasttext-local-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -1418,11 +1414,9 @@ async fn smart_moderation_uses_local_fasttext_runtime_before_llm() {
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_fasttext_runtime_is_missing() {
     let profile_name = format!("smart-fasttext-fallback-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
@@ -1509,11 +1503,9 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_runtime_is_missing() {
 #[tokio::test]
 async fn smart_moderation_allows_low_risk_local_bow_without_llm() {
     let profile_name = format!("smart-bow-allow-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -1580,11 +1572,9 @@ async fn smart_moderation_allows_low_risk_local_bow_without_llm() {
 #[tokio::test]
 async fn smart_moderation_allows_low_risk_local_fasttext_without_llm() {
     let profile_name = format!("smart-fasttext-allow-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -1654,11 +1644,9 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_low_thre
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = -1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -1742,11 +1730,9 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_hig
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = 1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -1829,11 +1815,9 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_high_thr
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = 1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -1917,11 +1901,9 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_low
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = -1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -2004,11 +1986,9 @@ async fn smart_moderation_blocks_with_ai_details_when_bow_probability_equals_hig
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = 1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -2102,11 +2082,9 @@ async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equal
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = -1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -2194,11 +2172,9 @@ async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equal
 #[tokio::test]
 async fn smart_moderation_allows_low_risk_local_hashlinear_without_llm() {
     let profile_name = format!("smart-hashlinear-allow-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -2265,11 +2241,9 @@ async fn smart_moderation_allows_low_risk_local_hashlinear_without_llm() {
 #[tokio::test]
 async fn smart_moderation_falls_back_to_llm_when_hashlinear_is_uncertain() {
     let profile_name = format!("smart-hashlinear-uncertain-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
@@ -2356,11 +2330,9 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_l
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = -1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -2443,11 +2415,9 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_h
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = 1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -2530,11 +2500,9 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = -1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -2629,11 +2597,9 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
         std::process::id(),
         unique_test_suffix()
     );
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
     let boundary_intercept = 1.3862944_f32;
     let boundary_probability = 1.0 / (1.0 + (-(boundary_intercept as f64)).exp());
 
@@ -2724,11 +2690,9 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
 #[tokio::test]
 async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
     let profile_name = format!("smart-ai-review-rate-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
@@ -2810,11 +2774,9 @@ async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
 #[tokio::test]
 async fn smart_moderation_reuses_cached_result_for_same_text() {
     let profile_name = format!("smart-cache-hit-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
         "choices": [{
@@ -2919,11 +2881,9 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
 #[tokio::test]
 async fn smart_moderation_reuses_history_sample_before_llm() {
     let profile_name = format!("smart-history-hit-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
         "choices": [{
@@ -3014,11 +2974,9 @@ async fn smart_moderation_reuses_history_sample_before_llm() {
 #[tokio::test]
 async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
     let profile_name = format!("smart-history-sqlite-hit-{}", unique_test_suffix());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
         "choices": [{
@@ -3109,11 +3067,9 @@ async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
 #[tokio::test]
 async fn smart_moderation_persists_ai_result_into_history_sample_db() {
     let profile_name = format!("smart-history-write-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let (llm_base, hits) = spawn_counting_openai_chat_server(json!({
         "choices": [{
@@ -3199,11 +3155,9 @@ async fn smart_moderation_persists_ai_result_into_history_sample_db() {
 #[tokio::test]
 async fn smart_moderation_retries_llm_after_server_error_like_python() {
     let profile_name = format!("smart-llm-retry-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let (llm_base, hits) = spawn_sequenced_openai_chat_server(vec![
         (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary"}})),
@@ -3290,11 +3244,9 @@ async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
     moderation::smart::set_test_random_values(&[0.75, 0.20, 0.10]);
 
     let profile_name = format!("smart-llm-retry-models-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let (llm_base, hits, models) = spawn_recording_sequenced_openai_chat_server(vec![
         (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "temporary-1"}})),

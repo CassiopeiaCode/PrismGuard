@@ -62,6 +62,22 @@ struct StreamingHangState {
     disconnect_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
+fn local_profile_dir_or_skip(profile_name: &str) -> Option<PathBuf> {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        eprintln!(
+            "skipping local-profile integration test on GitHub Actions: {profile_name}"
+        );
+        return None;
+    }
+
+    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
+        .join("configs")
+        .join("mod_profiles")
+        .join(profile_name);
+    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    Some(profile_dir)
+}
+
 fn temp_keywords_path(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -266,11 +282,9 @@ async fn basic_moderation_blocks_before_upstream_proxy_call() {
 #[tokio::test]
 async fn smart_moderation_local_hashlinear_blocks_before_upstream_proxy_call() {
     let profile_name = format!("runtime-hashlinear-block-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -353,11 +367,9 @@ async fn smart_moderation_local_hashlinear_blocks_before_upstream_proxy_call() {
 #[tokio::test]
 async fn smart_moderation_low_risk_hashlinear_still_reaches_upstream() {
     let profile_name = format!("runtime-hashlinear-allow-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     std::fs::write(
         profile_dir.join("profile.json"),
@@ -555,11 +567,9 @@ fn percent_encode(input: &str) -> String {
 #[tokio::test]
 async fn smart_moderation_llm_timeout_aborts_streaming_connection() {
     let profile_name = format!("runtime-ai-timeout-{}", std::process::id());
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(&profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
 
     let (ai_base_url, seen, disconnected) = spawn_streaming_hang_ai_server().await;
     std::fs::write(
