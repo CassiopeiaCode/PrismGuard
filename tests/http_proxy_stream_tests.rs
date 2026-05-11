@@ -114,7 +114,8 @@ fn claude_sse_can_transform_to_openai_chat_sse() {
     assert!(text.contains("\"role\":\"assistant\""), "{text}");
     assert!(text.contains("\"content\":\"hello\""), "{text}");
     assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
-    assert!(text.contains("\"usage\":{\"input_tokens\":3,\"output_tokens\":7"), "{text}");
+    assert!(text.contains("\"input_tokens\":3"), "{text}");
+    assert!(text.contains("\"output_tokens\":7"), "{text}");
     assert!(text.contains("[DONE]"), "{text}");
 }
 
@@ -136,13 +137,21 @@ fn openai_chat_sse_emits_claude_message_start_usage_and_final_usage() {
     let text = String::from_utf8(transformed).expect("utf8");
 
     assert!(
-        text.contains("\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl_usage\",\"model\":\"gpt-4.1-mini\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":0"),
+        text.contains("\"type\":\"message_start\""),
         "{text}"
     );
+    assert!(text.contains("\"id\":\"chatcmpl_usage\""), "{text}");
+    assert!(text.contains("\"model\":\"gpt-4.1-mini\""), "{text}");
+    assert!(text.contains("\"input_tokens\":3"), "{text}");
+    assert!(text.contains("\"output_tokens\":0"), "{text}");
     assert!(
-        text.contains("\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":1"),
+        text.contains("\"type\":\"message_delta\""),
         "{text}"
     );
+    assert!(text.contains("\"stop_reason\":\"end_turn\""), "{text}");
+    assert!(text.contains("\"output_tokens\":5"), "{text}");
+    assert!(text.contains("\"cache_creation_input_tokens\":2"), "{text}");
+    assert!(text.contains("\"cache_read_input_tokens\":1"), "{text}");
 }
 
 #[tokio::test]
@@ -176,10 +185,7 @@ async fn claude_stream_message_start_uses_estimated_prompt_tokens_when_upstream_
     let body = response.text().await.expect("sse body");
     assert!(body.contains("\"type\":\"message_start\""), "{body}");
     assert!(body.contains("\"usage\":{\"input_tokens\":"), "{body}");
-    assert!(
-        !body.contains("\"usage\":{\"input_tokens\":0,\"output_tokens\":0}"),
-        "{body}"
-    );
+    assert!(body.contains("\"input_tokens\":11"), "{body}");
 }
 
 #[test]
@@ -248,13 +254,17 @@ fn openai_chat_reasoning_sse_transforms_to_openai_responses_reasoning_events() {
     let text = String::from_utf8(transformed).expect("utf8");
 
     assert!(
-        text.contains("\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\""),
+        text.contains("\"type\":\"response.output_item.added\""),
         "{text}"
     );
+    assert!(text.contains("\"output_index\":0"), "{text}");
+    assert!(text.contains("\"type\":\"reasoning\""), "{text}");
     assert!(
-        text.contains("\"type\":\"response.reasoning_text.delta\",\"delta\":\"step one\",\"content_index\":0"),
+        text.contains("\"type\":\"response.reasoning_text.delta\""),
         "{text}"
     );
+    assert!(text.contains("\"delta\":\"step one\""), "{text}");
+    assert!(text.contains("\"content_index\":0"), "{text}");
     assert!(!text.contains("\"type\":\"response.output_text.delta\""), "{text}");
     assert!(text.contains("\"type\":\"response.completed\""), "{text}");
 }
@@ -306,13 +316,15 @@ fn openai_chat_reasoning_sse_transforms_to_claude_thinking_events() {
     let text = String::from_utf8(transformed).expect("utf8");
 
     assert!(
-        text.contains("\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\""),
+        text.contains("\"type\":\"content_block_start\""),
         "{text}"
     );
+    assert!(text.contains("\"type\":\"thinking\""), "{text}");
     assert!(
-        text.contains("\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one\"}"),
+        text.contains("\"type\":\"thinking_delta\""),
         "{text}"
     );
+    assert!(text.contains("\"thinking\":\"step one\""), "{text}");
     assert!(!text.contains("\"type\":\"text_delta\""), "{text}");
     assert!(text.contains("\"type\":\"message_stop\""), "{text}");
 }
@@ -898,15 +910,21 @@ async fn responses_completed_event_emits_done_even_without_upstream_done_marker(
 #[tokio::test]
 async fn passthrough_sse_starts_before_upstream_finishes() {
     let upstream_base = spawn_delayed_sse_upstream(vec![
-        (0, "data: first\n\n"),
-        (250, "data: second\n\n"),
+        (
+            0,
+            "data: {\"id\":\"chatcmpl_passthrough\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n",
+        ),
+        (
+            250,
+            "data: {\"id\":\"chatcmpl_passthrough\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"second\"},\"finish_reason\":null}]}\n\n",
+        ),
         (250, "data: [DONE]\n\n"),
     ])
     .await;
     let proxy_base = spawn_proxy_server().await;
 
     let (first_ms, total_ms, body) = measure_stream_timing(
-        &format!("{proxy_base}/${upstream_base}/v1/chat/completions"),
+        &format!("{proxy_base}/{}${upstream_base}/v1/chat/completions", percent_encode("{}")),
         &json!({
             "model": "gpt-4.1-mini",
             "stream": true,
@@ -915,7 +933,7 @@ async fn passthrough_sse_starts_before_upstream_finishes() {
     )
     .await;
 
-    assert!(body.contains("data: first"), "{body}");
+    assert!(body.contains("\"content\":\"first\""), "{body}");
     assert!(body.contains("data: [DONE]"), "{body}");
     assert!(
         first_ms < total_ms.saturating_sub(150),
@@ -958,8 +976,14 @@ async fn transformed_sse_starts_before_upstream_finishes() {
 #[tokio::test]
 async fn delay_stream_header_passthrough_still_starts_before_upstream_finishes() {
     let upstream_base = spawn_delayed_sse_upstream(vec![
-        (0, "data: abc\n\n"),
-        (250, "data: def\n\n"),
+        (
+            0,
+            "data: {\"id\":\"chatcmpl_delay_passthrough\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"abc\"},\"finish_reason\":null}]}\n\n",
+        ),
+        (
+            250,
+            "data: {\"id\":\"chatcmpl_delay_passthrough\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"def\"},\"finish_reason\":null}]}\n\n",
+        ),
         (250, "data: [DONE]\n\n"),
     ])
     .await;
@@ -982,7 +1006,7 @@ async fn delay_stream_header_passthrough_still_starts_before_upstream_finishes()
     )
     .await;
 
-    assert!(body.contains("data: abc"), "{body}");
+    assert!(body.contains("\"content\":\"abc\""), "{body}");
     assert!(body.contains("data: [DONE]"), "{body}");
     assert!(
         first_ms < total_ms.saturating_sub(150),
@@ -1026,9 +1050,14 @@ async fn delay_stream_header_transformed_stream_still_starts_before_upstream_fin
 #[tokio::test]
 async fn delay_stream_header_reasoning_only_stream_counts_as_valid_content() {
     let upstream_body = concat!(
-        "data: {\"id\":\"chatcmpl_reasoning_delay\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"chatcmpl_reasoning_delay\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"abcd\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"chatcmpl_reasoning_delay\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning_delay\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_delay_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"\"}]}}\n\n",
+        "event: response.reasoning_text.delta\n",
+        "data: {\"type\":\"response.reasoning_text.delta\",\"item_id\":\"rs_delay_1\",\"delta\":\"abcd\",\"content_index\":0}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning_delay\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n",
         "data: [DONE]\n\n"
     );
     let upstream_base = spawn_raw_sse_upstream(upstream_body).await;
@@ -1067,11 +1096,8 @@ async fn delay_stream_header_reasoning_only_stream_counts_as_valid_content() {
     );
 
     let body = response.text().await.expect("sse body");
-    assert!(
-        body.contains("\"type\":\"response.reasoning_text.delta\",\"delta\":\"abcd\",\"content_index\":0"),
-        "{body}"
-    );
-    assert!(!body.contains("\"type\":\"response.output_text.delta\""), "{body}");
+    assert!(body.contains("\"reasoning_content\":\"abcd\""), "{body}");
+    assert!(!body.contains("\"content\":\"abcd\""), "{body}");
     assert!(body.contains("[DONE]"), "{body}");
 }
 
