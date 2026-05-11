@@ -13,6 +13,7 @@ pub struct Settings {
     pub port: u16,
     pub debug: bool,
     pub log_level: String,
+    pub upstream_http_timeout_secs: u64,
     pub access_log_file: String,
     pub moderation_log_file: String,
     pub training_log_file: String,
@@ -47,6 +48,10 @@ impl Settings {
                 .unwrap_or(8000),
             debug: parse_bool_env("DEBUG", true),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "INFO".to_string()),
+            upstream_http_timeout_secs: env::var("UPSTREAM_HTTP_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
             access_log_file: env::var("ACCESS_LOG_FILE")
                 .unwrap_or_else(|_| "logs/access.log".to_string()),
             moderation_log_file: env::var("MODERATION_LOG_FILE")
@@ -108,12 +113,14 @@ mod tests {
     fn settings_default_training_rpc_uses_unix_socket() {
         let _guard = env_test_lock().lock().expect("env test lock");
         let root_dir = PathBuf::from("/tmp/prismguard-config-defaults");
+        std::env::remove_var("UPSTREAM_HTTP_TIMEOUT_SECS");
         std::env::remove_var("TRAINING_DATA_RPC_ENABLED");
         std::env::remove_var("TRAINING_DATA_RPC_TRANSPORT");
         std::env::remove_var("TRAINING_DATA_RPC_UNIX_SOCKET");
 
         let settings = Settings::load(&root_dir).expect("load settings");
 
+        assert_eq!(settings.upstream_http_timeout_secs, 60);
         assert!(settings.training_data_rpc_enabled);
         assert_eq!(settings.training_data_rpc_transport, "unix");
         assert_eq!(
@@ -126,16 +133,19 @@ mod tests {
     fn settings_can_override_training_rpc_env() {
         let _guard = env_test_lock().lock().expect("env test lock");
         let root_dir = PathBuf::from("/tmp/prismguard-config-overrides");
+        std::env::set_var("UPSTREAM_HTTP_TIMEOUT_SECS", "300");
         std::env::set_var("TRAINING_DATA_RPC_ENABLED", "0");
         std::env::set_var("TRAINING_DATA_RPC_TRANSPORT", "tcp");
         std::env::set_var("TRAINING_DATA_RPC_UNIX_SOCKET", "/tmp/custom.sock");
 
         let settings = Settings::load(&root_dir).expect("load settings");
 
+        assert_eq!(settings.upstream_http_timeout_secs, 300);
         assert!(!settings.training_data_rpc_enabled);
         assert_eq!(settings.training_data_rpc_transport, "tcp");
         assert_eq!(settings.training_data_rpc_unix_socket, "/tmp/custom.sock");
 
+        std::env::remove_var("UPSTREAM_HTTP_TIMEOUT_SECS");
         std::env::remove_var("TRAINING_DATA_RPC_ENABLED");
         std::env::remove_var("TRAINING_DATA_RPC_TRANSPORT");
         std::env::remove_var("TRAINING_DATA_RPC_UNIX_SOCKET");

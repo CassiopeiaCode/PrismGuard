@@ -145,6 +145,7 @@
 - `PORT`：监听端口，默认 `8000`
 - `DEBUG`：调试开关，默认 `true`
 - `LOG_LEVEL`：日志级别，默认 `INFO`
+- `UPSTREAM_HTTP_TIMEOUT_SECS`：代理请求上游时的全局 HTTP 超时，默认 `60`
 - `ACCESS_LOG_FILE`
 - `MODERATION_LOG_FILE`
 - `TRAINING_LOG_FILE`
