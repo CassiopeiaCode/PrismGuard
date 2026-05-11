@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
-#[cfg(all(feature = "storage-debug", not(test)))]
+#[cfg(feature = "storage-debug")]
 use axum::routing::post;
 use axum::{Json, Router};
 use reqwest::Client;
@@ -15,7 +15,7 @@ use crate::config::Settings;
 use crate::moderation::{bow, fasttext, hashlinear};
 use crate::profile::ModerationProfile;
 use crate::proxy::{proxy_entry, proxy_entry_root};
-#[cfg(all(feature = "storage-debug", not(test)))]
+#[cfg(feature = "storage-debug")]
 use crate::storage::SampleStorage;
 use crate::training::evaluate_training_need;
 
@@ -298,7 +298,7 @@ struct DebugProfileMetricsQuery {
     sampling: String,
 }
 
-#[cfg(all(feature = "storage-debug", not(test)))]
+#[cfg(feature = "storage-debug")]
 async fn debug_profile_metrics(
     State(state): State<AppState>,
     Path(profile): Path<String>,
@@ -417,7 +417,7 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
-#[cfg(all(feature = "storage-debug", not(test)))]
+#[cfg(feature = "storage-debug")]
 async fn debug_storage_meta(
     State(state): State<AppState>,
     Path(profile): Path<String>,
@@ -431,7 +431,7 @@ async fn debug_storage_meta(
     })))
 }
 
-#[cfg(all(feature = "storage-debug", not(test)))]
+#[cfg(feature = "storage-debug")]
 async fn debug_storage_sample(
     State(state): State<AppState>,
     Path((profile, id)): Path<(String, u64)>,
@@ -451,7 +451,7 @@ struct FindByTextRequest {
     text: String,
 }
 
-#[cfg(all(feature = "storage-debug", not(test)))]
+#[cfg(feature = "storage-debug")]
 async fn debug_find_by_text(
     State(state): State<AppState>,
     Path(profile): Path<String>,
@@ -466,7 +466,7 @@ async fn debug_find_by_text(
     })))
 }
 
-#[cfg(all(feature = "storage-debug", not(test)))]
+#[cfg(feature = "storage-debug")]
 fn attach_storage_debug_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
@@ -483,7 +483,7 @@ fn attach_storage_debug_routes(router: Router<AppState>) -> Router<AppState> {
         )
 }
 
-#[cfg(any(test, not(feature = "storage-debug")))]
+#[cfg(not(feature = "storage-debug"))]
 fn attach_storage_debug_routes(router: Router<AppState>) -> Router<AppState> {
     router
 }
@@ -686,6 +686,7 @@ mod tests {
             port: 0,
             debug: true,
             log_level: "info".to_string(),
+            upstream_http_timeout_secs: 60,
             access_log_file: "logs/access.log".to_string(),
             moderation_log_file: "logs/moderation.log".to_string(),
             training_log_file: "logs/training.log".to_string(),

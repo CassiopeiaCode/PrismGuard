@@ -5684,6 +5684,7 @@ fn test_settings(env_map: HashMap<String, String>) -> Settings {
         port: 0,
         debug: true,
         log_level: "info".to_string(),
+        upstream_http_timeout_secs: 60,
         access_log_file: "logs/access.log".to_string(),
         moderation_log_file: "logs/moderation.log".to_string(),
         training_log_file: "logs/training.log".to_string(),
