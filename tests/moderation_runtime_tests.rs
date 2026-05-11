@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, StatusCode, Uri};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use config::Settings;
