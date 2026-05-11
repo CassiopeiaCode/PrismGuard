@@ -36,6 +36,9 @@ enum InternalEvent {
     TextDelta {
         text: String,
     },
+    ReasoningDelta {
+        text: String,
+    },
     ToolCallStart {
         call_id: String,
         name: String,
@@ -55,6 +58,7 @@ enum InternalEvent {
 trait InternalSink: Send {
     fn on_start(&mut self, meta: &Map<String, Value>) -> Vec<Vec<u8>>;
     fn on_text_delta(&mut self, text: &str) -> Vec<Vec<u8>>;
+    fn on_reasoning_delta(&mut self, text: &str) -> Vec<Vec<u8>>;
     fn on_tool_call_start(&mut self, call_id: &str, name: &str) -> Vec<Vec<u8>>;
     fn on_tool_call_args_delta(&mut self, call_id: &str, name: &str, delta: &str) -> Vec<Vec<u8>>;
     fn on_final(&mut self, finish_reason: Option<&str>, usage: Option<&Value>) -> Vec<Vec<u8>>;
@@ -160,6 +164,15 @@ impl StreamTranscoder {
                     out.extend(self.sink.on_start(&self.meta));
                 }
                 out.extend(self.sink.on_text_delta(&text));
+                out
+            }
+            InternalEvent::ReasoningDelta { text } => {
+                let mut out = Vec::new();
+                if !self.started {
+                    self.started = true;
+                    out.extend(self.sink.on_start(&self.meta));
+                }
+                out.extend(self.sink.on_reasoning_delta(&text));
                 out
             }
             InternalEvent::ToolCallStart { call_id, name } => {
@@ -270,6 +283,23 @@ impl InternalSink for OpenAiChatSink {
         }))]
     }
 
+    fn on_reasoning_delta(&mut self, text: &str) -> Vec<Vec<u8>> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        vec![encode_json_sse(&json!({
+            "id": self.response_id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": text},
+                "finish_reason": Value::Null
+            }]
+        }))]
+    }
+
     fn on_tool_call_start(&mut self, call_id: &str, name: &str) -> Vec<Vec<u8>> {
         if call_id.is_empty() && name.is_empty() {
             return Vec::new();
@@ -368,6 +398,7 @@ struct OpenAiResponsesSink {
     model: String,
     created_at: i64,
     started: bool,
+    reasoning_item_id: Option<String>,
 }
 
 impl InternalSink for OpenAiResponsesSink {
@@ -420,6 +451,24 @@ impl InternalSink for OpenAiResponsesSink {
             &json!({"type": "response.output_text.delta", "delta": text}),
             "response.output_text.delta",
         )]
+    }
+
+    fn on_reasoning_delta(&mut self, text: &str) -> Vec<Vec<u8>> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let item_id = self.ensure_reasoning_item(&mut out);
+        out.push(encode_json_sse_with_event(
+            &json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": item_id,
+                "delta": text,
+                "content_index": 0
+            }),
+            "response.reasoning_text.delta",
+        ));
+        out
     }
 
     fn on_tool_call_start(&mut self, call_id: &str, name: &str) -> Vec<Vec<u8>> {
@@ -487,6 +536,33 @@ impl InternalSink for OpenAiResponsesSink {
     }
 }
 
+impl OpenAiResponsesSink {
+    fn ensure_reasoning_item(&mut self, out: &mut Vec<Vec<u8>>) -> String {
+        if let Some(item_id) = self.reasoning_item_id.clone() {
+            return item_id;
+        }
+        let item_id = if self.response_id.is_empty() {
+            "reasoning_0".to_string()
+        } else {
+            format!("{}_reasoning_0", self.response_id)
+        };
+        self.reasoning_item_id = Some(item_id.clone());
+        out.push(encode_json_sse_with_event(
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": item_id.clone(),
+                    "summary": [{"type": "summary_text", "text": ""}]
+                }
+            }),
+            "response.output_item.added",
+        ));
+        item_id
+    }
+}
+
 #[derive(Default)]
 struct ClaudeSink {
     id: String,
@@ -499,6 +575,7 @@ struct ClaudeSink {
 #[derive(Clone)]
 enum ClaudeActiveBlock {
     Text { index: usize },
+    Thinking { index: usize },
     Tool { index: usize, call_id: String },
 }
 
@@ -541,7 +618,7 @@ impl InternalSink for ClaudeSink {
         let mut out = Vec::new();
         let index = match self.active_block.as_ref() {
             Some(ClaudeActiveBlock::Text { index }) => *index,
-            Some(ClaudeActiveBlock::Tool { .. }) => {
+            Some(ClaudeActiveBlock::Thinking { .. } | ClaudeActiveBlock::Tool { .. }) => {
                 out.extend(self.close_active_block());
                 let index = self.next_index;
                 self.next_index += 1;
@@ -584,6 +661,65 @@ impl InternalSink for ClaudeSink {
                 "delta": {
                     "type": "text_delta",
                     "text": text
+                }
+            }),
+            "content_block_delta",
+        ));
+        out
+    }
+
+    fn on_reasoning_delta(&mut self, text: &str) -> Vec<Vec<u8>> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let index = match self.active_block.as_ref() {
+            Some(ClaudeActiveBlock::Thinking { index }) => *index,
+            Some(ClaudeActiveBlock::Text { .. } | ClaudeActiveBlock::Tool { .. }) => {
+                out.extend(self.close_active_block());
+                let index = self.next_index;
+                self.next_index += 1;
+                self.active_block = Some(ClaudeActiveBlock::Thinking { index });
+                out.push(encode_json_sse_with_event(
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": ""
+                        }
+                    }),
+                    "content_block_start",
+                ));
+                index
+            }
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                self.active_block = Some(ClaudeActiveBlock::Thinking { index });
+                out.push(encode_json_sse_with_event(
+                    &json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": ""
+                        }
+                    }),
+                    "content_block_start",
+                ));
+                index
+            }
+        };
+        out.push(encode_json_sse_with_event(
+            &json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": text
                 }
             }),
             "content_block_delta",
@@ -670,16 +806,37 @@ impl ClaudeSink {
         let Some(active) = self.active_block.take() else {
             return Vec::new();
         };
-        let index = match active {
-            ClaudeActiveBlock::Text { index } | ClaudeActiveBlock::Tool { index, .. } => index,
-        };
-        vec![encode_json_sse_with_event(
-            &json!({
-                "type": "content_block_stop",
-                "index": index
-            }),
-            "content_block_stop",
-        )]
+        match active {
+            ClaudeActiveBlock::Text { index } | ClaudeActiveBlock::Tool { index, .. } => {
+                vec![encode_json_sse_with_event(
+                    &json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                    "content_block_stop",
+                )]
+            }
+            ClaudeActiveBlock::Thinking { index } => vec![
+                encode_json_sse_with_event(
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": ""
+                        }
+                    }),
+                    "content_block_delta",
+                ),
+                encode_json_sse_with_event(
+                    &json!({
+                        "type": "content_block_stop",
+                        "index": index
+                    }),
+                    "content_block_stop",
+                ),
+            ],
+        }
     }
 }
 
@@ -714,6 +871,10 @@ impl InternalSink for GeminiSink {
                 }
             }]
         }))]
+    }
+
+    fn on_reasoning_delta(&mut self, _text: &str) -> Vec<Vec<u8>> {
+        Vec::new()
     }
 
     fn on_tool_call_start(&mut self, _call_id: &str, _name: &str) -> Vec<Vec<u8>> {
@@ -885,6 +1046,16 @@ fn decode_openai_chat(
             });
         }
     }
+    if let Some(text) = delta
+        .and_then(|delta| delta.get("reasoning_content"))
+        .and_then(Value::as_str)
+    {
+        if !text.is_empty() {
+            out.push(InternalEvent::ReasoningDelta {
+                text: text.to_string(),
+            });
+        }
+    }
 
     if let Some(tool_calls) = delta.and_then(|delta| delta.get("tool_calls")).and_then(Value::as_array) {
         for tool_call in tool_calls.iter().filter_map(Value::as_object) {
@@ -1007,12 +1178,23 @@ fn decode_openai_responses(
                 }
             }
         }
+        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                if !delta.is_empty() {
+                    out.push(InternalEvent::ReasoningDelta {
+                        text: delta.to_string(),
+                    });
+                }
+            }
+        }
         "response.output_item.added" => {
             let Some(item) = event.get("item").and_then(Value::as_object) else {
                 return out;
             };
-            if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                return out;
+            match item.get("type").and_then(Value::as_str) {
+                Some("reasoning") => return out,
+                Some("function_call") => {}
+                _ => return out,
             }
             let item_id = item
                 .get("id")
@@ -1241,6 +1423,15 @@ fn decode_claude(
                     if let Some(text) = delta.get("text").and_then(Value::as_str) {
                         if !text.is_empty() {
                             out.push(InternalEvent::TextDelta {
+                                text: text.to_string(),
+                            });
+                        }
+                    }
+                }
+                Some("thinking_delta") => {
+                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            out.push(InternalEvent::ReasoningDelta {
                                 text: text.to_string(),
                             });
                         }

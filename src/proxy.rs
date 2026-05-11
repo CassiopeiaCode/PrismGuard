@@ -1028,6 +1028,11 @@ impl StreamPrecheck {
                                 self.content_chars += delta.chars().count();
                             }
                         }
+                        Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
+                            if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                                self.content_chars += delta.chars().count();
+                            }
+                        }
                         Some("response.function_call_arguments.delta" | "response.function_call.delta") => {
                             self.has_tool_call = true;
                         }
@@ -1052,6 +1057,9 @@ impl StreamPrecheck {
                                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
                                     self.content_chars += text.chars().count();
                                 }
+                                if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                                    self.content_chars += text.chars().count();
+                                }
                                 if delta.get("tool_calls").is_some() {
                                     self.has_tool_call = true;
                                 }
@@ -1062,20 +1070,19 @@ impl StreamPrecheck {
                 crate::format::RequestFormat::ClaudeChat => {
                     match payload.get("type").and_then(Value::as_str) {
                         Some("content_block_delta") => {
-                            if payload
-                                .get("delta")
-                                .and_then(Value::as_object)
-                                .and_then(|delta| delta.get("type"))
-                                .and_then(Value::as_str)
-                                == Some("text_delta")
-                            {
-                                if let Some(text) = payload
-                                    .get("delta")
-                                    .and_then(Value::as_object)
-                                    .and_then(|delta| delta.get("text"))
-                                    .and_then(Value::as_str)
-                                {
-                                    self.content_chars += text.chars().count();
+                            if let Some(delta) = payload.get("delta").and_then(Value::as_object) {
+                                match delta.get("type").and_then(Value::as_str) {
+                                    Some("text_delta") => {
+                                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                            self.content_chars += text.chars().count();
+                                        }
+                                    }
+                                    Some("thinking_delta") => {
+                                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                                            self.content_chars += text.chars().count();
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -1285,6 +1292,22 @@ fn validate_response_content(
             if let Some(items) = object.get("output").and_then(Value::as_array) {
                 for item in items {
                     match item.get("type").and_then(Value::as_str) {
+                        Some("reasoning") => {
+                            if let Some(parts) = item.get("summary").and_then(Value::as_array) {
+                                for part in parts {
+                                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                        accumulated_content.push_str(text);
+                                    }
+                                }
+                            }
+                            if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                                for part in parts {
+                                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                        accumulated_content.push_str(text);
+                                    }
+                                }
+                            }
+                        }
                         Some("function_call" | "function_call_output" | "tool_result") => {
                             has_tool_call = true;
                         }
@@ -1318,6 +1341,11 @@ fn validate_response_content(
                                 accumulated_content.push_str(text);
                             }
                         }
+                        Some("thinking") => {
+                            if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                                accumulated_content.push_str(text);
+                            }
+                        }
                         Some("tool_use") => has_tool_call = true,
                         _ => {}
                     }
@@ -1329,6 +1357,11 @@ fn validate_response_content(
                 for choice in choices {
                     if let Some(message) = choice.get("message").and_then(Value::as_object) {
                         if let Some(text) = message.get("content").and_then(Value::as_str) {
+                            accumulated_content.push_str(text);
+                        }
+                        if let Some(text) =
+                            message.get("reasoning_content").and_then(Value::as_str)
+                        {
                             accumulated_content.push_str(text);
                         }
                         if message.get("tool_calls").is_some() {
@@ -1396,6 +1429,11 @@ fn validate_stream_content(
                             accumulated_content.push_str(delta);
                         }
                     }
+                    Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
+                        if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                            accumulated_content.push_str(delta);
+                        }
+                    }
                     Some("response.function_call_arguments.delta" | "response.function_call.delta") => {
                         has_tool_call = true;
                     }
@@ -1420,6 +1458,9 @@ fn validate_stream_content(
                             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                                 accumulated_content.push_str(text);
                             }
+                            if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                                accumulated_content.push_str(text);
+                            }
                             if delta.get("tool_calls").is_some() {
                                 has_tool_call = true;
                             }
@@ -1430,20 +1471,19 @@ fn validate_stream_content(
             crate::format::RequestFormat::ClaudeChat => {
                 match payload.get("type").and_then(Value::as_str) {
                     Some("content_block_delta") => {
-                        if payload
-                            .get("delta")
-                            .and_then(Value::as_object)
-                            .and_then(|delta| delta.get("type"))
-                            .and_then(Value::as_str)
-                            == Some("text_delta")
-                        {
-                            if let Some(text) = payload
-                                .get("delta")
-                                .and_then(Value::as_object)
-                                .and_then(|delta| delta.get("text"))
-                                .and_then(Value::as_str)
-                            {
-                                accumulated_content.push_str(text);
+                        if let Some(delta) = payload.get("delta").and_then(Value::as_object) {
+                            match delta.get("type").and_then(Value::as_str) {
+                                Some("text_delta") => {
+                                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                        accumulated_content.push_str(text);
+                                    }
+                                }
+                                Some("thinking_delta") => {
+                                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                                        accumulated_content.push_str(text);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }

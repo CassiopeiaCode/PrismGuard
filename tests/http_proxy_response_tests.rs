@@ -84,6 +84,53 @@ async fn upstream_openai_responses_json_is_transformed_back_to_openai_chat() {
 }
 
 #[tokio::test]
+async fn upstream_openai_chat_reasoning_response_transforms_to_claude_thinking_content() {
+    let upstream_body = json!({
+        "id": "chatcmpl_reasoning",
+        "object": "chat.completion",
+        "model": "gpt-4.1-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "step one"
+            },
+            "finish_reason": "stop"
+        }]
+    });
+
+    let upstream_base = spawn_json_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "claude_chat",
+            "to": "openai_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/messages"))
+        .json(&json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["content"][0]["type"], "thinking");
+    assert_eq!(body["content"][0]["thinking"], "step one");
+    assert_eq!(body["content"][0]["signature"], "");
+}
+
+#[tokio::test]
 async fn upstream_openai_responses_message_content_items_object_maps_to_chat() {
     let upstream_body = json!({
         "id": "resp_items_obj",
@@ -1283,7 +1330,7 @@ async fn upstream_openai_responses_only_uses_last_message_item_for_final_chat_me
 }
 
 #[tokio::test]
-async fn upstream_openai_responses_reasoning_item_maps_to_chat_text_content() {
+async fn upstream_openai_responses_reasoning_item_maps_to_chat_reasoning_content() {
     let upstream_body = json!({
         "id": "resp_reasoning",
         "object": "response",
@@ -1324,7 +1371,11 @@ async fn upstream_openai_responses_reasoning_item_maps_to_chat_text_content() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["choices"][0]["message"]["content"], "step one\nstep two");
+    assert_eq!(
+        body["choices"][0]["message"]["reasoning_content"],
+        "step one\nstep two"
+    );
+    assert!(body["choices"][0]["message"].get("content").is_none());
 }
 
 #[tokio::test]

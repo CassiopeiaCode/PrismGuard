@@ -231,6 +231,93 @@ fn openai_chat_sse_can_transform_to_openai_responses_sse() {
 }
 
 #[test]
+fn openai_chat_reasoning_sse_transforms_to_openai_responses_reasoning_events() {
+    let raw = concat!(
+        "data: {\"id\":\"chatcmpl_reasoning\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"step one\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiChat),
+        Some(RequestFormat::OpenAiResponses),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(
+        text.contains("\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"type\":\"response.reasoning_text.delta\",\"delta\":\"step one\",\"content_index\":0"),
+        "{text}"
+    );
+    assert!(!text.contains("\"type\":\"response.output_text.delta\""), "{text}");
+    assert!(text.contains("\"type\":\"response.completed\""), "{text}");
+}
+
+#[test]
+fn openai_responses_reasoning_sse_transforms_to_openai_chat_reasoning_content() {
+    let raw = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning\",\"model\":\"gpt-4.1-mini\",\"created_at\":1}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"\"}]}}\n\n",
+        "event: response.reasoning_text.delta\n",
+        "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"step one\",\"content_index\":0}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning\",\"model\":\"gpt-4.1-mini\",\"created_at\":1,\"status\":\"completed\"}}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiResponses),
+        Some(RequestFormat::OpenAiChat),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(text.contains("chat.completion.chunk"), "{text}");
+    assert!(text.contains("\"role\":\"assistant\""), "{text}");
+    assert!(text.contains("\"reasoning_content\":\"step one\""), "{text}");
+    assert!(!text.contains("\"content\":\"step one\""), "{text}");
+    assert!(text.contains("\"finish_reason\":\"stop\""), "{text}");
+}
+
+#[test]
+fn openai_chat_reasoning_sse_transforms_to_claude_thinking_events() {
+    let raw = concat!(
+        "data: {\"id\":\"chatcmpl_claude_reasoning\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_claude_reasoning\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"step one\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_claude_reasoning\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiChat),
+        Some(RequestFormat::ClaudeChat),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(
+        text.contains("\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"step one\"}"),
+        "{text}"
+    );
+    assert!(!text.contains("\"type\":\"text_delta\""), "{text}");
+    assert!(text.contains("\"type\":\"message_stop\""), "{text}");
+}
+
+#[test]
 fn incremental_sse_transform_matches_whole_body_transform() {
     let raw = concat!(
         "event: response.created\n",
@@ -934,6 +1021,58 @@ async fn delay_stream_header_transformed_stream_still_starts_before_upstream_fin
         first_ms < total_ms.saturating_sub(150),
         "expected delayed-header transformed stream to start before completion, first={first_ms} total={total_ms}"
     );
+}
+
+#[tokio::test]
+async fn delay_stream_header_reasoning_only_stream_counts_as_valid_content() {
+    let upstream_body = concat!(
+        "data: {\"id\":\"chatcmpl_reasoning_delay\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning_delay\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"abcd\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning_delay\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let upstream_base = spawn_raw_sse_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "openai_responses",
+            "delay_stream_header": true
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = response.text().await.expect("sse body");
+    assert!(
+        body.contains("\"type\":\"response.reasoning_text.delta\",\"delta\":\"abcd\",\"content_index\":0"),
+        "{body}"
+    );
+    assert!(!body.contains("\"type\":\"response.output_text.delta\""), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
 }
 
 #[tokio::test]

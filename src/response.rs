@@ -102,6 +102,16 @@ fn openai_chat_to_claude_response(body: Value) -> Result<Value, ApiError> {
         }
     }
 
+    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !reasoning.is_empty() {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": reasoning,
+                "signature": ""
+            }));
+        }
+    }
+
     if content.is_empty() {
         content.push(json!({
             "type": "text",
@@ -302,7 +312,7 @@ fn openai_responses_to_openai_chat(body: Value) -> Result<Value, ApiError> {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !text_content.is_empty() {
-                    message.insert("content".to_string(), json!(text_content));
+                    message.insert("reasoning_content".to_string(), json!(text_content));
                 }
             }
             _ => {}
