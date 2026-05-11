@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header::CONTENT_TYPE, StatusCode, Uri};
-use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
 use config::Settings;
@@ -694,12 +694,11 @@ async fn upstream_ai_stream_hang(
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
 
-    (
-        StatusCode::OK,
-        [(CONTENT_TYPE, "text/event-stream")],
-        body,
-    )
-        .into_response()
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .body(body)
+        .expect("disconnecting moderation stream response")
 }
 
 fn unused_http_base() -> String {
