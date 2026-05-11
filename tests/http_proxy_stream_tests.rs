@@ -184,7 +184,7 @@ async fn claude_stream_message_start_uses_estimated_prompt_tokens_when_upstream_
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.expect("sse body");
     assert!(body.contains("\"type\":\"message_start\""), "{body}");
-    assert!(body.contains("\"usage\":{\"input_tokens\":"), "{body}");
+    assert!(body.contains("\"usage\":{"), "{body}");
     assert!(body.contains("\"input_tokens\":11"), "{body}");
 }
 
