@@ -924,7 +924,7 @@ impl InternalSink for ClaudeSink {
                     "type": "tool_use",
                     "id": call_id,
                     "name": name,
-                    "input": {}
+                    "input": ""
                 }
             }),
             "content_block_start",

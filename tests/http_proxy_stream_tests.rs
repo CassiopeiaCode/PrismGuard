@@ -154,6 +154,30 @@ fn openai_chat_sse_emits_claude_message_start_usage_and_final_usage() {
     assert!(text.contains("\"cache_read_input_tokens\":1"), "{text}");
 }
 
+#[test]
+fn openai_chat_tool_call_sse_emits_claude_tool_use_with_string_input_buffer() {
+    let raw = concat!(
+        "data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5.5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5.5\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5.5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiChat),
+        Some(RequestFormat::ClaudeChat),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(text.contains("event: content_block_start"), "{text}");
+    assert!(text.contains("\"type\":\"tool_use\""), "{text}");
+    assert!(text.contains("\"input\":\"\""), "{text}");
+    assert!(text.contains("\"type\":\"input_json_delta\""), "{text}");
+    assert!(text.contains("\\\"command\\\":\\\"pwd\\\""), "{text}");
+}
+
 #[tokio::test]
 async fn claude_stream_message_start_uses_estimated_prompt_tokens_when_upstream_usage_is_missing() {
     let upstream_base = spawn_openai_chat_no_initial_usage_sse_upstream().await;
