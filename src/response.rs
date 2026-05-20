@@ -133,6 +133,11 @@ fn openai_chat_to_claude_response(body: Value) -> Result<Value, ApiError> {
         "model": object.get("model").cloned().unwrap_or_else(|| json!("")),
         "type": "message",
         "role": "assistant",
+        "created_at": object
+            .get("created_at")
+            .cloned()
+            .or_else(|| object.get("created").cloned())
+            .unwrap_or_else(|| json!(0)),
         "content": content,
         "stop_reason": map_chat_finish_reason(choice.get("finish_reason").and_then(Value::as_str)),
         "stop_sequence": Value::Null,
@@ -148,7 +153,10 @@ fn openai_chat_to_claude_response(body: Value) -> Result<Value, ApiError> {
 
     if let Some(response_obj) = response.as_object_mut() {
         for (key, value) in object {
-            if matches!(key.as_str(), "id" | "model" | "choices" | "usage") {
+            if matches!(
+                key.as_str(),
+                "id" | "model" | "choices" | "usage" | "object" | "created" | "created_at"
+            ) {
                 continue;
             }
             response_obj.insert(key.clone(), value.clone());
@@ -840,9 +848,12 @@ fn map_chat_finish_reason(finish_reason: Option<&str>) -> Value {
 }
 
 fn chat_usage_to_claude_usage(usage: &Map<String, Value>) -> Option<Value> {
+    let prompt_details = usage.get("prompt_tokens_details").and_then(Value::as_object);
     Some(json!({
         "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or_else(|| usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0))),
         "output_tokens": usage.get("completion_tokens").cloned().unwrap_or_else(|| usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0))),
+        "cache_creation_input_tokens": prompt_details.and_then(|details| details.get("cached_creation_tokens").cloned()).unwrap_or_else(|| json!(0)),
+        "cache_read_input_tokens": prompt_details.and_then(|details| details.get("cached_tokens").cloned()).unwrap_or_else(|| json!(0)),
         "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0)),
     }))
 }

@@ -296,6 +296,82 @@ async fn upstream_openai_chat_reasoning_response_transforms_to_claude_thinking_c
 }
 
 #[tokio::test]
+async fn upstream_openai_chat_tool_response_transforms_to_canonical_claude_message() {
+    let upstream_body = json!({
+        "id": "chatcmpl_claude_tool_resp",
+        "object": "chat.completion",
+        "created": 1710000010,
+        "model": "gpt-5.5",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "我来查看当前目录位置和下面的文件。 \n",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "Bash",
+                        "arguments": "{\"command\":\"pwd\",\"dangerouslyDisableSandbox\":false,\"description\":\"Show current working directory\",\"run_in_background\":false,\"timeout\":120000}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 19859,
+            "completion_tokens": 118,
+            "total_tokens": 19977,
+            "prompt_tokens_details": {
+                "cached_creation_tokens": 0,
+                "cached_tokens": 8704
+            }
+        }
+    });
+
+    let upstream_base = spawn_json_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "claude_chat",
+            "to": "openai_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/messages"))
+        .json(&json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["role"], "assistant");
+    assert_eq!(body["created_at"], 1710000010);
+    assert_eq!(body.get("created"), None);
+    assert_eq!(body.get("object"), None);
+    assert_eq!(body["content"][0]["type"], "text");
+    assert_eq!(body["content"][1]["type"], "tool_use");
+    assert_eq!(body["content"][1]["name"], "Bash");
+    assert_eq!(body["content"][1]["input"]["command"], "pwd");
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert_eq!(body["usage"]["input_tokens"], 19859);
+    assert_eq!(body["usage"]["output_tokens"], 118);
+    assert_eq!(body["usage"]["cache_creation_input_tokens"], 0);
+    assert_eq!(body["usage"]["cache_read_input_tokens"], 8704);
+}
+
+#[tokio::test]
 async fn upstream_claude_json_is_transformed_back_to_openai_responses() {
     let upstream_body = json!({
         "id": "msg_claude_resp_123",
