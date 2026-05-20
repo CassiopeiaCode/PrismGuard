@@ -398,7 +398,20 @@ struct OpenAiResponsesSink {
     model: String,
     created_at: i64,
     started: bool,
+    assistant_item_id: Option<String>,
+    assistant_text: String,
     reasoning_item_id: Option<String>,
+    reasoning_text: String,
+    tool_calls: HashMap<String, ResponsesToolCallState>,
+    tool_call_order: Vec<String>,
+    next_output_index: usize,
+}
+
+#[derive(Default, Clone)]
+struct ResponsesToolCallState {
+    item_id: String,
+    name: String,
+    arguments: String,
 }
 
 impl InternalSink for OpenAiResponsesSink {
@@ -447,10 +460,19 @@ impl InternalSink for OpenAiResponsesSink {
         if text.is_empty() {
             return Vec::new();
         }
-        vec![encode_json_sse_with_event(
-            &json!({"type": "response.output_text.delta", "delta": text}),
+        let mut out = Vec::new();
+        let item_id = self.ensure_assistant_item(&mut out);
+        self.assistant_text.push_str(text);
+        out.push(encode_json_sse_with_event(
+            &json!({
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": text
+            }),
             "response.output_text.delta",
-        )]
+        ));
+        out
     }
 
     fn on_reasoning_delta(&mut self, text: &str) -> Vec<Vec<u8>> {
@@ -459,6 +481,7 @@ impl InternalSink for OpenAiResponsesSink {
         }
         let mut out = Vec::new();
         let item_id = self.ensure_reasoning_item(&mut out);
+        self.reasoning_text.push_str(text);
         out.push(encode_json_sse_with_event(
             &json!({
                 "type": "response.reasoning_text.delta",
@@ -475,30 +498,90 @@ impl InternalSink for OpenAiResponsesSink {
         if call_id.is_empty() && name.is_empty() {
             return Vec::new();
         }
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        self.tool_call_order.push(call_id.to_string());
+        self.tool_calls.insert(
+            call_id.to_string(),
+            ResponsesToolCallState {
+                item_id: call_id.to_string(),
+                name: name.to_string(),
+                arguments: String::new(),
+            },
+        );
         vec![encode_json_sse_with_event(
             &json!({
                 "type": "response.output_item.added",
-                "output_index": 0,
+                "output_index": output_index,
                 "item": {
                     "id": call_id,
                     "call_id": call_id,
                     "type": "function_call",
-                    "name": name
+                    "name": name,
+                    "arguments": "",
+                    "status": "in_progress"
                 }
             }),
             "response.output_item.added",
         )]
     }
 
-    fn on_tool_call_args_delta(&mut self, call_id: &str, _name: &str, delta: &str) -> Vec<Vec<u8>> {
+    fn on_tool_call_args_delta(&mut self, call_id: &str, name: &str, delta: &str) -> Vec<Vec<u8>> {
         if delta.is_empty() {
             return Vec::new();
         }
+        if !self.tool_calls.contains_key(call_id) {
+            let output_index = self.next_output_index;
+            self.next_output_index += 1;
+            self.tool_call_order.push(call_id.to_string());
+            self.tool_calls.insert(
+                call_id.to_string(),
+                ResponsesToolCallState {
+                    item_id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments: delta.to_string(),
+                },
+            );
+            return vec![
+                encode_json_sse_with_event(
+                    &json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "id": call_id,
+                            "call_id": call_id,
+                            "type": "function_call",
+                            "name": name,
+                            "arguments": "",
+                            "status": "in_progress"
+                        }
+                    }),
+                    "response.output_item.added",
+                ),
+                encode_json_sse_with_event(
+                    &json!({
+                        "type": "response.function_call_arguments.delta",
+                        "call_id": call_id,
+                        "item_id": call_id,
+                        "delta": delta
+                    }),
+                    "response.function_call_arguments.delta",
+                ),
+            ];
+        }
+        let entry = self
+            .tool_calls
+            .get_mut(call_id)
+            .expect("checked contains_key above");
+        if entry.name.is_empty() {
+            entry.name = name.to_string();
+        }
+        entry.arguments.push_str(delta);
         vec![encode_json_sse_with_event(
             &json!({
                 "type": "response.function_call_arguments.delta",
                 "call_id": call_id,
-                "item_id": call_id,
+                "item_id": entry.item_id,
                 "delta": delta
             }),
             "response.function_call_arguments.delta",
@@ -525,10 +608,12 @@ impl InternalSink for OpenAiResponsesSink {
             "failed" => "response.failed",
             _ => "response.completed",
         };
-        vec![encode_json_sse_with_event(
+        let mut out = self.flush_pending_items();
+        out.push(encode_json_sse_with_event(
             &json!({"type": event, "response": response}),
             event,
-        )]
+        ));
+        out
     }
 
     fn on_done(&mut self) -> Vec<Vec<u8>> {
@@ -537,6 +622,37 @@ impl InternalSink for OpenAiResponsesSink {
 }
 
 impl OpenAiResponsesSink {
+    fn ensure_assistant_item(&mut self, out: &mut Vec<Vec<u8>>) -> String {
+        if let Some(item_id) = self.assistant_item_id.clone() {
+            return item_id;
+        }
+        let item_id = if self.response_id.is_empty() {
+            "msg_0".to_string()
+        } else {
+            format!("{}_msg_0", self.response_id)
+        };
+        self.assistant_item_id = Some(item_id.clone());
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        out.push(encode_json_sse_with_event(
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {
+                    "type": "message",
+                    "id": item_id.clone(),
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": ""
+                    }]
+                }
+            }),
+            "response.output_item.added",
+        ));
+        item_id
+    }
+
     fn ensure_reasoning_item(&mut self, out: &mut Vec<Vec<u8>>) -> String {
         if let Some(item_id) = self.reasoning_item_id.clone() {
             return item_id;
@@ -547,10 +663,12 @@ impl OpenAiResponsesSink {
             format!("{}_reasoning_0", self.response_id)
         };
         self.reasoning_item_id = Some(item_id.clone());
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
         out.push(encode_json_sse_with_event(
             &json!({
                 "type": "response.output_item.added",
-                "output_index": 0,
+                "output_index": output_index,
                 "item": {
                     "type": "reasoning",
                     "id": item_id.clone(),
@@ -560,6 +678,69 @@ impl OpenAiResponsesSink {
             "response.output_item.added",
         ));
         item_id
+    }
+
+    fn flush_pending_items(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+
+        if let Some(item_id) = self.assistant_item_id.clone() {
+            out.push(encode_json_sse_with_event(
+                &json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "id": item_id,
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": self.assistant_text
+                        }]
+                    }
+                }),
+                "response.output_item.done",
+            ));
+        }
+
+        if let Some(item_id) = self.reasoning_item_id.clone() {
+            out.push(encode_json_sse_with_event(
+                &json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "reasoning",
+                        "id": item_id,
+                        "summary": [{
+                            "type": "summary_text",
+                            "text": self.reasoning_text
+                        }],
+                        "content": [{
+                            "type": "reasoning_text",
+                            "text": self.reasoning_text
+                        }]
+                    }
+                }),
+                "response.output_item.done",
+            ));
+        }
+
+        for call_id in &self.tool_call_order {
+            if let Some(state) = self.tool_calls.get(call_id) {
+                out.push(encode_json_sse_with_event(
+                    &json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "id": state.item_id,
+                            "call_id": call_id,
+                            "name": state.name,
+                            "arguments": state.arguments
+                        }
+                    }),
+                    "response.output_item.done",
+                ));
+            }
+        }
+
+        out
     }
 }
 
