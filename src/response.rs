@@ -13,6 +13,12 @@ pub fn maybe_transform_json_response(
         (Some(RequestFormat::OpenAiChat), Some(RequestFormat::OpenAiResponses)) => {
             openai_chat_to_openai_responses_response(body)
         }
+        (Some(RequestFormat::ClaudeChat), Some(RequestFormat::OpenAiResponses)) => {
+            claude_to_openai_responses_response(body)
+        }
+        (Some(RequestFormat::GeminiChat), Some(RequestFormat::OpenAiResponses)) => {
+            gemini_to_openai_responses_response(body)
+        }
         (Some(RequestFormat::OpenAiChat), Some(RequestFormat::ClaudeChat)) => {
             openai_chat_to_claude_response(body)
         }
@@ -253,6 +259,291 @@ fn openai_chat_to_openai_responses_response(body: Value) -> Result<Value, ApiErr
     if let Some(response_obj) = response.as_object_mut() {
         for (key, value) in object {
             if matches!(key.as_str(), "id" | "object" | "choices" | "model" | "created" | "created_at" | "usage") {
+                continue;
+            }
+            response_obj.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(response)
+}
+
+fn claude_to_openai_responses_response(body: Value) -> Result<Value, ApiError> {
+    let object = body.as_object().ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_GATEWAY, "response body is not a JSON object")
+            .with_code("PROXY_ERROR")
+    })?;
+
+    let content_blocks = object
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_GATEWAY, "claude response content is missing")
+                .with_code("PROXY_ERROR")
+        })?;
+
+    let response_id = object.get("id").and_then(Value::as_str).unwrap_or("resp");
+    let mut output = Vec::new();
+    let mut message_content = Vec::new();
+    let mut reasoning_parts = Vec::new();
+
+    for block in content_blocks.iter().filter_map(Value::as_object) {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        message_content.push(json!({
+                            "type": "output_text",
+                            "text": text
+                        }));
+                    }
+                }
+            }
+            Some("thinking") => {
+                if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        reasoning_parts.push(text.to_string());
+                    }
+                }
+            }
+            Some("tool_use") => {
+                let arguments = stringify_function_arguments(
+                    block.get("input").unwrap_or(&Value::Null),
+                );
+                output.push(json!({
+                    "type": "function_call",
+                    "id": block.get("id").cloned().unwrap_or_else(|| json!("")),
+                    "call_id": block.get("id").cloned().unwrap_or_else(|| json!("")),
+                    "name": block.get("name").cloned().unwrap_or_else(|| json!("")),
+                    "arguments": arguments
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    if !message_content.is_empty() {
+        output.insert(0, json!({
+            "type": "message",
+            "id": format!("{response_id}_msg_0"),
+            "role": "assistant",
+            "content": message_content
+        }));
+    }
+
+    if !reasoning_parts.is_empty() {
+        let reasoning_text = reasoning_parts.join("\n");
+        let insert_at = usize::from(!output.is_empty() && output[0].get("type").and_then(Value::as_str) == Some("message"));
+        output.insert(insert_at, json!({
+            "type": "reasoning",
+            "id": format!("{response_id}_reasoning_0"),
+            "summary": [{
+                "type": "summary_text",
+                "text": reasoning_text
+            }],
+            "content": [{
+                "type": "reasoning_text",
+                "text": reasoning_text
+            }]
+        }));
+    }
+
+    let stop_reason = object.get("stop_reason").and_then(Value::as_str);
+    let status = match stop_reason {
+        Some("max_tokens") => "incomplete",
+        Some("error") => "failed",
+        _ => "completed",
+    };
+
+    let mut response = json!({
+        "id": object.get("id").cloned().unwrap_or_else(|| json!("")),
+        "object": "response",
+        "model": object.get("model").cloned().unwrap_or_else(|| json!("")),
+        "created_at": numeric_response_timestamp(object.get("created_at")),
+        "status": status,
+        "output": output
+    });
+
+    if let Some(usage) = object.get("usage").and_then(Value::as_object) {
+        let input_tokens = usage.get("input_tokens").cloned().unwrap_or_else(|| json!(0));
+        let output_tokens = usage.get("output_tokens").cloned().unwrap_or_else(|| json!(0));
+        let total_tokens = usage
+            .get("total_tokens")
+            .cloned()
+            .unwrap_or_else(|| {
+                json!(
+                    input_tokens.as_i64().unwrap_or(0) + output_tokens.as_i64().unwrap_or(0)
+                )
+            });
+        response["usage"] = json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens
+        });
+    }
+
+    if let Some(response_obj) = response.as_object_mut() {
+        for (key, value) in object {
+            if matches!(
+                key.as_str(),
+                "id" | "type" | "role" | "content" | "model" | "created_at" | "stop_reason" | "usage"
+            ) {
+                continue;
+            }
+            response_obj.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(response)
+}
+
+fn gemini_to_openai_responses_response(body: Value) -> Result<Value, ApiError> {
+    let object = body.as_object().ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_GATEWAY, "response body is not a JSON object")
+            .with_code("PROXY_ERROR")
+    })?;
+
+    let candidate = object
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_GATEWAY, "gemini response candidates[0] is missing")
+                .with_code("PROXY_ERROR")
+        })?;
+
+    let response_id = object
+        .get("responseId")
+        .and_then(Value::as_str)
+        .unwrap_or("gemini-response");
+    let mut output = Vec::new();
+    let mut message_content = Vec::new();
+    let mut reasoning_parts = Vec::new();
+
+    if let Some(parts) = candidate
+        .get("content")
+        .and_then(Value::as_object)
+        .and_then(|content| content.get("parts"))
+        .and_then(Value::as_array)
+    {
+        for part in parts.iter().filter_map(Value::as_object) {
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        reasoning_parts.push(text.to_string());
+                    }
+                }
+                continue;
+            }
+
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    message_content.push(json!({
+                        "type": "output_text",
+                        "text": text
+                    }));
+                }
+                continue;
+            }
+
+            if let Some(function_call) = part.get("functionCall").and_then(Value::as_object) {
+                let call_id = function_call
+                    .get("id")
+                    .cloned()
+                    .unwrap_or_else(|| json!("gemini_call"));
+                output.push(json!({
+                    "type": "function_call",
+                    "id": call_id.clone(),
+                    "call_id": call_id,
+                    "name": function_call.get("name").cloned().unwrap_or_else(|| json!("")),
+                    "arguments": stringify_function_arguments(
+                        function_call.get("args").unwrap_or(&Value::Null)
+                    )
+                }));
+            }
+        }
+    }
+
+    if !message_content.is_empty() {
+        output.insert(0, json!({
+            "type": "message",
+            "id": format!("{response_id}_msg_0"),
+            "role": "assistant",
+            "content": message_content
+        }));
+    }
+
+    if !reasoning_parts.is_empty() {
+        let reasoning_text = reasoning_parts.join("\n");
+        let insert_at = usize::from(!output.is_empty() && output[0].get("type").and_then(Value::as_str) == Some("message"));
+        output.insert(insert_at, json!({
+            "type": "reasoning",
+            "id": format!("{response_id}_reasoning_0"),
+            "summary": [{
+                "type": "summary_text",
+                "text": reasoning_text
+            }],
+            "content": [{
+                "type": "reasoning_text",
+                "text": reasoning_text
+            }]
+        }));
+    }
+
+    let finish_reason = candidate.get("finishReason").and_then(Value::as_str);
+    let status = match finish_reason {
+        Some("MAX_TOKENS") => "incomplete",
+        Some("ERROR") => "failed",
+        _ => "completed",
+    };
+
+    let mut response = json!({
+        "id": response_id,
+        "object": "response",
+        "model": object.get("modelVersion").cloned().unwrap_or_else(|| json!("gemini")),
+        "created_at": numeric_response_timestamp(object.get("createTime")),
+        "status": status,
+        "output": output
+    });
+
+    if let Some(usage) = object.get("usageMetadata").and_then(Value::as_object) {
+        let input_tokens = usage
+            .get("promptTokenCount")
+            .cloned()
+            .unwrap_or_else(|| json!(0));
+        let candidate_tokens = usage
+            .get("candidatesTokenCount")
+            .cloned()
+            .unwrap_or_else(|| json!(0));
+        let thought_tokens = usage
+            .get("thoughtsTokenCount")
+            .cloned()
+            .unwrap_or_else(|| json!(0));
+        let output_tokens = json!(
+            candidate_tokens.as_i64().unwrap_or(0) + thought_tokens.as_i64().unwrap_or(0)
+        );
+        let total_tokens = usage
+            .get("totalTokenCount")
+            .cloned()
+            .unwrap_or_else(|| {
+                json!(
+                    input_tokens.as_i64().unwrap_or(0) + output_tokens.as_i64().unwrap_or(0)
+                )
+            });
+        response["usage"] = json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens
+        });
+    }
+
+    if let Some(response_obj) = response.as_object_mut() {
+        for (key, value) in object {
+            if matches!(
+                key.as_str(),
+                "candidates" | "responseId" | "modelVersion" | "createTime" | "usageMetadata"
+            ) {
                 continue;
             }
             response_obj.insert(key.clone(), value.clone());
@@ -561,5 +852,13 @@ fn parse_tool_arguments(arguments: &Value) -> Value {
         Value::String(raw) => serde_json::from_str(raw).unwrap_or_else(|_| json!({})),
         Value::Object(_) | Value::Array(_) => arguments.clone(),
         _ => json!({}),
+    }
+}
+
+fn numeric_response_timestamp(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::Number(number)) => Value::Number(number.clone()),
+        Some(Value::String(text)) => text.parse::<i64>().map_or_else(|_| json!(0), |value| json!(value)),
+        _ => json!(0),
     }
 }

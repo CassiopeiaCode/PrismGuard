@@ -296,6 +296,160 @@ async fn upstream_openai_chat_reasoning_response_transforms_to_claude_thinking_c
 }
 
 #[tokio::test]
+async fn upstream_claude_json_is_transformed_back_to_openai_responses() {
+    let upstream_body = json!({
+        "id": "msg_claude_resp_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-5",
+        "created_at": 1710000100,
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": "step one"
+            },
+            {
+                "type": "text",
+                "text": "hello from claude"
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_123",
+                "name": "lookup_weather",
+                "input": {
+                    "city": "Paris"
+                }
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 3,
+            "output_tokens": 5
+        }
+    });
+
+    let upstream_base = spawn_json_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "claude_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello from claude");
+    assert_eq!(body["output"][1]["type"], "reasoning");
+    assert_eq!(body["output"][1]["summary"][0]["text"], "step one");
+    assert_eq!(body["output"][2]["type"], "function_call");
+    assert_eq!(body["output"][2]["call_id"], "toolu_123");
+    assert_eq!(body["output"][2]["name"], "lookup_weather");
+    assert_eq!(body["output"][2]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(body["usage"]["input_tokens"], 3);
+    assert_eq!(body["usage"]["output_tokens"], 5);
+    assert_eq!(body["usage"]["total_tokens"], 8);
+}
+
+#[tokio::test]
+async fn upstream_gemini_json_is_transformed_back_to_openai_responses() {
+    let upstream_body = json!({
+        "responseId": "gem_resp_123",
+        "modelVersion": "gemini-2.5-flash",
+        "createTime": "2026-05-20T00:00:00Z",
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [
+                    {
+                        "text": "hidden chain",
+                        "thought": true
+                    },
+                    {
+                        "text": "hello from gemini"
+                    },
+                    {
+                        "functionCall": {
+                            "id": "call_g1",
+                            "name": "lookup_weather",
+                            "args": {
+                                "city": "Paris"
+                            }
+                        }
+                    }
+                ]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 7,
+            "candidatesTokenCount": 11,
+            "totalTokenCount": 18
+        }
+    });
+
+    let upstream_base = spawn_json_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "gemini_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["id"], "gem_resp_123");
+    assert_eq!(body["model"], "gemini-2.5-flash");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello from gemini");
+    assert_eq!(body["output"][1]["type"], "reasoning");
+    assert_eq!(body["output"][1]["summary"][0]["text"], "hidden chain");
+    assert_eq!(body["output"][2]["type"], "function_call");
+    assert_eq!(body["output"][2]["call_id"], "call_g1");
+    assert_eq!(body["output"][2]["name"], "lookup_weather");
+    assert_eq!(body["output"][2]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(body["usage"]["input_tokens"], 7);
+    assert_eq!(body["usage"]["output_tokens"], 11);
+    assert_eq!(body["usage"]["total_tokens"], 18);
+}
+
+#[tokio::test]
 async fn upstream_openai_responses_message_content_items_object_maps_to_chat() {
     let upstream_body = json!({
         "id": "resp_items_obj",
