@@ -28,6 +28,48 @@ uv run python eval_profile.py --profile 4claudecode --limit 2000
 - 默认走 `scikit-learn` 的 `HashingVectorizer` 快速路径（更接近 Rust/训练时的 Hashing 行为，也快很多）
 - 如果环境缺少依赖，会自动回退到纯 Python 慢路径（用于小样本调试）
 
+## Inline 审核链路延时诊断
+
+针对“开启本地模型 + LLM 审核后，请求为什么变慢”的专项诊断脚本：
+
+```bash
+cd py-scripts
+uv run python bench_inline_moderation.py --profile 4claudecode
+uv run python bench_inline_moderation.py --profile 4claudecode --mode stream
+uv run python bench_inline_moderation.py --profile 4claudecode --base-url http://127.0.0.1:8000
+uv run python bench_inline_moderation.py --profile 4claudecode --request-file ./request.json --verbose
+```
+
+脚本行为：
+- 优先从运行中的 `Prismguand-Rust` 进程环境读取 `HOST`/`PORT`
+- 读取失败时回退到仓库根目录 `.env`
+- 仍未命中时回退到 `http://127.0.0.1:8000`
+- 对候选地址执行 `/healthz` 探活，失败时要求显式传 `--base-url`
+- 自动启动本地模拟 upstream，同时覆盖非流式 JSON 和流式 SSE
+- 通过 inline config 请求当前运行中的 PrismGuard，并启用指定 `profile` 的 `smart_moderation`
+- 默认只随机化 `messages` 中第一条 `user` 纯文本内容，追加 `benchmark_nonce=<随机值>`，避免重复请求命中审核缓存
+- 输出 `total_latency_ms`、`first_event_latency_ms`、`proxy_overhead_ms` 以及详细 troubleshooting 建议
+
+常用参数：
+- `--profile`：必填，`configs/mod_profiles/<profile>/profile.json` 的目录名
+- `--mode {all,non-stream,stream}`：默认同时跑两种模式
+- `--request-file`：自定义请求体 JSON；不传时使用内置最小 OpenAI Chat 请求
+- `--upstream-delay-ms`：模拟非流式上游延时
+- `--stream-first-token-delay-ms`：模拟流式首事件延时
+- `--stream-tail-delay-ms`：模拟流式尾部延时
+- `--timeout-secs`：代理请求和调试接口超时
+- `--verbose`：打印更多 profile 诊断信息
+- `--disable-randomize-user-text`：关闭默认的随机 `user` 文本后缀，回到固定文本模式做对照
+
+输出中的排障信息会包含：
+- 地址发现过程与最终命中的主程序地址
+- `profile` 的 AI 审核配置摘要
+- 本地模型产物缺失情况
+- `/debug/profile/<profile>` 返回的关键状态
+- 代理返回体或错误体摘要
+- 流式 SSE 预览和 `[DONE]` 是否出现
+- 基于耗时形状的疑难排查建议
+
 ## 单条耗时对比（Python vs Rust 在线服务）
 
 基准脚本：
