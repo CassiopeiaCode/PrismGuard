@@ -229,7 +229,12 @@ fn openai_chat_sse_can_transform_to_openai_responses_sse() {
     let text = String::from_utf8(transformed).expect("utf8");
 
     assert!(text.contains("\"type\":\"response.created\""), "{text}");
+    assert!(text.contains("\"type\":\"response.output_item.added\""), "{text}");
+    assert!(text.contains("\"type\":\"message\""), "{text}");
     assert!(text.contains("\"type\":\"response.output_text.delta\""), "{text}");
+    assert!(text.contains("\"item_id\":\"chatcmpl_1_msg_0\""), "{text}");
+    assert!(text.contains("\"type\":\"response.output_item.done\""), "{text}");
+    assert!(text.contains("\"text\":\"hello\""), "{text}");
     assert!(text.contains("\"type\":\"response.completed\""), "{text}");
     assert!(text.contains("\"input_tokens\":3"), "{text}");
     assert!(text.contains("\"output_tokens\":5"), "{text}");
@@ -265,7 +270,35 @@ fn openai_chat_reasoning_sse_transforms_to_openai_responses_reasoning_events() {
     );
     assert!(text.contains("\"delta\":\"step one\""), "{text}");
     assert!(text.contains("\"content_index\":0"), "{text}");
+    assert!(text.contains("\"type\":\"response.output_item.done\""), "{text}");
     assert!(!text.contains("\"type\":\"response.output_text.delta\""), "{text}");
+    assert!(text.contains("\"type\":\"response.completed\""), "{text}");
+}
+
+#[test]
+fn openai_chat_tool_call_sse_transforms_to_codex_compatible_openai_responses_events() {
+    let raw = concat!(
+        "data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let transformed = streaming::maybe_transform_sse(
+        raw.as_bytes(),
+        Some(RequestFormat::OpenAiChat),
+        Some(RequestFormat::OpenAiResponses),
+    )
+    .expect("transform result");
+    let text = String::from_utf8(transformed).expect("utf8");
+
+    assert!(text.contains("\"type\":\"response.output_item.added\""), "{text}");
+    assert!(text.contains("\"type\":\"function_call\""), "{text}");
+    assert!(text.contains("\"call_id\":\"call_1\""), "{text}");
+    assert!(text.contains("\"type\":\"response.function_call_arguments.delta\""), "{text}");
+    assert!(text.contains("\"delta\":\"{\\\"city\\\":\\\"Paris\\\"}\""), "{text}");
+    assert!(text.contains("\"type\":\"response.output_item.done\""), "{text}");
+    assert!(text.contains("\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\""), "{text}");
     assert!(text.contains("\"type\":\"response.completed\""), "{text}");
 }
 
