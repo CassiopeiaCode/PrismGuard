@@ -10,6 +10,9 @@ pub fn maybe_transform_json_response(
     client_format: Option<RequestFormat>,
 ) -> Result<Value, ApiError> {
     match (upstream_format, client_format) {
+        (Some(RequestFormat::OpenAiChat), Some(RequestFormat::OpenAiResponses)) => {
+            openai_chat_to_openai_responses_response(body)
+        }
         (Some(RequestFormat::OpenAiChat), Some(RequestFormat::ClaudeChat)) => {
             openai_chat_to_claude_response(body)
         }
@@ -140,6 +143,116 @@ fn openai_chat_to_claude_response(body: Value) -> Result<Value, ApiError> {
     if let Some(response_obj) = response.as_object_mut() {
         for (key, value) in object {
             if matches!(key.as_str(), "id" | "model" | "choices" | "usage") {
+                continue;
+            }
+            response_obj.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(response)
+}
+
+fn openai_chat_to_openai_responses_response(body: Value) -> Result<Value, ApiError> {
+    let object = body.as_object().ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_GATEWAY, "response body is not a JSON object")
+            .with_code("PROXY_ERROR")
+    })?;
+
+    let choice = object
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_GATEWAY, "chat response choices[0] is missing")
+                .with_code("PROXY_ERROR")
+        })?;
+
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::BAD_GATEWAY, "chat response message is missing")
+                .with_code("PROXY_ERROR")
+        })?;
+
+    let mut output = Vec::new();
+
+    let message_content = chat_message_to_responses_content(message.get("content"));
+    if !message_content.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "id": format!("{}_msg_0", object.get("id").and_then(Value::as_str).unwrap_or("resp")),
+            "role": "assistant",
+            "content": message_content
+        }));
+    }
+
+    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !reasoning.is_empty() {
+            output.push(json!({
+                "type": "reasoning",
+                "id": format!("{}_reasoning_0", object.get("id").and_then(Value::as_str).unwrap_or("resp")),
+                "summary": [{
+                    "type": "summary_text",
+                    "text": reasoning
+                }],
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": reasoning
+                }]
+            }));
+        }
+    }
+
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls.iter().filter_map(Value::as_object) {
+            let function = tool_call
+                .get("function")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            output.push(json!({
+                "type": "function_call",
+                "id": tool_call.get("id").cloned().unwrap_or_else(|| json!("")),
+                "call_id": tool_call.get("id").cloned().unwrap_or_else(|| json!("")),
+                "name": function.get("name").cloned().unwrap_or_else(|| json!("")),
+                "arguments": function.get("arguments").cloned().unwrap_or_else(|| json!(""))
+            }));
+        }
+    }
+
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let status = match finish_reason {
+        Some("length") => "incomplete",
+        Some("error") => "failed",
+        _ => "completed",
+    };
+
+    let mut response = json!({
+        "id": object.get("id").cloned().unwrap_or_else(|| json!("")),
+        "object": "response",
+        "model": object.get("model").cloned().unwrap_or_else(|| json!("")),
+        "created_at": object
+            .get("created")
+            .cloned()
+            .or_else(|| object.get("created_at").cloned())
+            .unwrap_or_else(|| json!(0)),
+        "status": status,
+        "output": output
+    });
+
+    if let Some(usage) = object.get("usage").and_then(Value::as_object) {
+        response["usage"] = json!({
+            "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or_else(|| json!(0)),
+            "output_tokens": usage.get("completion_tokens").cloned().unwrap_or_else(|| json!(0)),
+            "total_tokens": usage.get("total_tokens").cloned().unwrap_or_else(|| json!(0))
+        });
+    }
+
+    if let Some(response_obj) = response.as_object_mut() {
+        for (key, value) in object {
+            if matches!(key.as_str(), "id" | "object" | "choices" | "model" | "created" | "created_at" | "usage") {
                 continue;
             }
             response_obj.insert(key.clone(), value.clone());
@@ -372,6 +485,40 @@ fn response_message_parts(content: Option<&Value>) -> Vec<Value> {
                 vec![Value::Object(obj.clone())]
             }
         }
+        _ => Vec::new(),
+    }
+}
+
+fn chat_message_to_responses_content(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![json!({
+                "type": "output_text",
+                "text": text
+            })]
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                let part = part.as_object()?;
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => part.get("text").and_then(Value::as_str).map(|text| {
+                        json!({
+                            "type": "output_text",
+                            "text": text
+                        })
+                    }),
+                    Some("image_url") => {
+                        let image_url = part.get("image_url")?;
+                        Some(json!({
+                            "type": "image_url",
+                            "image_url": image_url
+                        }))
+                    }
+                    _ => None,
+                }
+            })
+            .collect(),
         _ => Vec::new(),
     }
 }

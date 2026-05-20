@@ -84,6 +84,171 @@ async fn upstream_openai_responses_json_is_transformed_back_to_openai_chat() {
 }
 
 #[tokio::test]
+async fn upstream_openai_chat_json_is_transformed_back_to_openai_responses() {
+    let upstream_body = json!({
+        "id": "chatcmpl_resp_123",
+        "object": "chat.completion",
+        "created": 1710000000,
+        "model": "gpt-4.1-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "hello"
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 5,
+            "total_tokens": 8
+        }
+    });
+
+    let upstream_base = spawn_json_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "hi"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["type"], "message");
+    assert_eq!(body["output"][0]["role"], "assistant");
+    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(body["output"][0]["content"][0]["text"], "hello");
+    assert_eq!(body["usage"]["input_tokens"], 3);
+    assert_eq!(body["usage"]["output_tokens"], 5);
+    assert_eq!(body["usage"]["total_tokens"], 8);
+}
+
+#[tokio::test]
+async fn upstream_openai_chat_tool_calls_are_transformed_back_to_openai_responses_function_calls() {
+    let upstream_body = json!({
+        "id": "chatcmpl_tool_resp",
+        "object": "chat.completion",
+        "created": 1710000001,
+        "model": "gpt-4.1-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_weather",
+                        "arguments": "{\"city\":\"Paris\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+
+    let upstream_base = spawn_json_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "weather?"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["call_id"], "call_1");
+    assert_eq!(body["output"][0]["name"], "lookup_weather");
+    assert_eq!(body["output"][0]["arguments"], "{\"city\":\"Paris\"}");
+}
+
+#[tokio::test]
+async fn upstream_openai_chat_reasoning_content_is_transformed_back_to_openai_responses_reasoning_item() {
+    let upstream_body = json!({
+        "id": "chatcmpl_reasoning_resp",
+        "object": "chat.completion",
+        "created": 1710000002,
+        "model": "gpt-4.1-mini",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "reasoning_content": "step one"
+            },
+            "finish_reason": "stop"
+        }]
+    });
+
+    let upstream_base = spawn_json_upstream(upstream_body).await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(&json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    }).to_string());
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "think"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["output"][0]["type"], "reasoning");
+    assert_eq!(body["output"][0]["summary"][0]["type"], "summary_text");
+    assert_eq!(body["output"][0]["summary"][0]["text"], "step one");
+    assert_eq!(body["output"][0]["content"][0]["type"], "reasoning_text");
+    assert_eq!(body["output"][0]["content"][0]["text"], "step one");
+}
+
+#[tokio::test]
 async fn upstream_openai_chat_reasoning_response_transforms_to_claude_thinking_content() {
     let upstream_body = json!({
         "id": "chatcmpl_reasoning",
