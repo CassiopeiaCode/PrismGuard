@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
@@ -12,8 +12,8 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::time::timeout as tokio_timeout;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::timeout as tokio_timeout;
 
 use crate::moderation::bow;
 use crate::moderation::fasttext;
@@ -27,8 +27,9 @@ const CACHE_SIZE: usize = 1024;
 const MAX_CACHE_PROFILES: usize = 50;
 
 static LLM_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static MODERATION_CACHE: OnceLock<Mutex<IndexMap<String, IndexMap<String, SmartModerationResult>>>> =
-    OnceLock::new();
+static MODERATION_CACHE: OnceLock<
+    Mutex<IndexMap<String, IndexMap<String, SmartModerationResult>>>,
+> = OnceLock::new();
 #[cfg(feature = "storage-debug")]
 static HISTORY_STORAGE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 static REQUEST_RANDOM_STATE: OnceLock<AtomicU64> = OnceLock::new();
@@ -58,6 +59,82 @@ pub struct ModerationDebugInfo {
     pub llm_result: Option<String>,
     pub llm_latency_ms: Option<f64>,
     pub llm_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalDecision {
+    Allow,
+    Block,
+    Uncertain,
+}
+
+#[derive(Debug, Clone)]
+struct LocalModelEvaluation {
+    source: String,
+    probability: f64,
+    decision: LocalDecision,
+    latency_ms: f64,
+}
+
+impl LocalModelEvaluation {
+    fn debug_info(&self) -> ModerationDebugInfo {
+        let local_model_decision = match self.decision {
+            LocalDecision::Allow => "allow",
+            LocalDecision::Block => "block",
+            LocalDecision::Uncertain => "uncertain",
+        };
+        ModerationDebugInfo {
+            local_model_source: Some(self.source.clone()),
+            local_model_confidence: Some(self.probability),
+            local_model_latency_ms: Some(self.latency_ms),
+            local_model_decision: Some(local_model_decision.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn direct_result(&self) -> Option<SmartModerationResult> {
+        match self.decision {
+            LocalDecision::Allow => Some(SmartModerationResult {
+                violation: false,
+                category: None,
+                reason: Some(format!(
+                    "{}: low risk (p={:.3})",
+                    self.source, self.probability
+                )),
+                source: self.source.clone(),
+                confidence: Some(self.probability),
+                debug: None,
+            }),
+            LocalDecision::Block => Some(SmartModerationResult {
+                violation: true,
+                category: None,
+                reason: Some(format!(
+                    "{}: high risk (p={:.3})",
+                    self.source, self.probability
+                )),
+                source: self.source.clone(),
+                confidence: Some(self.probability),
+                debug: None,
+            }),
+            LocalDecision::Uncertain => None,
+        }
+    }
+
+    fn fallback_result(&self, profile: &ModerationProfile) -> SmartModerationResult {
+        let threshold = fallback_threshold(profile);
+        let violation = self.probability >= threshold;
+        SmartModerationResult {
+            violation,
+            category: None,
+            reason: Some(format!(
+                "{}: llm concurrency fallback (p={:.3}, threshold={threshold:.3})",
+                self.source, self.probability
+            )),
+            source: "local_fallback".to_string(),
+            confidence: Some(self.probability),
+            debug: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -120,38 +197,97 @@ async fn decide_moderation(
     env_map: &HashMap<String, String>,
 ) -> Result<SmartModerationResult, SmartModerationError> {
     if should_force_ai_review(profile) {
-        return run_ai_moderation_with_history(text, profile, http_client, env_map, None).await;
+        let (local_evaluation, debug) =
+            optional_local_evaluation_for_concurrency_fallback(text, profile);
+        let inherited_debug = (!is_empty_debug(&debug)).then_some(debug);
+        return run_ai_moderation_with_history(
+            text,
+            profile,
+            http_client,
+            env_map,
+            local_evaluation,
+            inherited_debug,
+        )
+        .await;
     }
 
     if profile.local_model_exists() {
-        let (result, debug) = evaluate_local_model(text, profile);
-        if let Some(mut result) = result {
-            result.debug = Some(debug);
-            return Ok(result);
+        let (evaluation, debug) = evaluate_local_model_state(text, profile);
+        if let Some(evaluation) = evaluation {
+            if let Some(mut result) = evaluation.direct_result() {
+                result.debug = Some(debug);
+                return Ok(result);
+            }
+
+            return run_ai_moderation_with_history(
+                text,
+                profile,
+                http_client,
+                env_map,
+                Some(evaluation),
+                Some(debug),
+            )
+            .await;
         }
 
-        return run_ai_moderation_with_history(text, profile, http_client, env_map, Some(debug)).await;
+        return run_ai_moderation_with_history(
+            text,
+            profile,
+            http_client,
+            env_map,
+            None,
+            Some(debug),
+        )
+        .await;
     }
 
-    run_ai_moderation_with_history(text, profile, http_client, env_map, None).await
+    run_ai_moderation_with_history(text, profile, http_client, env_map, None, None).await
 }
 
-fn should_force_ai_review(profile: &ModerationProfile) -> bool {
-    let rate = profile.config.probability.ai_review_rate;
-    if rate <= 0.0 {
-        return false;
-    }
-    if rate >= 1.0 {
-        return true;
+fn should_use_concurrency_limit_fallback(profile: &ModerationProfile) -> bool {
+    profile.config.probability.enable_concurrency_limit_fallback
+}
+
+fn fallback_threshold(profile: &ModerationProfile) -> f64 {
+    let low = profile.config.probability.low_risk_threshold;
+    let high = profile.config.probability.high_risk_threshold;
+    (low + high) / 2.0
+}
+
+fn is_empty_debug(debug: &ModerationDebugInfo) -> bool {
+    debug.local_model_source.is_none()
+        && debug.local_model_confidence.is_none()
+        && debug.local_model_latency_ms.is_none()
+        && debug.local_model_decision.is_none()
+        && !debug.llm_reviewed
+        && debug.llm_result.is_none()
+        && debug.llm_latency_ms.is_none()
+        && debug.llm_error.is_none()
+}
+
+fn optional_local_evaluation_for_concurrency_fallback(
+    text: &str,
+    profile: &ModerationProfile,
+) -> (Option<LocalModelEvaluation>, ModerationDebugInfo) {
+    if should_use_concurrency_limit_fallback(profile) && profile.local_model_exists() {
+        return evaluate_local_model_state(text, profile);
     }
 
-    next_random_unit() < rate
+    (None, ModerationDebugInfo::default())
 }
 
 fn evaluate_local_model(
     text: &str,
     profile: &ModerationProfile,
 ) -> (Option<SmartModerationResult>, ModerationDebugInfo) {
+    let (evaluation, debug) = evaluate_local_model_state(text, profile);
+    (evaluation.and_then(|item| item.direct_result()), debug)
+}
+
+fn evaluate_local_model_state(
+    text: &str,
+    profile: &ModerationProfile,
+) -> (Option<LocalModelEvaluation>, ModerationDebugInfo) {
     let started = Instant::now();
     let (probability, source) = match profile.config.local_model_type.as_str() {
         "fasttext" => match fasttext::predict_proba(text, profile) {
@@ -197,43 +333,33 @@ fn evaluate_local_model(
     let low = profile.config.probability.low_risk_threshold;
     let high = profile.config.probability.high_risk_threshold;
     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut debug = ModerationDebugInfo {
-        local_model_source: Some(source.to_string()),
-        local_model_confidence: Some(probability),
-        local_model_latency_ms: Some(latency_ms),
-        ..Default::default()
+    let decision = if probability < low {
+        LocalDecision::Allow
+    } else if probability > high {
+        LocalDecision::Block
+    } else {
+        LocalDecision::Uncertain
     };
+    let evaluation = LocalModelEvaluation {
+        source: source.to_string(),
+        probability,
+        decision,
+        latency_ms,
+    };
+    let debug = evaluation.debug_info();
+    (Some(evaluation), debug)
+}
 
-    if probability < low {
-        debug.local_model_decision = Some("allow".to_string());
-        return (
-            Some(SmartModerationResult {
-                violation: false,
-                category: None,
-                reason: Some(format!("{source}: low risk (p={probability:.3})")),
-                source: source.to_string(),
-                confidence: Some(probability),
-                debug: None,
-            }),
-            debug,
-        );
+fn should_force_ai_review(profile: &ModerationProfile) -> bool {
+    let rate = profile.config.probability.ai_review_rate;
+    if rate <= 0.0 {
+        return false;
     }
-    if probability > high {
-        debug.local_model_decision = Some("block".to_string());
-        return (
-            Some(SmartModerationResult {
-                violation: true,
-                category: None,
-                reason: Some(format!("{source}: high risk (p={probability:.3})")),
-                source: source.to_string(),
-                confidence: Some(probability),
-                debug: None,
-            }),
-            debug,
-        );
+    if rate >= 1.0 {
+        return true;
     }
-    debug.local_model_decision = Some("uncertain".to_string());
-    (None, debug)
+
+    next_random_unit() < rate
 }
 
 async fn llm_moderate(
@@ -327,7 +453,11 @@ async fn llm_moderate(
             Ok(Ok(mut parsed)) => {
                 parsed.debug = Some(ModerationDebugInfo {
                     llm_reviewed: true,
-                    llm_result: Some(if parsed.violation { "block".to_string() } else { "allow".to_string() }),
+                    llm_result: Some(if parsed.violation {
+                        "block".to_string()
+                    } else {
+                        "allow".to_string()
+                    }),
                     llm_latency_ms: Some(started.elapsed().as_secs_f64() * 1000.0),
                     ..Default::default()
                 });
@@ -358,9 +488,7 @@ async fn llm_moderate(
     .into())
 }
 
-async fn read_openai_chat_sse_content(
-    response: reqwest::Response,
-) -> Result<String> {
+async fn read_openai_chat_sse_content(response: reqwest::Response) -> Result<String> {
     use futures_util::StreamExt;
 
     let mut stream = response.bytes_stream();
@@ -441,6 +569,7 @@ async fn run_ai_moderation_with_history(
     profile: &ModerationProfile,
     http_client: &Client,
     env_map: &HashMap<String, String>,
+    local_evaluation: Option<LocalModelEvaluation>,
     inherited_debug: Option<ModerationDebugInfo>,
 ) -> Result<SmartModerationResult, SmartModerationError> {
     if let Some(mut result) = load_history_result(text, profile).await? {
@@ -454,28 +583,48 @@ async fn run_ai_moderation_with_history(
         result.debug = Some(debug);
         return Ok(result);
     }
-    let mut result = llm_moderate(text, profile, http_client, env_map).await.map_err(|err| {
-        let mut debug = inherited_debug.clone().unwrap_or_default();
-        debug.llm_reviewed = true;
-        debug.llm_result = Some("error".to_string());
-        debug.llm_error = Some(truncate_header_value(&match &err {
-            SmartModerationError::ConcurrencyLimit(message) => message.clone(),
-            SmartModerationError::Other(error, _) => format!("{error:#}"),
-        }));
-        match err {
-            SmartModerationError::ConcurrencyLimit(message) => {
-                SmartModerationError::Other(anyhow!(message), Some(debug))
-            }
-            SmartModerationError::Other(error, _) => SmartModerationError::Other(error, Some(debug)),
+    let mut result = match llm_moderate(text, profile, http_client, env_map).await {
+        Ok(result) => result,
+        Err(SmartModerationError::ConcurrencyLimit(message))
+            if should_use_concurrency_limit_fallback(profile) && local_evaluation.is_some() =>
+        {
+            let mut result = local_evaluation
+                .as_ref()
+                .expect("local evaluation checked above")
+                .fallback_result(profile);
+            let mut debug = inherited_debug.clone().unwrap_or_default();
+            debug.llm_reviewed = true;
+            debug.llm_result = Some("error".to_string());
+            debug.llm_error = Some(truncate_header_value(&message));
+            result.debug = Some(debug);
+            return Ok(result);
         }
-    })?;
+        Err(err) => {
+            let mut debug = inherited_debug.clone().unwrap_or_default();
+            debug.llm_reviewed = true;
+            debug.llm_result = Some("error".to_string());
+            debug.llm_error = Some(truncate_header_value(&match &err {
+                SmartModerationError::ConcurrencyLimit(message) => message.clone(),
+                SmartModerationError::Other(error, _) => format!("{error:#}"),
+            }));
+            return Err(match err {
+                SmartModerationError::ConcurrencyLimit(message) => {
+                    SmartModerationError::Other(anyhow!(message), Some(debug))
+                }
+                SmartModerationError::Other(error, _) => {
+                    SmartModerationError::Other(error, Some(debug))
+                }
+            });
+        }
+    };
     let mut debug = inherited_debug.unwrap_or_default();
-    let latency = result
-        .debug
-        .as_ref()
-        .and_then(|value| value.llm_latency_ms);
+    let latency = result.debug.as_ref().and_then(|value| value.llm_latency_ms);
     debug.llm_reviewed = true;
-    debug.llm_result = Some(if result.violation { "block".to_string() } else { "allow".to_string() });
+    debug.llm_result = Some(if result.violation {
+        "block".to_string()
+    } else {
+        "allow".to_string()
+    });
     debug.llm_latency_ms = latency;
     result.debug = Some(debug);
     save_history_result(text, profile, &result).await?;
@@ -523,7 +672,9 @@ async fn load_history_result(
         }))
     })
     .await
-    .map_err(|err| SmartModerationError::Other(anyhow!("history storage read task failed: {err}"), None))?
+    .map_err(|err| {
+        SmartModerationError::Other(anyhow!("history storage read task failed: {err}"), None)
+    })?
 }
 
 #[cfg(not(feature = "storage-debug"))]
@@ -552,7 +703,9 @@ async fn save_history_result(
         Ok(())
     })
     .await
-    .map_err(|err| SmartModerationError::Other(anyhow!("history storage write task failed: {err}"), None))?
+    .map_err(|err| {
+        SmartModerationError::Other(anyhow!("history storage write task failed: {err}"), None)
+    })?
 }
 
 #[cfg(not(feature = "storage-debug"))]
@@ -587,7 +740,9 @@ fn extract_content_text(content: &Value) -> String {
             .iter()
             .filter_map(|part| {
                 if part.get("type").and_then(Value::as_str) == Some("text") {
-                    part.get("text").and_then(Value::as_str).map(ToString::to_string)
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
                 } else {
                     None
                 }
@@ -598,18 +753,25 @@ fn extract_content_text(content: &Value) -> String {
     }
 }
 
-fn parse_moderation_content(
-    content: &str,
-) -> Result<SmartModerationResult, SmartModerationError> {
+fn parse_moderation_content(content: &str) -> Result<SmartModerationResult, SmartModerationError> {
     let json_text = extract_json_object(content)
         .ok_or_else(|| anyhow!("llm moderation content is not a JSON object"))?;
     let data: Value = serde_json::from_str(json_text)
         .map_err(|err| anyhow!(err).context("failed to decode moderation JSON"))?;
 
     Ok(SmartModerationResult {
-        violation: data.get("violation").and_then(Value::as_bool).unwrap_or(false),
-        category: data.get("category").and_then(Value::as_str).map(ToString::to_string),
-        reason: data.get("reason").and_then(Value::as_str).map(ToString::to_string),
+        violation: data
+            .get("violation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        category: data
+            .get("category")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        reason: data
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
         source: "ai".to_string(),
         confidence: data.get("confidence").and_then(Value::as_f64),
         debug: None,
@@ -738,8 +900,8 @@ mod tests {
     use crate::profile::{ModerationProfile, ProfileConfig};
 
     use super::{
-        pick_model_for_attempt, save_cache, set_test_random_values, should_force_ai_review,
-        SmartModerationResult, MODERATION_CACHE,
+        evaluate_local_model, fallback_threshold, pick_model_for_attempt, save_cache,
+        set_test_random_values, should_force_ai_review, SmartModerationResult, MODERATION_CACHE,
     };
 
     fn test_profile() -> ModerationProfile {
@@ -819,5 +981,24 @@ mod tests {
 
         drop(guard);
         clear_cache();
+    }
+
+    #[test]
+    fn concurrency_limit_fallback_uses_probability_midpoint() {
+        let mut profile = test_profile();
+        profile.config.probability.low_risk_threshold = 0.2;
+        profile.config.probability.high_risk_threshold = 0.8;
+
+        let threshold = fallback_threshold(&profile);
+        assert_eq!(threshold, 0.5);
+    }
+
+    #[test]
+    fn evaluate_local_model_returns_skipped_debug_when_runtime_is_missing() {
+        let profile = test_profile();
+        let (result, debug) = evaluate_local_model("anything", &profile);
+
+        assert!(result.is_none());
+        assert_eq!(debug.local_model_decision.as_deref(), Some("skipped"));
     }
 }

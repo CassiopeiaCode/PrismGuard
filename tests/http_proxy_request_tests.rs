@@ -4,6 +4,8 @@
 mod config;
 #[path = "../src/format.rs"]
 mod format;
+#[path = "../src/moderation/mod.rs"]
+mod moderation;
 #[path = "../src/profile.rs"]
 mod profile;
 #[path = "../src/proxy.rs"]
@@ -17,12 +19,10 @@ mod sample_rpc;
 #[cfg(feature = "storage-debug")]
 #[path = "../src/storage.rs"]
 mod storage;
-#[path = "../src/training.rs"]
-mod training;
-#[path = "../src/moderation/mod.rs"]
-mod moderation;
 #[path = "../src/streaming.rs"]
 mod streaming;
+#[path = "../src/training.rs"]
+mod training;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -41,9 +41,9 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 #[cfg(feature = "storage-debug")]
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
+use routes::{router as proxy_router, AppState};
 #[cfg(feature = "storage-debug")]
 use rusqlite::{params, Connection};
-use routes::{router as proxy_router, AppState};
 use serde_json::{json, Value};
 
 #[derive(Clone, Debug)]
@@ -60,9 +60,7 @@ struct UpstreamState {
 
 fn local_profile_dir_or_skip(profile_name: &str) -> Option<PathBuf> {
     if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        eprintln!(
-            "skipping local-profile integration test on GitHub Actions: {profile_name}"
-        );
+        eprintln!("skipping local-profile integration test on GitHub Actions: {profile_name}");
         return None;
     }
 
@@ -84,14 +82,17 @@ async fn compressed_json_request_is_decoded_and_preserves_upstream_prefix() {
         "messages": [{"role": "user", "content": "hello"}]
     }));
 
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "claude_chat",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/secret_endpoint/v1/messages");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -118,14 +119,17 @@ async fn compressed_json_request_is_decoded_and_preserves_upstream_prefix() {
 async fn openai_chat_system_messages_map_to_claude_system_string_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "claude_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "claude_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -439,8 +443,7 @@ async fn debug_profile_exposes_training_and_model_status() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"model")
-        .expect("write model marker");
+    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"model").expect("write model marker");
     std::fs::write(
         profile_dir.join(".train_status.json"),
         json!({
@@ -467,12 +470,10 @@ async fn debug_profile_exposes_training_and_model_status() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["profile_name"], profile_name);
     assert_eq!(body["local_model_exists"], true);
-    assert!(
-        body["hashlinear_model_path"]
-            .as_str()
-            .expect("hashlinear model path")
-            .ends_with("/hashlinear_model.pkl")
-    );
+    assert!(body["hashlinear_model_path"]
+        .as_str()
+        .expect("hashlinear model path")
+        .ends_with("/hashlinear_model.pkl"));
     assert_eq!(body["training_status"]["status"], "failed");
     assert_eq!(body["training_status"]["message"], "previous run failed");
     assert_eq!(body["training_decision"]["should_train"], false);
@@ -481,7 +482,10 @@ async fn debug_profile_exposes_training_and_model_status() {
 
 #[tokio::test]
 async fn debug_profile_hashlinear_runtime_only_is_not_treated_as_local_model() {
-    let profile_name = format!("debug-profile-hashlinear-runtime-only-{}", std::process::id());
+    let profile_name = format!(
+        "debug-profile-hashlinear-runtime-only-{}",
+        std::process::id()
+    );
     let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
         return;
     };
@@ -594,12 +598,10 @@ async fn unreachable_upstream_returns_500_proxy_error_like_python() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "PROXY_ERROR");
     assert_eq!(body["error"]["type"], "proxy_error");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("upstream request failed")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("upstream request failed"));
 }
 
 #[tokio::test]
@@ -612,13 +614,16 @@ async fn basic_moderation_blocks_matching_keyword_like_python() {
 
     let proxy_base = spawn_proxy_server().await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "basic_moderation": {
-            "enabled": true,
-            "keywords_file": keyword_file,
-            "error_code": "BASIC_MODERATION_BLOCKED"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "basic_moderation": {
+                "enabled": true,
+                "keywords_file": keyword_file,
+                "error_code": "BASIC_MODERATION_BLOCKED"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -642,12 +647,10 @@ async fn basic_moderation_blocks_matching_keyword_like_python() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("[BASIC_MODERATION_BLOCKED] Matched keyword: blocked phrase")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("[BASIC_MODERATION_BLOCKED] Matched keyword: blocked phrase"));
 }
 
 #[tokio::test]
@@ -660,13 +663,16 @@ async fn basic_moderation_ignores_tool_role_content_like_python() {
 
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "basic_moderation": {
-            "enabled": true,
-            "keywords_file": keyword_file,
-            "error_code": "BASIC_MODERATION_BLOCKED"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "basic_moderation": {
+                "enabled": true,
+                "keywords_file": keyword_file,
+                "error_code": "BASIC_MODERATION_BLOCKED"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -733,8 +739,7 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
 
     let (upstream_base, _seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
@@ -742,12 +747,15 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -806,12 +814,10 @@ async fn smart_moderation_falls_back_to_llm_and_blocks_like_python() {
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
     assert_eq!(body["error"]["moderation_details"]["category"], "abuse");
     assert_eq!(body["error"]["moderation_details"]["reason"], "llm blocked");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("Smart moderation blocked by ai")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("Smart moderation blocked by ai"));
 }
 
 #[tokio::test]
@@ -856,8 +862,7 @@ async fn smart_moderation_falls_back_to_llm_and_allows_clean_request() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
 
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
@@ -865,12 +870,15 @@ async fn smart_moderation_falls_back_to_llm_and_allows_clean_request() {
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -890,7 +898,10 @@ async fn smart_moderation_falls_back_to_llm_and_allows_clean_request() {
     let seen = seen.lock().expect("seen lock");
     let request = seen.last().expect("upstream request");
     assert_eq!(request.path, "/v1/chat/completions");
-    assert_eq!(request.json_body["messages"][0]["content"], "normal request");
+    assert_eq!(
+        request.json_body["messages"][0]["content"],
+        "normal request"
+    );
 }
 
 #[tokio::test]
@@ -938,8 +949,7 @@ async fn smart_moderation_returns_concurrency_limit_like_python() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
 
     let (upstream_base, _seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
@@ -947,12 +957,15 @@ async fn smart_moderation_returns_concurrency_limit_like_python() {
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let mut handles = Vec::new();
@@ -994,13 +1007,147 @@ async fn smart_moderation_returns_concurrency_limit_like_python() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(body["error"]["moderation_details"]["source"], "concurrency_limit");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("并发数超限")
+    assert_eq!(
+        body["error"]["moderation_details"]["source"],
+        "concurrency_limit"
     );
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("并发数超限"));
+
+    for handle in handles {
+        let response = handle.await.expect("join request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn smart_moderation_uses_midpoint_fallback_when_hashlinear_uncertain_and_llm_slots_exhausted()
+{
+    let profile_name = format!(
+        "smart-llm-concurrency-fallback-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    let llm_base = spawn_delayed_openai_chat_server(
+        json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"violation\": false, \"category\": null, \"reason\": \"clean\"}"
+                }
+            }]
+        }),
+        Duration::from_millis(400),
+    )
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 0.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8,
+                "enable_concurrency_limit_fallback": true
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
+    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
+        .expect("write model marker");
+    write_hashlinear_runtime(&profile_dir, 0.0, &[0.0]);
+
+    let (upstream_base, _seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let mut handles = Vec::new();
+    for idx in 0..5 {
+        let proxy_url = proxy_url.clone();
+        handles.push(tokio::spawn(async move {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("reqwest client")
+                .post(proxy_url)
+                .json(&json!({
+                    "model": "gpt-4.1-mini",
+                    "messages": [{"role": "user", "content": format!("occupy fallback slot {idx}")}]
+                }))
+                .send()
+                .await
+                .expect("proxy response")
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let blocked = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "should use midpoint fallback"}]
+        }))
+        .send()
+        .await
+        .expect("blocked response");
+
+    assert_eq!(blocked.status(), StatusCode::BAD_REQUEST);
+    let body: Value = blocked.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(body["error"]["type"], "moderation_error");
+    assert_eq!(body["error"]["source_format"], "openai_chat");
+    assert_eq!(
+        body["error"]["moderation_details"]["source"],
+        "local_fallback"
+    );
+    assert_eq!(
+        body["error"]["moderation_details"]["confidence"]
+            .as_f64()
+            .expect("confidence"),
+        0.5
+    );
+    assert!(body["error"]["moderation_details"]["reason"]
+        .as_str()
+        .expect("reason")
+        .contains("threshold=0.500"));
 
     for handle in handles {
         let response = handle.await.expect("join request");
@@ -1041,20 +1188,22 @@ async fn smart_moderation_uses_local_hashlinear_runtime_before_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, -5.0, &[10.0]);
 
     let proxy_base = spawn_proxy_server().await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1075,7 +1224,10 @@ async fn smart_moderation_uses_local_hashlinear_runtime_before_llm() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["source_format"], "openai_chat");
-    assert_eq!(body["error"]["moderation_details"]["source"], "hashlinear_model");
+    assert_eq!(
+        body["error"]["moderation_details"]["source"],
+        "hashlinear_model"
+    );
     assert!(
         body["error"]["moderation_details"]["confidence"]
             .as_f64()
@@ -1126,8 +1278,7 @@ async fn smart_moderation_hashlinear_runtime_only_falls_back_to_llm_like_python(
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     write_hashlinear_runtime(&profile_dir, -5.0, &[10.0]);
 
     let (upstream_base, _seen) = spawn_upstream_echo_server().await;
@@ -1136,12 +1287,15 @@ async fn smart_moderation_hashlinear_runtime_only_falls_back_to_llm_like_python(
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1205,21 +1359,29 @@ async fn smart_moderation_uses_local_bow_runtime_before_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
     std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
         .expect("write bow vectorizer");
-    write_bow_runtime(&profile_dir, 0.0, &["blocked", "phrase"], &[4.0, 4.0], &[3.0, 3.0]);
+    write_bow_runtime(
+        &profile_dir,
+        0.0,
+        &["blocked", "phrase"],
+        &[4.0, 4.0],
+        &[3.0, 3.0],
+    );
 
     let proxy_base = spawn_proxy_server().await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1291,8 +1453,7 @@ async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
     std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
         .expect("write bow vectorizer");
@@ -1303,12 +1464,15 @@ async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1329,7 +1493,10 @@ async fn smart_moderation_falls_back_to_llm_when_bow_runtime_is_missing() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "bow-fallback");
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "bow-fallback"
+    );
     assert_eq!(
         body["error"]["moderation_details"]["reason"],
         "llm fallback blocked"
@@ -1369,20 +1536,22 @@ async fn smart_moderation_uses_local_fasttext_runtime_before_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
         .expect("write fasttext model");
     write_fasttext_runtime(&profile_dir, 0.0, &[("blocked", 6.0), ("phrase", 6.0)]);
 
     let proxy_base = spawn_proxy_server().await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1402,7 +1571,10 @@ async fn smart_moderation_uses_local_fasttext_runtime_before_llm() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
-    assert_eq!(body["error"]["moderation_details"]["source"], "fasttext_model");
+    assert_eq!(
+        body["error"]["moderation_details"]["source"],
+        "fasttext_model"
+    );
     assert!(
         body["error"]["moderation_details"]["confidence"]
             .as_f64()
@@ -1453,8 +1625,7 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_runtime_is_missing() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
         .expect("write fasttext model");
 
@@ -1464,12 +1635,15 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_runtime_is_missing() {
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1533,21 +1707,29 @@ async fn smart_moderation_allows_low_risk_local_bow_without_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
     std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
         .expect("write bow vectorizer");
-    write_bow_runtime(&profile_dir, -6.0, &["blocked", "phrase"], &[1.0, 1.0], &[0.5, 0.5]);
+    write_bow_runtime(
+        &profile_dir,
+        -6.0,
+        &["blocked", "phrase"],
+        &[1.0, 1.0],
+        &[0.5, 0.5],
+    );
 
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1602,20 +1784,22 @@ async fn smart_moderation_allows_low_risk_local_fasttext_without_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
         .expect("write fasttext model");
     write_fasttext_runtime(&profile_dir, -8.0, &[("blocked", 1.0), ("phrase", 1.0)]);
 
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1685,8 +1869,7 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_low_thre
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
     std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
         .expect("write bow vectorizer");
@@ -1698,12 +1881,15 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_low_thre
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1771,8 +1957,7 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_hig
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
         .expect("write fasttext model");
     write_fasttext_runtime(&profile_dir, boundary_intercept, &[]);
@@ -1783,12 +1968,15 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_hig
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1856,8 +2044,7 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_high_thr
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
     std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
         .expect("write bow vectorizer");
@@ -1869,12 +2056,15 @@ async fn smart_moderation_falls_back_to_llm_when_bow_probability_equals_high_thr
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1942,8 +2132,7 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_low
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
         .expect("write fasttext model");
     write_fasttext_runtime(&profile_dir, boundary_intercept, &[]);
@@ -1954,12 +2143,15 @@ async fn smart_moderation_falls_back_to_llm_when_fasttext_probability_equals_low
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2027,8 +2219,7 @@ async fn smart_moderation_blocks_with_ai_details_when_bow_probability_equals_hig
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("bow_model.pkl"), b"stub-model").expect("write bow model");
     std::fs::write(profile_dir.join("bow_vectorizer.pkl"), b"stub-vectorizer")
         .expect("write bow vectorizer");
@@ -2040,12 +2231,15 @@ async fn smart_moderation_blocks_with_ai_details_when_bow_probability_equals_hig
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2123,8 +2317,7 @@ async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equal
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("fasttext_model.bin"), b"stub-fasttext")
         .expect("write fasttext model");
     write_fasttext_runtime(&profile_dir, boundary_intercept, &[]);
@@ -2135,12 +2328,15 @@ async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equal
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2162,7 +2358,10 @@ async fn smart_moderation_blocks_with_ai_details_when_fasttext_probability_equal
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "fasttext-edge");
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "fasttext-edge"
+    );
     assert_eq!(
         body["error"]["moderation_details"]["reason"],
         "equal low threshold should use ai"
@@ -2202,20 +2401,22 @@ async fn smart_moderation_allows_low_risk_local_hashlinear_without_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, 5.0, &[-10.0]);
 
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2235,7 +2436,10 @@ async fn smart_moderation_allows_low_risk_local_hashlinear_without_llm() {
     let seen = seen.lock().expect("seen lock");
     let request = seen.last().expect("upstream request");
     assert_eq!(request.path, "/v1/chat/completions");
-    assert_eq!(request.json_body["messages"][0]["content"], "local low risk should pass");
+    assert_eq!(
+        request.json_body["messages"][0]["content"],
+        "local low risk should pass"
+    );
 }
 
 #[tokio::test]
@@ -2280,8 +2484,7 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_is_uncertain() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, 0.0, &[0.0]);
@@ -2292,12 +2495,15 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_is_uncertain() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2320,7 +2526,10 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_is_uncertain() {
     assert_eq!(body["error"]["source_format"], "openai_chat");
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
     assert_eq!(body["error"]["moderation_details"]["category"], "policy");
-    assert_eq!(body["error"]["moderation_details"]["reason"], "llm fallback blocked");
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "llm fallback blocked"
+    );
 }
 
 #[tokio::test]
@@ -2371,8 +2580,7 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_l
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
@@ -2383,12 +2591,15 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_l
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2456,8 +2667,7 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_h
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
@@ -2468,12 +2678,15 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_h
         "test-key".to_string(),
     )]))
     .await;
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2494,7 +2707,8 @@ async fn smart_moderation_falls_back_to_llm_when_hashlinear_probability_equals_h
 }
 
 #[tokio::test]
-async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equals_low_threshold() {
+async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equals_low_threshold()
+{
     let profile_name = format!(
         "smart-hashlinear-low-threshold-blocked-{}-{}",
         std::process::id(),
@@ -2541,8 +2755,7 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
@@ -2553,12 +2766,15 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2591,7 +2807,8 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
 }
 
 #[tokio::test]
-async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equals_high_threshold() {
+async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equals_high_threshold()
+{
     let profile_name = format!(
         "smart-hashlinear-high-threshold-blocked-{}-{}",
         std::process::id(),
@@ -2638,8 +2855,7 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, boundary_intercept, &[0.0]);
@@ -2650,12 +2866,15 @@ async fn smart_moderation_blocks_with_ai_details_when_hashlinear_probability_equ
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2697,7 +2916,7 @@ async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
     let llm_base = spawn_openai_chat_server(json!({
         "choices": [{
             "message": {
-                "content": "{\"violation\": true, \"category\": \"sampled\", \"reason\": \"forced ai review\"}"
+                "content": "{\"violation\": false, \"category\": null, \"reason\": \"clean\"}"
             }
         }]
     }))
@@ -2729,8 +2948,7 @@ async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
         .expect("write model marker");
     write_hashlinear_runtime(&profile_dir, 5.0, &[-10.0]);
@@ -2741,12 +2959,15 @@ async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2768,7 +2989,135 @@ async fn smart_moderation_ai_review_rate_takes_priority_over_local_model() {
     assert_eq!(body["error"]["type"], "moderation_error");
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
     assert_eq!(body["error"]["moderation_details"]["category"], "sampled");
-    assert_eq!(body["error"]["moderation_details"]["reason"], "forced ai review");
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "forced ai review"
+    );
+}
+
+#[tokio::test]
+async fn smart_moderation_ai_review_rate_recomputes_local_confidence_for_concurrency_fallback() {
+    let profile_name = format!(
+        "smart-ai-review-rate-fallback-{}-{}",
+        std::process::id(),
+        unique_test_suffix()
+    );
+    let Some(profile_dir) = local_profile_dir_or_skip(&profile_name) else {
+        return;
+    };
+
+    let llm_base = spawn_delayed_openai_chat_server(
+        json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"violation\": false, \"category\": null, \"reason\": \"clean\"}"
+                }
+            }]
+        }),
+        Duration::from_millis(400),
+    )
+    .await;
+
+    std::fs::write(
+        profile_dir.join("profile.json"),
+        json!({
+            "ai": {
+                "provider": "openai",
+                "base_url": format!("{llm_base}/v1"),
+                "model": "fake-moderation-model",
+                "api_key_env": "TEST_MOD_AI_API_KEY",
+                "timeout": 3,
+                "max_retries": 0
+            },
+            "prompt": {
+                "template_file": "ai_prompt.txt",
+                "max_text_length": 4000
+            },
+            "local_model_type": "hashlinear",
+            "probability": {
+                "ai_review_rate": 1.0,
+                "random_seed": 42,
+                "low_risk_threshold": 0.2,
+                "high_risk_threshold": 0.8,
+                "enable_concurrency_limit_fallback": true
+            }
+        })
+        .to_string(),
+    )
+    .expect("write profile");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
+    std::fs::write(profile_dir.join("hashlinear_model.pkl"), b"stub-model")
+        .expect("write model marker");
+    write_hashlinear_runtime(&profile_dir, -10.0, &[0.0]);
+
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
+        "TEST_MOD_AI_API_KEY".to_string(),
+        "test-key".to_string(),
+    )]))
+    .await;
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
+    let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
+
+    let mut handles = Vec::new();
+    for idx in 0..5 {
+        let proxy_url = proxy_url.clone();
+        handles.push(tokio::spawn(async move {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("reqwest client")
+                .post(proxy_url)
+                .json(&json!({
+                    "model": "gpt-4.1-mini",
+                    "messages": [{"role": "user", "content": format!("occupy ai-review slot {idx}")}]
+                }))
+                .send()
+                .await
+                .expect("proxy response")
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "sampled path should still degrade locally"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response
+        .headers()
+        .get("x-prismguard-local-model-confidence")
+        .is_some());
+
+    let seen = seen.lock().expect("seen lock");
+    assert!(seen.iter().any(|request| {
+        request.json_body["messages"][0]["content"]
+            == json!("sampled path should still degrade locally")
+    }));
+    drop(seen);
+
+    for handle in handles {
+        let response = handle.await.expect("join request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 #[tokio::test]
@@ -2813,8 +3162,7 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
 
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
         "TEST_MOD_AI_API_KEY".to_string(),
@@ -2822,12 +3170,15 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let first_body = loop {
@@ -2854,7 +3205,10 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
     };
 
     assert_eq!(first_body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(first_body["error"]["moderation_details"]["category"], "cache");
+    assert_eq!(
+        first_body["error"]["moderation_details"]["category"],
+        "cache"
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -2872,7 +3226,10 @@ async fn smart_moderation_reuses_cached_result_for_same_text() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let second_body: Value = response.json().await.expect("json body");
     assert_eq!(second_body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(second_body["error"]["moderation_details"]["category"], "cache");
+    assert_eq!(
+        second_body["error"]["moderation_details"]["category"],
+        "cache"
+    );
 
     assert_eq!(*hits.lock().expect("hits lock"), 1);
 }
@@ -2920,8 +3277,7 @@ async fn smart_moderation_reuses_history_sample_before_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     seed_history_sample_db(
         &profile_dir.join("history.rocks"),
         "history db hit",
@@ -2936,12 +3292,15 @@ async fn smart_moderation_reuses_history_sample_before_llm() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -2960,13 +3319,14 @@ async fn smart_moderation_reuses_history_sample_before_llm() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "history-db");
-    assert!(
-        body["error"]["moderation_details"]["reason"]
-            .as_str()
-            .expect("reason")
-            .contains("From DB")
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "history-db"
     );
+    assert!(body["error"]["moderation_details"]["reason"]
+        .as_str()
+        .expect("reason")
+        .contains("From DB"));
     assert_eq!(*hits.lock().expect("hits lock"), 0);
 }
 
@@ -3013,8 +3373,7 @@ async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
     seed_legacy_sqlite_sample_db(
         &profile_dir.join("history.db"),
         "legacy sqlite history hit",
@@ -3029,12 +3388,15 @@ async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -3053,13 +3415,14 @@ async fn smart_moderation_reuses_legacy_sqlite_history_before_llm() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
-    assert_eq!(body["error"]["moderation_details"]["category"], "legacy-sqlite");
-    assert!(
-        body["error"]["moderation_details"]["reason"]
-            .as_str()
-            .expect("reason")
-            .contains("From DB")
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "legacy-sqlite"
     );
+    assert!(body["error"]["moderation_details"]["reason"]
+        .as_str()
+        .expect("reason")
+        .contains("From DB"));
     assert_eq!(*hits.lock().expect("hits lock"), 0);
 }
 
@@ -3106,8 +3469,7 @@ async fn smart_moderation_persists_ai_result_into_history_sample_db() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
 
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
         "TEST_MOD_AI_API_KEY".to_string(),
@@ -3115,12 +3477,15 @@ async fn smart_moderation_persists_ai_result_into_history_sample_db() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -3200,8 +3565,7 @@ async fn smart_moderation_retries_llm_after_server_error_like_python() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
 
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
         "TEST_MOD_AI_API_KEY".to_string(),
@@ -3209,12 +3573,15 @@ async fn smart_moderation_retries_llm_after_server_error_like_python() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -3235,7 +3602,10 @@ async fn smart_moderation_retries_llm_after_server_error_like_python() {
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
     assert_eq!(body["error"]["moderation_details"]["source"], "ai");
     assert_eq!(body["error"]["moderation_details"]["category"], "retry");
-    assert_eq!(body["error"]["moderation_details"]["reason"], "second attempt");
+    assert_eq!(
+        body["error"]["moderation_details"]["reason"],
+        "second attempt"
+    );
     assert_eq!(*hits.lock().expect("hits lock"), 2);
 }
 
@@ -3290,8 +3660,7 @@ async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
         .to_string(),
     )
     .expect("write profile");
-    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}")
-        .expect("write prompt");
+    std::fs::write(profile_dir.join("ai_prompt.txt"), "审核文本：{{text}}").expect("write prompt");
 
     let proxy_base = spawn_proxy_server_with_env(HashMap::from([(
         "TEST_MOD_AI_API_KEY".to_string(),
@@ -3299,12 +3668,15 @@ async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
     )]))
     .await;
     let upstream_base = unused_http_base();
-    let config = percent_encode(&json!({
-        "smart_moderation": {
-            "enabled": true,
-            "profile": profile_name
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "smart_moderation": {
+                "enabled": true,
+                "profile": profile_name
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -3323,11 +3695,18 @@ async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
-    assert_eq!(body["error"]["moderation_details"]["category"], "retry-models");
+    assert_eq!(
+        body["error"]["moderation_details"]["category"],
+        "retry-models"
+    );
     assert_eq!(*hits.lock().expect("hits lock"), 3);
     assert_eq!(
         *models.lock().expect("models lock"),
-        vec!["model-b".to_string(), "model-a".to_string(), "model-a".to_string()]
+        vec![
+            "model-b".to_string(),
+            "model-a".to_string(),
+            "model-a".to_string()
+        ]
     );
 }
 
@@ -3335,14 +3714,17 @@ async fn smart_moderation_retry_prefers_untried_models_before_repeats() {
 async fn gemini_stream_request_appends_alt_sse_query_parameter() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "gemini_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "gemini_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3377,14 +3759,17 @@ async fn gemini_stream_request_appends_alt_sse_query_parameter() {
 async fn gemini_non_stream_request_does_not_append_alt_sse_query_parameter() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "gemini_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "gemini_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3479,19 +3864,16 @@ async fn invalid_env_backed_proxy_config_returns_400_config_error() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "CONFIG_PARSE_ERROR");
     assert_eq!(body["error"]["type"], "config_error");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("failed to parse env BROKEN_PROXY_CFG as JSON")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("failed to parse env BROKEN_PROXY_CFG as JSON"));
 }
 
 #[tokio::test]
 async fn invalid_inline_proxy_config_returns_400_config_error() {
     let proxy_base = spawn_proxy_server().await;
-    let proxy_url =
-        format!("{proxy_base}/%7Bnot-json%7D$https://example.com/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/%7Bnot-json%7D$https://example.com/v1/chat/completions");
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -3510,26 +3892,27 @@ async fn invalid_inline_proxy_config_returns_400_config_error() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "CONFIG_PARSE_ERROR");
     assert_eq!(body["error"]["type"], "config_error");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("Config parse error")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("Config parse error"));
 }
 
 #[tokio::test]
 async fn openai_chat_request_normalizes_response_format_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3576,14 +3959,17 @@ async fn openai_chat_request_normalizes_response_format_for_responses_upstream()
 async fn openai_chat_request_normalizes_max_completion_tokens_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3614,14 +4000,17 @@ async fn openai_chat_request_normalizes_max_completion_tokens_for_responses_upst
 async fn openai_chat_request_strips_stream_include_usage_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3649,7 +4038,10 @@ async fn openai_chat_request_strips_stream_include_usage_for_responses_upstream(
     let request = seen.last().expect("upstream request");
     assert_eq!(request.path, "/v1/responses");
     assert_eq!(request.json_body["stream"], true);
-    assert_eq!(request.json_body["stream_options"].get("include_usage"), None);
+    assert_eq!(
+        request.json_body["stream_options"].get("include_usage"),
+        None
+    );
     assert_eq!(request.json_body["stream_options"]["test_marker"], 1);
 }
 
@@ -3657,14 +4049,17 @@ async fn openai_chat_request_strips_stream_include_usage_for_responses_upstream(
 async fn openai_chat_request_normalizes_function_tool_choice_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3704,14 +4099,17 @@ async fn openai_chat_request_normalizes_function_tool_choice_for_responses_upstr
 async fn openai_chat_request_normalizes_text_response_format_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3750,14 +4148,17 @@ async fn openai_chat_request_normalizes_text_response_format_for_responses_upstr
 async fn openai_chat_request_normalizes_json_object_response_format_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3796,14 +4197,17 @@ async fn openai_chat_request_normalizes_json_object_response_format_for_response
 async fn openai_chat_request_keeps_string_tool_choice_auto_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3832,14 +4236,17 @@ async fn openai_chat_request_keeps_string_tool_choice_auto_for_responses_upstrea
 async fn openai_chat_request_keeps_string_tool_choice_none_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3868,14 +4275,17 @@ async fn openai_chat_request_keeps_string_tool_choice_none_for_responses_upstrea
 async fn openai_chat_request_keeps_string_tool_choice_required_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3904,14 +4314,17 @@ async fn openai_chat_request_keeps_string_tool_choice_required_for_responses_ups
 async fn openai_chat_request_normalizes_tool_tool_choice_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3949,14 +4362,17 @@ async fn openai_chat_request_normalizes_tool_tool_choice_for_responses_upstream(
 async fn openai_chat_request_preserves_parallel_tool_calls_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -3998,15 +4414,18 @@ async fn openai_chat_request_preserves_parallel_tool_calls_for_responses_upstrea
 async fn openai_chat_disable_tools_strips_tool_fields_even_without_format_change() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "disable_tools": true,
-            "from": "openai_chat",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "disable_tools": true,
+                "from": "openai_chat",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4062,7 +4481,10 @@ async fn openai_chat_disable_tools_strips_tool_fields_even_without_format_change
     assert_eq!(request.path, "/v1/chat/completions");
     assert!(request.json_body.get("tools").is_none());
     assert!(request.json_body.get("tool_choice").is_none());
-    assert_eq!(request.json_body["messages"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        request.json_body["messages"].as_array().map(Vec::len),
+        Some(1)
+    );
     assert_eq!(request.json_body["messages"][0]["role"], "assistant");
     assert_eq!(request.json_body["messages"][0]["content"], "");
     assert!(request.json_body["messages"][0].get("tool_calls").is_none());
@@ -4072,17 +4494,19 @@ async fn openai_chat_disable_tools_strips_tool_fields_even_without_format_change
 async fn gemini_chat_disable_tools_strips_tool_fields_even_without_format_change() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "disable_tools": true,
-            "from": "gemini_chat",
-            "to": "gemini_chat"
-        }
-    }).to_string());
-    let upstream_full =
-        format!("{upstream_base}/v1beta/models/gemini-2.5-flash:generateContent");
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "disable_tools": true,
+                "from": "gemini_chat",
+                "to": "gemini_chat"
+            }
+        })
+        .to_string(),
+    );
+    let upstream_full = format!("{upstream_base}/v1beta/models/gemini-2.5-flash:generateContent");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
     let response = reqwest::Client::builder()
@@ -4139,25 +4563,34 @@ async fn gemini_chat_disable_tools_strips_tool_fields_even_without_format_change
 
     let seen = seen.lock().expect("seen lock");
     let request = seen.last().expect("upstream request");
-    assert_eq!(request.path, "/v1beta/models/gemini-2.5-flash:generateContent");
+    assert_eq!(
+        request.path,
+        "/v1beta/models/gemini-2.5-flash:generateContent"
+    );
     assert!(request.json_body.get("tools").is_none());
     assert!(request.json_body.get("toolConfig").is_none());
     assert_eq!(request.json_body["contents"], json!([]));
-    assert_eq!(request.json_body["generationConfig"], json!({"temperature": 0.2}));
+    assert_eq!(
+        request.json_body["generationConfig"],
+        json!({"temperature": 0.2})
+    );
 }
 
 #[tokio::test]
 async fn openai_responses_function_call_output_maps_to_openai_chat_tool_message() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4194,14 +4627,17 @@ async fn openai_responses_function_call_output_maps_to_openai_chat_tool_message(
 async fn openai_responses_function_call_maps_to_openai_chat_assistant_tool_calls() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4229,7 +4665,10 @@ async fn openai_responses_function_call_maps_to_openai_chat_assistant_tool_calls
     let request = seen.last().expect("upstream request");
     assert_eq!(request.path, "/v1/chat/completions");
     assert_eq!(request.json_body["messages"][0]["role"], "assistant");
-    assert_eq!(request.json_body["messages"][0]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        request.json_body["messages"][0]["tool_calls"][0]["id"],
+        "call_1"
+    );
     assert_eq!(
         request.json_body["messages"][0]["tool_calls"][0]["function"]["name"],
         "lookup_weather"
@@ -4244,14 +4683,17 @@ async fn openai_responses_function_call_maps_to_openai_chat_assistant_tool_calls
 async fn openai_chat_tool_messages_map_to_responses_top_level_tool_items_with_status() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4317,14 +4759,17 @@ async fn openai_chat_tool_messages_map_to_responses_top_level_tool_items_with_st
 async fn openai_responses_top_level_input_image_object_maps_to_openai_chat_image_part() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4353,7 +4798,10 @@ async fn openai_responses_top_level_input_image_object_maps_to_openai_chat_image
     let request = seen.last().expect("upstream request");
     assert_eq!(request.path, "/v1/chat/completions");
     assert_eq!(request.json_body["messages"][0]["role"], "user");
-    assert_eq!(request.json_body["messages"][0]["content"][0]["type"], "image_url");
+    assert_eq!(
+        request.json_body["messages"][0]["content"][0]["type"],
+        "image_url"
+    );
     assert_eq!(
         request.json_body["messages"][0]["content"][0]["image_url"]["url"],
         "https://example.com/cat.png"
@@ -4368,14 +4816,17 @@ async fn openai_responses_top_level_input_image_object_maps_to_openai_chat_image
 async fn openai_responses_message_content_items_object_maps_to_openai_chat_parts() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4432,14 +4883,17 @@ async fn openai_responses_message_content_items_object_maps_to_openai_chat_parts
 async fn openai_responses_reasoning_item_maps_to_openai_chat_assistant_text() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4480,14 +4934,17 @@ async fn openai_responses_reasoning_item_maps_to_openai_chat_assistant_text() {
 async fn openai_responses_preserves_extra_generation_fields_when_mapping_to_openai_chat() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4516,21 +4973,27 @@ async fn openai_responses_preserves_extra_generation_fields_when_mapping_to_open
     assert_eq!(request.json_body["temperature"], json!(0.3));
     assert_eq!(request.json_body["top_p"], json!(0.8));
     assert_eq!(request.json_body["metadata"], json!({"trace_id": "abc"}));
-    assert_eq!(request.json_body["response_format"], json!({"type": "json_object"}));
+    assert_eq!(
+        request.json_body["response_format"],
+        json!({"type": "json_object"})
+    );
 }
 
 #[tokio::test]
 async fn openai_responses_single_input_object_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4569,14 +5032,17 @@ async fn openai_responses_single_input_object_maps_like_python() {
 async fn openai_responses_message_text_field_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4615,14 +5081,17 @@ async fn openai_responses_message_text_field_maps_like_python() {
 async fn openai_responses_input_image_flat_url_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4671,14 +5140,17 @@ async fn openai_responses_input_image_flat_url_maps_like_python() {
 async fn openai_responses_input_image_nested_image_url_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4729,14 +5201,17 @@ async fn openai_responses_input_image_nested_image_url_maps_like_python() {
 async fn openai_responses_image_url_part_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4785,14 +5260,17 @@ async fn openai_responses_image_url_part_maps_like_python() {
 async fn openai_responses_image_url_object_part_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4843,14 +5321,17 @@ async fn openai_responses_image_url_object_part_maps_like_python() {
 async fn openai_responses_image_url_nested_image_url_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4898,17 +5379,21 @@ async fn openai_responses_image_url_nested_image_url_maps_like_python() {
 }
 
 #[tokio::test]
-async fn openai_responses_function_call_output_content_items_map_to_openai_chat_tool_text_like_python() {
+async fn openai_responses_function_call_output_content_items_map_to_openai_chat_tool_text_like_python(
+) {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -4952,14 +5437,17 @@ async fn openai_responses_function_call_output_content_items_map_to_openai_chat_
 async fn openai_responses_function_call_output_single_object_text_maps_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -5001,14 +5489,17 @@ async fn openai_responses_function_call_output_single_object_text_maps_like_pyth
 async fn openai_chat_tool_result_array_maps_to_claude_array_content_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "claude_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "claude_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -5058,14 +5549,17 @@ async fn openai_chat_tool_result_array_maps_to_claude_array_content_like_python(
 async fn claude_tool_use_non_object_input_maps_to_openai_chat_empty_arguments_like_python() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "claude_chat",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/messages");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -5113,19 +5607,22 @@ async fn claude_tool_use_non_object_input_maps_to_openai_chat_empty_arguments_li
     );
 }
 
-
 #[tokio::test]
-async fn openai_responses_function_call_object_arguments_map_to_openai_chat_tool_call_json_string() {
+async fn openai_responses_function_call_object_arguments_map_to_openai_chat_tool_call_json_string()
+{
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/responses");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -5217,14 +5714,17 @@ async fn proxy_entry_supports_head_like_fastapi_get_route() {
 async fn delete_request_body_is_ignored_to_match_python_router() {
     let (upstream_base, seen) = spawn_upstream_delete_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let upstream_full = format!("{upstream_base}/v1/chat/completions");
     let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
 
@@ -5364,27 +5864,24 @@ async fn spawn_upstream_head_echo_server() -> (String, Arc<Mutex<Vec<SeenRequest
     (format!("http://{}", addr), seen)
 }
 
-async fn upstream_head_echo(
-    State(state): State<UpstreamState>,
-    uri: Uri,
-) -> impl IntoResponse {
-    state
-        .seen
-        .lock()
-        .expect("seen lock")
-        .push(SeenRequest {
-            path: uri.path().to_string(),
-            path_and_query: uri
-                .path_and_query()
-                .map(|value| value.as_str().to_string())
-                .unwrap_or_else(|| uri.path().to_string()),
-            json_body: json!({}),
-        });
+async fn upstream_head_echo(State(state): State<UpstreamState>, uri: Uri) -> impl IntoResponse {
+    state.seen.lock().expect("seen lock").push(SeenRequest {
+        path: uri.path().to_string(),
+        path_and_query: uri
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string()),
+        json_body: json!({}),
+    });
 
     StatusCode::OK
 }
 
-async fn spawn_fixed_upstream(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> String {
+async fn spawn_fixed_upstream(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> String {
     let app = Router::new().route(
         "/*path",
         post(move || {
@@ -5497,7 +5994,10 @@ async fn spawn_sequenced_openai_chat_server(
                 let (status, body) = {
                     let mut guard = remaining.lock().expect("remaining lock");
                     if guard.is_empty() {
-                        (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": {"message": "no response scripted"}}))
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({"error": {"message": "no response scripted"}}),
+                        )
                     } else {
                         guard.remove(0)
                     }
@@ -5566,7 +6066,9 @@ async fn spawn_recording_sequenced_openai_chat_server(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind recording sequenced openai chat server");
-    let addr = listener.local_addr().expect("recording sequenced openai chat addr");
+    let addr = listener
+        .local_addr()
+        .expect("recording sequenced openai chat addr");
     tokio::spawn(async move {
         axum::Server::from_tcp(listener.into_std().expect("std listener"))
             .expect("server from tcp")
@@ -5585,18 +6087,14 @@ async fn upstream_echo(
     body: Bytes,
 ) -> impl IntoResponse {
     let json_body: Value = serde_json::from_slice(&body).expect("json body");
-    state
-        .seen
-        .lock()
-        .expect("seen lock")
-        .push(SeenRequest {
-            path: uri.path().to_string(),
-            path_and_query: uri
-                .path_and_query()
-                .map(|value| value.as_str().to_string())
-                .unwrap_or_else(|| uri.path().to_string()),
-            json_body: json_body.clone(),
-        });
+    state.seen.lock().expect("seen lock").push(SeenRequest {
+        path: uri.path().to_string(),
+        path_and_query: uri
+            .path_and_query()
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string()),
+        json_body: json_body.clone(),
+    });
 
     (StatusCode::OK, Json(json!({"ok": true})))
 }

@@ -50,6 +50,8 @@ pub struct ProbabilityConfig {
     pub low_risk_threshold: f64,
     #[serde(default = "default_high_risk_threshold")]
     pub high_risk_threshold: f64,
+    #[serde(default)]
+    pub enable_concurrency_limit_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -445,29 +447,75 @@ fn escape_html(input: &str) -> String {
     escaped
 }
 
-fn default_provider() -> String { "openai".to_string() }
-fn default_base_url() -> String { "https://api.openai.com/v1".to_string() }
-fn default_model() -> String { "gpt-4o-mini".to_string() }
-fn default_api_key_env() -> String { "MOD_AI_API_KEY".to_string() }
-fn default_timeout() -> u64 { 10 }
-fn default_max_retries() -> u32 { 2 }
-fn default_template_file() -> String { "ai_prompt.txt".to_string() }
-fn default_prompt_max_text_length() -> usize { 4000 }
-fn default_ai_review_rate() -> f64 { 0.3 }
-fn default_random_seed() -> u64 { 42 }
-fn default_low_risk_threshold() -> f64 { 0.2 }
-fn default_high_risk_threshold() -> f64 { 0.8 }
-fn default_min_samples() -> usize { 200 }
-fn default_retrain_interval_minutes() -> usize { 60 }
-fn default_max_samples() -> usize { 50_000 }
-fn default_sample_loading() -> String { "balanced_undersample".to_string() }
-fn default_max_features() -> usize { 8000 }
-fn default_char_ngram_range() -> Vec<usize> { vec![2, 3] }
-fn default_word_ngram_range() -> Vec<usize> { vec![1, 2] }
-fn default_bow_model_type() -> String { "sgd_logistic".to_string() }
-fn default_batch_size() -> usize { 2000 }
-fn default_max_seconds() -> usize { 300 }
-fn default_max_db_items() -> usize { 100_000 }
+fn default_provider() -> String {
+    "openai".to_string()
+}
+fn default_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+fn default_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+fn default_api_key_env() -> String {
+    "MOD_AI_API_KEY".to_string()
+}
+fn default_timeout() -> u64 {
+    10
+}
+fn default_max_retries() -> u32 {
+    2
+}
+fn default_template_file() -> String {
+    "ai_prompt.txt".to_string()
+}
+fn default_prompt_max_text_length() -> usize {
+    4000
+}
+fn default_ai_review_rate() -> f64 {
+    0.3
+}
+fn default_random_seed() -> u64 {
+    42
+}
+fn default_low_risk_threshold() -> f64 {
+    0.2
+}
+fn default_high_risk_threshold() -> f64 {
+    0.8
+}
+fn default_min_samples() -> usize {
+    200
+}
+fn default_retrain_interval_minutes() -> usize {
+    60
+}
+fn default_max_samples() -> usize {
+    50_000
+}
+fn default_sample_loading() -> String {
+    "balanced_undersample".to_string()
+}
+fn default_max_features() -> usize {
+    8000
+}
+fn default_char_ngram_range() -> Vec<usize> {
+    vec![2, 3]
+}
+fn default_word_ngram_range() -> Vec<usize> {
+    vec![1, 2]
+}
+fn default_bow_model_type() -> String {
+    "sgd_logistic".to_string()
+}
+fn default_batch_size() -> usize {
+    2000
+}
+fn default_max_seconds() -> usize {
+    300
+}
+fn default_max_db_items() -> usize {
+    100_000
+}
 fn default_vocab_buckets() -> Vec<VocabBucket> {
     vec![
         VocabBucket {
@@ -490,23 +538,63 @@ fn default_vocab_buckets() -> Vec<VocabBucket> {
         },
     ]
 }
-fn default_bucket_name() -> String { "bucket".to_string() }
-fn default_bucket_limit() -> usize { 1000 }
-fn default_one() -> f64 { 1.0 }
-fn default_tiktoken_model() -> String { "cl100k_base".to_string() }
-fn default_fasttext_dim() -> usize { 64 }
-fn default_fasttext_lr() -> f64 { 0.1 }
-fn default_fasttext_epoch() -> usize { 5 }
-fn default_fasttext_word_ngrams() -> usize { 2 }
-fn default_fasttext_minn() -> usize { 2 }
-fn default_fasttext_maxn() -> usize { 4 }
-fn default_fasttext_bucket() -> usize { 200_000 }
-fn default_hashlinear_analyzer() -> String { "char".to_string() }
-fn default_hashlinear_ngram_range() -> Vec<usize> { vec![2, 4] }
-fn default_hashlinear_n_features() -> usize { 1_048_576 }
-fn default_hashlinear_norm() -> Option<String> { Some("l2".to_string()) }
-fn default_hashlinear_alpha() -> f64 { 1e-5 }
-fn default_hashlinear_epochs() -> usize { 3 }
-fn default_hashlinear_batch_size() -> usize { 2048 }
-fn default_local_model_type() -> String { "bow".to_string() }
-fn default_true() -> bool { true }
+fn default_bucket_name() -> String {
+    "bucket".to_string()
+}
+fn default_bucket_limit() -> usize {
+    1000
+}
+fn default_one() -> f64 {
+    1.0
+}
+fn default_tiktoken_model() -> String {
+    "cl100k_base".to_string()
+}
+fn default_fasttext_dim() -> usize {
+    64
+}
+fn default_fasttext_lr() -> f64 {
+    0.1
+}
+fn default_fasttext_epoch() -> usize {
+    5
+}
+fn default_fasttext_word_ngrams() -> usize {
+    2
+}
+fn default_fasttext_minn() -> usize {
+    2
+}
+fn default_fasttext_maxn() -> usize {
+    4
+}
+fn default_fasttext_bucket() -> usize {
+    200_000
+}
+fn default_hashlinear_analyzer() -> String {
+    "char".to_string()
+}
+fn default_hashlinear_ngram_range() -> Vec<usize> {
+    vec![2, 4]
+}
+fn default_hashlinear_n_features() -> usize {
+    1_048_576
+}
+fn default_hashlinear_norm() -> Option<String> {
+    Some("l2".to_string())
+}
+fn default_hashlinear_alpha() -> f64 {
+    1e-5
+}
+fn default_hashlinear_epochs() -> usize {
+    3
+}
+fn default_hashlinear_batch_size() -> usize {
+    2048
+}
+fn default_local_model_type() -> String {
+    "bow".to_string()
+}
+fn default_true() -> bool {
+    true
+}
