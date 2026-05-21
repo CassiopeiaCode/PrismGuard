@@ -18,8 +18,9 @@ use profile::ModerationProfile;
 use rocksdb::{DBWithThreadMode, MultiThreaded, Options};
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sample_rpc::{
     decode_request_line, decode_response_line, dispatch_request, encode_request_line,
     encode_response_line, send_unix_request, serve_one_unix_request,
@@ -37,13 +38,10 @@ use training::{
 };
 
 fn write_profile(profile_name: &str, payload: serde_json::Value) -> ModerationProfile {
-    let profile_dir = PathBuf::from("/services/apps/Prismguand-Rust")
-        .join("configs")
-        .join("mod_profiles")
-        .join(profile_name);
-    std::fs::create_dir_all(&profile_dir).expect("create profile dir");
-    std::fs::write(profile_dir.join("profile.json"), payload.to_string()).expect("write profile");
-    ModerationProfile::load("/services/apps/Prismguand-Rust", profile_name).expect("load profile")
+    let root_dir = unique_test_root("training-profile");
+    std::fs::create_dir_all(root_dir.join("configs").join("mod_profiles"))
+        .expect("create profile root");
+    write_profile_into(&root_dir, profile_name, payload)
 }
 
 fn write_profile_into(
@@ -63,6 +61,24 @@ fn write_profile_into(
 fn current_dir_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn unique_test_root(prefix: &str) -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    let unique_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let root_dir = PathBuf::from(format!(
+        "/tmp/{prefix}-{}-{nanos}-{unique_id}",
+        std::process::id()
+    ));
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).expect("cleanup old test root");
+    }
+    root_dir
 }
 
 #[cfg(feature = "storage-debug")]
