@@ -89,6 +89,37 @@ fn preserves_moderation_text_for_native_openai_responses_requests() {
 }
 
 #[test]
+fn pass_through_preserves_detected_request_shape_and_moderation_text() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "pass_through"
+        }
+    });
+    let original = json!({
+        "model": "gpt-4.1-mini",
+        "stream": true,
+        "messages": [
+            {"role": "system", "content": "policy text"},
+            {"role": "user", "content": "hello"}
+        ]
+    });
+
+    let plan = process_request(&config, "/v1/chat/completions", &[], original.clone())
+        .expect("openai chat request should pass through");
+
+    assert_eq!(plan.source_format, Some(RequestFormat::OpenAiChat));
+    assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+    assert!(plan.passthrough);
+    assert!(plan.stream);
+    assert_eq!(plan.path, "/v1/chat/completions");
+    assert_eq!(plan.body, original);
+    assert_eq!(plan.moderation_text.as_deref(), Some("policy text\nhello"));
+}
+
+#[test]
 fn detects_claude_chat_from_headers_and_rewrites_path_for_openai_chat_target() {
     let plan = process_request(
         &transform_config(true, "openai_chat"),
@@ -824,7 +855,8 @@ fn openai_chat_tools_normalize_claude_input_schema_like_python() {
         Some(&json!("object"))
     );
     assert_eq!(
-        plan.body.pointer("/tools/0/input_schema/properties/city/type"),
+        plan.body
+            .pointer("/tools/0/input_schema/properties/city/type"),
         Some(&json!("string"))
     );
 }

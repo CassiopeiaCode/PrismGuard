@@ -3756,6 +3756,89 @@ async fn gemini_stream_request_appends_alt_sse_query_parameter() {
 }
 
 #[tokio::test]
+async fn pass_through_keeps_request_shape_when_from_matches() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "pass_through"
+            }
+        })
+        .to_string(),
+    );
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.json_body["stream"], true);
+    assert_eq!(request.json_body["messages"][0]["role"], "user");
+    assert_eq!(request.json_body["messages"][0]["content"], "hello");
+}
+
+#[tokio::test]
+async fn pass_through_still_applies_basic_moderation() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "pass_through"
+            },
+            "basic_moderation": {
+                "enabled": true,
+                "keywords": ["forbidden phrase"]
+            }
+        })
+        .to_string(),
+    );
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "contains forbidden phrase"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "MODERATION_BLOCKED");
+    assert_eq!(seen.lock().expect("seen lock").len(), 0);
+}
+
+#[tokio::test]
 async fn gemini_non_stream_request_does_not_append_alt_sse_query_parameter() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;

@@ -3,7 +3,7 @@ use std::io::Read;
 use std::pin::Pin;
 
 use anyhow::Context;
-use axum::body::{boxed, BoxBody, Body};
+use axum::body::{boxed, Body, BoxBody};
 use axum::extract::{Path, State};
 use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HOST};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
@@ -16,8 +16,8 @@ use serde_json::json;
 use serde_json::Value;
 
 use crate::format::{process_request, RequestProcessError};
-use crate::moderation::{basic, extract, smart};
 use crate::moderation::smart::ModerationDebugInfo;
+use crate::moderation::{basic, extract, smart};
 use crate::response::maybe_transform_json_response;
 use crate::routes::{parse_url_config, ApiError, AppState};
 use crate::streaming::StreamTranscoder;
@@ -67,13 +67,11 @@ async fn proxy_entry_with_cfg(
         .with_error_type("config_error")
     })?;
 
-    let upstream_host = upstream
-        .host_str()
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::BAD_REQUEST, "upstream host is missing")
-                .with_code("CONFIG_PARSE_ERROR")
-                .with_error_type("config_error")
-        })?;
+    let upstream_host = upstream.host_str().ok_or_else(|| {
+        ApiError::new(StatusCode::BAD_REQUEST, "upstream host is missing")
+            .with_code("CONFIG_PARSE_ERROR")
+            .with_error_type("config_error")
+    })?;
     let upstream_base = match upstream.port() {
         Some(port) => format!("{}://{}:{}", upstream.scheme(), upstream_host, port),
         None => format!("{}://{}", upstream.scheme(), upstream_host),
@@ -85,27 +83,34 @@ async fn proxy_entry_with_cfg(
     };
 
     let (parts, body) = request.into_parts();
-    let raw_body = to_bytes(body)
-        .await
-        .map_err(|e| {
-            ApiError::new(StatusCode::BAD_REQUEST, format!("failed to read body: {e}"))
-                .with_code("PROXY_ERROR")
-        })?;
+    let raw_body = to_bytes(body).await.map_err(|e| {
+        ApiError::new(StatusCode::BAD_REQUEST, format!("failed to read body: {e}"))
+            .with_code("PROXY_ERROR")
+    })?;
     let request_json = parse_request_json(&parts.method, &parts.headers, &raw_body)?;
     let source_format_hint = detect_source_format(&path, request_json.as_ref()).map(str::to_string);
-    let mut request_body = request_json.clone().unwrap_or_else(|| Value::Object(Default::default()));
+    let mut request_body = request_json
+        .clone()
+        .unwrap_or_else(|| Value::Object(Default::default()));
     let header_pairs = parts
         .headers
         .iter()
-        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.as_str().to_string(), value.to_string())))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
         .collect::<Vec<_>>();
-    let request_plan =
-        process_request(&parsed.config, &path, &header_pairs, request_body.clone()).map_err(|error| {
-            match error {
-                RequestProcessError::StrictParse(message) | RequestProcessError::Transform(message) => {
-                    let moderation_details = moderation_details_for_message(&message);
-                    ApiError::moderation_blocked(message, source_format_hint.clone(), moderation_details)
-                }
+    let request_plan = process_request(&parsed.config, &path, &header_pairs, request_body.clone())
+        .map_err(|error| match error {
+            RequestProcessError::StrictParse(message) | RequestProcessError::Transform(message) => {
+                let moderation_details = moderation_details_for_message(&message);
+                ApiError::moderation_blocked(
+                    message,
+                    source_format_hint.clone(),
+                    moderation_details,
+                )
             }
         })?;
     let estimated_prompt_tokens = estimate_prompt_tokens_for_stream(
@@ -149,8 +154,8 @@ async fn proxy_entry_with_cfg(
         let (moderation_format, moderation_text) = moderation_context
             .as_ref()
             .expect("moderation context when basic moderation enabled");
-        if let Some(blocked) = basic::basic_moderation(moderation_text, &basic_mod_cfg)
-            .map_err(ApiError::from)?
+        if let Some(blocked) =
+            basic::basic_moderation(moderation_text, &basic_mod_cfg).map_err(ApiError::from)?
         {
             return Err(ApiError::moderation_blocked(
                 blocked.reason,
@@ -210,7 +215,8 @@ async fn proxy_entry_with_cfg(
                 .with_extra_headers(debug));
             }
             Err(smart::SmartModerationError::Other(err, debug)) => {
-                return Err(ApiError::from(err).with_extra_headers(moderation_debug_headers(debug.as_ref())));
+                return Err(ApiError::from(err)
+                    .with_extra_headers(moderation_debug_headers(debug.as_ref())));
             }
         }
     }
@@ -229,13 +235,14 @@ async fn proxy_entry_with_cfg(
         .headers(filtered_request_headers(&parts.headers));
 
     if should_forward_planned_json(&parts.method) {
-        upstream_request = upstream_request.body(serde_json::to_vec(&request_body).map_err(|e| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("failed to encode transformed body: {e}"),
-            )
-            .with_code("PROXY_ERROR")
-        })?);
+        upstream_request =
+            upstream_request.body(serde_json::to_vec(&request_body).map_err(|e| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to encode transformed body: {e}"),
+                )
+                .with_code("PROXY_ERROR")
+            })?);
     } else if !raw_body.is_empty() {
         upstream_request = upstream_request.body(raw_body.clone());
     }
@@ -273,6 +280,7 @@ async fn proxy_entry_with_cfg(
         upstream_response,
         request_plan.source_format,
         request_plan.target_format,
+        request_plan.passthrough,
         delay_stream_header,
         is_stream,
         estimated_prompt_tokens,
@@ -383,36 +391,70 @@ fn moderation_debug_headers(debug: Option<&ModerationDebugInfo>) -> HeaderMap {
         return headers;
     };
 
-    if let Some(value) = debug.local_model_source.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
-        headers.insert(HeaderName::from_static("x-prismguard-local-model-source"), value);
+    if let Some(value) = debug
+        .local_model_source
+        .as_deref()
+        .and_then(|v| HeaderValue::from_str(v).ok())
+    {
+        headers.insert(
+            HeaderName::from_static("x-prismguard-local-model-source"),
+            value,
+        );
     }
-    if let Some(value) = debug.local_model_decision.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
-        headers.insert(HeaderName::from_static("x-prismguard-local-model-decision"), value);
+    if let Some(value) = debug
+        .local_model_decision
+        .as_deref()
+        .and_then(|v| HeaderValue::from_str(v).ok())
+    {
+        headers.insert(
+            HeaderName::from_static("x-prismguard-local-model-decision"),
+            value,
+        );
     }
     if let Some(value) = format_optional_f64(debug.local_model_confidence) {
-        headers.insert(HeaderName::from_static("x-prismguard-local-model-confidence"), value);
+        headers.insert(
+            HeaderName::from_static("x-prismguard-local-model-confidence"),
+            value,
+        );
     }
     if let Some(value) = format_optional_f64(debug.local_model_latency_ms) {
-        headers.insert(HeaderName::from_static("x-prismguard-local-model-latency-ms"), value);
+        headers.insert(
+            HeaderName::from_static("x-prismguard-local-model-latency-ms"),
+            value,
+        );
     }
     headers.insert(
         HeaderName::from_static("x-prismguard-llm-reviewed"),
         HeaderValue::from_static(if debug.llm_reviewed { "true" } else { "false" }),
     );
-    if let Some(value) = debug.llm_result.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+    if let Some(value) = debug
+        .llm_result
+        .as_deref()
+        .and_then(|v| HeaderValue::from_str(v).ok())
+    {
         headers.insert(HeaderName::from_static("x-prismguard-llm-result"), value);
     }
     if let Some(value) = format_optional_f64(debug.llm_latency_ms) {
-        headers.insert(HeaderName::from_static("x-prismguard-llm-latency-ms"), value);
+        headers.insert(
+            HeaderName::from_static("x-prismguard-llm-latency-ms"),
+            value,
+        );
     }
-    if let Some(value) = debug.llm_error.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+    if let Some(value) = debug
+        .llm_error
+        .as_deref()
+        .and_then(|v| HeaderValue::from_str(v).ok())
+    {
         headers.insert(HeaderName::from_static("x-prismguard-llm-error"), value);
     }
     headers
 }
 
 fn should_forward_planned_json(method: &Method) -> bool {
-    matches!(*method, Method::GET | Method::POST | Method::PUT | Method::DELETE)
+    matches!(
+        *method,
+        Method::GET | Method::POST | Method::PUT | Method::DELETE
+    )
 }
 
 fn build_upstream_url(
@@ -438,6 +480,7 @@ async fn build_proxy_response(
     upstream_response: reqwest::Response,
     client_format: Option<crate::format::RequestFormat>,
     upstream_format: Option<crate::format::RequestFormat>,
+    passthrough: bool,
     delay_stream_header: bool,
     request_expects_stream: bool,
     estimated_prompt_tokens: Option<i64>,
@@ -450,6 +493,7 @@ async fn build_proxy_response(
             upstream_response,
             client_format,
             upstream_format,
+            passthrough,
             delay_stream_header,
             header_says_stream,
             estimated_prompt_tokens,
@@ -463,6 +507,7 @@ async fn build_proxy_response(
         upstream_response,
         client_format,
         upstream_format,
+        passthrough,
         delay_stream_header,
         &headers,
         moderation_debug,
@@ -476,6 +521,7 @@ async fn build_streaming_proxy_response(
     upstream_response: reqwest::Response,
     client_format: Option<crate::format::RequestFormat>,
     upstream_format: Option<crate::format::RequestFormat>,
+    passthrough: bool,
     delay_stream_header: bool,
     header_says_stream: bool,
     estimated_prompt_tokens: Option<i64>,
@@ -517,7 +563,8 @@ async fn build_streaming_proxy_response(
                     if let Some(checker) = precheck.as_mut() {
                         match checker.push_chunk(&chunk) {
                             StreamPrecheckStatus::Pending => continue,
-                            StreamPrecheckStatus::Passed | StreamPrecheckStatus::ForcePassProtectionLimit => break,
+                            StreamPrecheckStatus::Passed
+                            | StreamPrecheckStatus::ForcePassProtectionLimit => break,
                         }
                     } else if stream_detected {
                         break;
@@ -534,11 +581,9 @@ async fn build_streaming_proxy_response(
                 None => {
                     if let Some(checker) = precheck.as_mut() {
                         if let Some(message) = checker.finish() {
-                            return Err(
-                                ApiError::new(StatusCode::TOO_MANY_REQUESTS, message)
-                                    .with_code("UPSTREAM_STREAM_ERROR")
-                                    .with_error_type("upstream_stream_error"),
-                            );
+                            return Err(ApiError::new(StatusCode::TOO_MANY_REQUESTS, message)
+                                .with_code("UPSTREAM_STREAM_ERROR")
+                                .with_error_type("upstream_stream_error"));
                         }
                     }
                     break;
@@ -556,12 +601,17 @@ async fn build_streaming_proxy_response(
             body,
             client_format,
             upstream_format,
+            passthrough,
             delay_stream_header,
             moderation_debug,
         );
     }
 
-    let response_headers = stream_success_headers(headers, moderation_debug);
+    let response_headers = if passthrough {
+        passthrough_success_headers(headers, moderation_debug)
+    } else {
+        stream_success_headers(headers, moderation_debug)
+    };
     if status != StatusCode::OK {
         return build_response(
             status,
@@ -570,7 +620,11 @@ async fn build_streaming_proxy_response(
         );
     }
 
-    let body = if upstream_format.zip(client_format).is_some_and(|(from, to)| from != to) {
+    let body = if !passthrough
+        && upstream_format
+            .zip(client_format)
+            .is_some_and(|(from, to)| from != to)
+    {
         build_transformed_stream_body(
             buffered,
             upstream,
@@ -589,6 +643,7 @@ async fn build_non_stream_proxy_response(
     upstream_response: reqwest::Response,
     client_format: Option<crate::format::RequestFormat>,
     upstream_format: Option<crate::format::RequestFormat>,
+    passthrough: bool,
     delay_stream_header: bool,
     headers: &HeaderMap,
     moderation_debug: &HeaderMap,
@@ -613,6 +668,7 @@ async fn build_non_stream_proxy_response(
         body,
         client_format,
         upstream_format,
+        passthrough,
         delay_stream_header,
         moderation_debug,
     )
@@ -625,10 +681,18 @@ fn build_non_stream_proxy_response_from_body(
     body: Vec<u8>,
     client_format: Option<crate::format::RequestFormat>,
     upstream_format: Option<crate::format::RequestFormat>,
+    passthrough: bool,
     delay_stream_header: bool,
     moderation_debug: &HeaderMap,
 ) -> Result<Response, ApiError> {
     if status == StatusCode::OK {
+        if passthrough {
+            return build_response(
+                status,
+                &passthrough_success_headers(headers, moderation_debug),
+                boxed(Body::from(body)),
+            );
+        }
         if let Ok(json_body) = serde_json::from_slice::<Value>(&body) {
             let transformed = match maybe_transform_json_response(
                 json_body.clone(),
@@ -641,11 +705,9 @@ fn build_non_stream_proxy_response_from_body(
             if delay_stream_header {
                 let check_format = stream_check_format(client_format, upstream_format);
                 if let Some(message) = validate_response_content(&transformed, Some(check_format)) {
-                    return Err(
-                        ApiError::new(StatusCode::BAD_REQUEST, message)
-                            .with_code("EMPTY_RESPONSE")
-                            .with_error_type("content_validation_error"),
-                    );
+                    return Err(ApiError::new(StatusCode::BAD_REQUEST, message)
+                        .with_code("EMPTY_RESPONSE")
+                        .with_error_type("content_validation_error"));
                 }
             }
             let encoded = serde_json::to_vec(&transformed).map_err(|e| {
@@ -668,11 +730,9 @@ fn build_non_stream_proxy_response_from_body(
         if delay_stream_header {
             let check_format = stream_check_format(client_format, upstream_format);
             if let Some(message) = validate_response_content(&wrapped, Some(check_format)) {
-                return Err(
-                    ApiError::new(StatusCode::BAD_REQUEST, message)
-                        .with_code("EMPTY_RESPONSE")
-                        .with_error_type("content_validation_error"),
-                );
+                return Err(ApiError::new(StatusCode::BAD_REQUEST, message)
+                    .with_code("EMPTY_RESPONSE")
+                    .with_error_type("content_validation_error"));
             }
         }
         let encoded = serde_json::to_vec(&wrapped).map_err(|e| {
@@ -694,20 +754,20 @@ fn build_non_stream_proxy_response_from_body(
 
 fn build_passthrough_stream_body(buffered: Vec<Bytes>, upstream: ReqByteStream) -> BoxBody {
     let buffered = VecDeque::from(buffered);
-    let stream = stream::unfold((buffered, upstream), |(mut buffered, mut upstream)| async move {
-        if let Some(chunk) = buffered.pop_front() {
-            return Some((Ok::<Bytes, std::io::Error>(chunk), (buffered, upstream)));
-        }
+    let stream = stream::unfold(
+        (buffered, upstream),
+        |(mut buffered, mut upstream)| async move {
+            if let Some(chunk) = buffered.pop_front() {
+                return Some((Ok::<Bytes, std::io::Error>(chunk), (buffered, upstream)));
+            }
 
-        match upstream.as_mut().next().await {
-            Some(Ok(chunk)) => Some((Ok(chunk), (buffered, upstream))),
-            Some(Err(err)) => Some((
-                Err(stream_read_error(err)),
-                (buffered, upstream),
-            )),
-            None => None,
-        }
-    });
+            match upstream.as_mut().next().await {
+                Some(Ok(chunk)) => Some((Ok(chunk), (buffered, upstream))),
+                Some(Err(err)) => Some((Err(stream_read_error(err)), (buffered, upstream))),
+                None => None,
+            }
+        },
+    );
 
     boxed(Body::wrap_stream(stream))
 }
@@ -810,7 +870,8 @@ fn estimate_tokens_from_text(text: &str) -> Option<i64> {
         }
     }
 
-    let estimated_tokens = (0.28 * ascii_chars + 1.4 * cjk_chars + 0.15 * spaces + 4.0).ceil() as i64;
+    let estimated_tokens =
+        (0.28 * ascii_chars + 1.4 * cjk_chars + 0.15 * spaces + 4.0).ceil() as i64;
     Some(estimated_tokens.max(1))
 }
 
@@ -886,12 +947,13 @@ fn build_response(
             target_headers.append(name.clone(), value.clone());
         }
     }
-    response
-        .body(body)
-        .map_err(|e| {
-            ApiError::new(StatusCode::BAD_GATEWAY, format!("failed to build response: {e}"))
-                .with_code("PROXY_ERROR")
-        })
+    response.body(body).map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("failed to build response: {e}"),
+        )
+        .with_code("PROXY_ERROR")
+    })
 }
 
 fn filtered_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
@@ -913,6 +975,12 @@ fn json_success_headers(extra: &HeaderMap) -> HeaderMap {
         axum::http::header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
+    append_extra_headers(&mut headers, extra);
+    headers
+}
+
+fn passthrough_success_headers(headers: &HeaderMap, extra: &HeaderMap) -> HeaderMap {
+    let mut headers = headers.clone();
     append_extra_headers(&mut headers, extra);
     headers
 }
@@ -1028,12 +1096,18 @@ impl StreamPrecheck {
                                 self.content_chars += delta.chars().count();
                             }
                         }
-                        Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
+                        Some(
+                            "response.reasoning_text.delta"
+                            | "response.reasoning_summary_text.delta",
+                        ) => {
                             if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
                                 self.content_chars += delta.chars().count();
                             }
                         }
-                        Some("response.function_call_arguments.delta" | "response.function_call.delta") => {
+                        Some(
+                            "response.function_call_arguments.delta"
+                            | "response.function_call.delta",
+                        ) => {
                             self.has_tool_call = true;
                         }
                         Some("response.output_item.added") => {
@@ -1057,7 +1131,9 @@ impl StreamPrecheck {
                                 if let Some(text) = delta.get("content").and_then(Value::as_str) {
                                     self.content_chars += text.chars().count();
                                 }
-                                if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                                if let Some(text) =
+                                    delta.get("reasoning_content").and_then(Value::as_str)
+                                {
                                     self.content_chars += text.chars().count();
                                 }
                                 if delta.get("tool_calls").is_some() {
@@ -1073,12 +1149,16 @@ impl StreamPrecheck {
                             if let Some(delta) = payload.get("delta").and_then(Value::as_object) {
                                 match delta.get("type").and_then(Value::as_str) {
                                     Some("text_delta") => {
-                                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                        if let Some(text) =
+                                            delta.get("text").and_then(Value::as_str)
+                                        {
                                             self.content_chars += text.chars().count();
                                         }
                                     }
                                     Some("thinking_delta") => {
-                                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                                        if let Some(text) =
+                                            delta.get("thinking").and_then(Value::as_str)
+                                        {
                                             self.content_chars += text.chars().count();
                                         }
                                     }
@@ -1216,8 +1296,7 @@ fn detect_source_format(path: &str, body: Option<&Value>) -> Option<&'static str
         return Some("openai_responses");
     }
 
-    if path.contains("/v1beta/models/")
-        || object.is_some_and(|body| body.contains_key("contents"))
+    if path.contains("/v1beta/models/") || object.is_some_and(|body| body.contains_key("contents"))
     {
         return Some("gemini_chat");
     }
@@ -1319,7 +1398,8 @@ fn validate_response_content(
                                         part.get("type").and_then(Value::as_str),
                                         Some("output_text" | "input_text" | "text")
                                     ) {
-                                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                        if let Some(text) = part.get("text").and_then(Value::as_str)
+                                        {
                                             accumulated_content.push_str(text);
                                         }
                                     }
@@ -1359,8 +1439,7 @@ fn validate_response_content(
                         if let Some(text) = message.get("content").and_then(Value::as_str) {
                             accumulated_content.push_str(text);
                         }
-                        if let Some(text) =
-                            message.get("reasoning_content").and_then(Value::as_str)
+                        if let Some(text) = message.get("reasoning_content").and_then(Value::as_str)
                         {
                             accumulated_content.push_str(text);
                         }
@@ -1429,12 +1508,16 @@ fn validate_stream_content(
                             accumulated_content.push_str(delta);
                         }
                     }
-                    Some("response.reasoning_text.delta" | "response.reasoning_summary_text.delta") => {
+                    Some(
+                        "response.reasoning_text.delta" | "response.reasoning_summary_text.delta",
+                    ) => {
                         if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
                             accumulated_content.push_str(delta);
                         }
                     }
-                    Some("response.function_call_arguments.delta" | "response.function_call.delta") => {
+                    Some(
+                        "response.function_call_arguments.delta" | "response.function_call.delta",
+                    ) => {
                         has_tool_call = true;
                     }
                     Some("response.output_item.added") => {
@@ -1458,7 +1541,9 @@ fn validate_stream_content(
                             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                                 accumulated_content.push_str(text);
                             }
-                            if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                            if let Some(text) =
+                                delta.get("reasoning_content").and_then(Value::as_str)
+                            {
                                 accumulated_content.push_str(text);
                             }
                             if delta.get("tool_calls").is_some() {
@@ -1479,7 +1564,9 @@ fn validate_stream_content(
                                     }
                                 }
                                 Some("thinking_delta") => {
-                                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                                    if let Some(text) =
+                                        delta.get("thinking").and_then(Value::as_str)
+                                    {
                                         accumulated_content.push_str(text);
                                     }
                                 }

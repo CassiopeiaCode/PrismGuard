@@ -4,6 +4,8 @@
 mod config;
 #[path = "../src/format.rs"]
 mod format;
+#[path = "../src/moderation/mod.rs"]
+mod moderation;
 #[path = "../src/profile.rs"]
 mod profile;
 #[path = "../src/proxy.rs"]
@@ -17,12 +19,10 @@ mod sample_rpc;
 #[cfg(feature = "storage-debug")]
 #[path = "../src/storage.rs"]
 mod storage;
-#[path = "../src/training.rs"]
-mod training;
-#[path = "../src/moderation/mod.rs"]
-mod moderation;
 #[path = "../src/streaming.rs"]
 mod streaming;
+#[path = "../src/training.rs"]
+mod training;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,20 +56,25 @@ async fn upstream_openai_responses_json_is_transformed_back_to_openai_chat() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -81,6 +86,56 @@ async fn upstream_openai_responses_json_is_transformed_back_to_openai_chat() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["choices"][0]["message"]["content"], "hello");
+}
+
+#[tokio::test]
+async fn pass_through_non_stream_response_keeps_plain_text_body() {
+    let upstream_base = spawn_fixed_upstream(
+        StatusCode::OK,
+        "text/plain; charset=utf-8",
+        b"plain text body".to_vec(),
+    )
+    .await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "pass_through"
+            }
+        })
+        .to_string(),
+    );
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        response.text().await.expect("response text"),
+        "plain text body"
+    );
 }
 
 #[tokio::test]
@@ -107,20 +162,25 @@ async fn upstream_openai_chat_json_is_transformed_back_to_openai_responses() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/responses"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "input": "hi"
@@ -168,20 +228,25 @@ async fn upstream_openai_chat_tool_calls_are_transformed_back_to_openai_response
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/responses"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "input": "weather?"
@@ -199,7 +264,8 @@ async fn upstream_openai_chat_tool_calls_are_transformed_back_to_openai_response
 }
 
 #[tokio::test]
-async fn upstream_openai_chat_reasoning_content_is_transformed_back_to_openai_responses_reasoning_item() {
+async fn upstream_openai_chat_reasoning_content_is_transformed_back_to_openai_responses_reasoning_item(
+) {
     let upstream_body = json!({
         "id": "chatcmpl_reasoning_resp",
         "object": "chat.completion",
@@ -217,20 +283,25 @@ async fn upstream_openai_chat_reasoning_content_is_transformed_back_to_openai_re
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/responses"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "input": "think"
@@ -266,14 +337,17 @@ async fn upstream_openai_chat_reasoning_response_transforms_to_claude_thinking_c
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "claude_chat",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -331,14 +405,17 @@ async fn upstream_openai_chat_tool_response_transforms_to_canonical_claude_messa
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "claude_chat",
-            "to": "openai_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -406,20 +483,25 @@ async fn upstream_claude_json_is_transformed_back_to_openai_responses() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "claude_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "claude_chat"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/responses"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "input": "hi"
@@ -485,20 +567,25 @@ async fn upstream_gemini_json_is_transformed_back_to_openai_responses() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_responses",
-            "to": "gemini_chat"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_responses",
+                "to": "gemini_chat"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/responses"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/responses"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "input": "hi"
@@ -547,20 +634,25 @@ async fn upstream_openai_responses_message_content_items_object_maps_to_chat() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -592,20 +684,25 @@ async fn upstream_openai_responses_message_content_single_object_maps_to_chat() 
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -616,7 +713,10 @@ async fn upstream_openai_responses_message_content_single_object_maps_to_chat() 
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["choices"][0]["message"]["content"], "hello from object");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "hello from object"
+    );
 }
 
 #[tokio::test]
@@ -635,20 +735,25 @@ async fn upstream_openai_responses_function_call_is_transformed_back_to_chat_too
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "weather?"}]
@@ -659,7 +764,10 @@ async fn upstream_openai_responses_function_call_is_transformed_back_to_chat_too
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_1"
+    );
     assert_eq!(
         body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
         "lookup_weather"
@@ -688,14 +796,17 @@ async fn upstream_openai_responses_function_call_object_arguments_are_stringifie
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -743,14 +854,17 @@ async fn upstream_openai_responses_multiple_function_calls_are_preserved_in_chat
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -770,12 +884,18 @@ async fn upstream_openai_responses_multiple_function_calls_are_preserved_in_chat
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     assert!(body["choices"][0]["message"]["content"].is_null(), "{body}");
-    assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_1"
+    );
     assert_eq!(
         body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
         "lookup_weather"
     );
-    assert_eq!(body["choices"][0]["message"]["tool_calls"][1]["id"], "call_2");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][1]["id"],
+        "call_2"
+    );
     assert_eq!(
         body["choices"][0]["message"]["tool_calls"][1]["function"]["name"],
         "lookup_time"
@@ -805,20 +925,25 @@ async fn upstream_openai_responses_usage_is_preserved_in_chat_response() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -855,20 +980,25 @@ async fn upstream_openai_responses_incomplete_status_maps_to_chat_length_finish_
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -901,20 +1031,25 @@ async fn upstream_openai_responses_failed_status_maps_to_chat_error_finish_reaso
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -946,14 +1081,17 @@ async fn upstream_openai_responses_without_status_keeps_chat_finish_reason_null(
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -993,14 +1131,17 @@ async fn upstream_openai_responses_without_created_does_not_emit_zero_created_fi
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1041,14 +1182,17 @@ async fn upstream_openai_responses_null_created_does_not_emit_created_field() {
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1088,14 +1232,17 @@ async fn upstream_openai_responses_without_usage_emits_null_usage_field() {
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1142,20 +1289,25 @@ async fn upstream_openai_responses_extra_fields_are_preserved_in_chat_response()
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1197,20 +1349,25 @@ async fn upstream_openai_responses_final_chat_message_uses_last_assistant_item()
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1222,7 +1379,10 @@ async fn upstream_openai_responses_final_chat_message_uses_last_assistant_item()
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
     assert!(body["choices"][0]["message"]["content"].is_null(), "{body}");
-    assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_1"
+    );
 }
 
 #[tokio::test]
@@ -1242,20 +1402,25 @@ async fn upstream_openai_responses_function_call_output_does_not_surface_in_fina
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1268,12 +1433,16 @@ async fn upstream_openai_responses_function_call_output_does_not_surface_in_fina
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     assert!(body["choices"][0]["message"]["content"].is_null(), "{body}");
-    assert!(body["choices"][0]["message"]["tool_calls"].is_null(), "{body}");
+    assert!(
+        body["choices"][0]["message"]["tool_calls"].is_null(),
+        "{body}"
+    );
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
 }
 
 #[tokio::test]
-async fn upstream_openai_responses_trailing_function_call_output_keeps_previous_assistant_message() {
+async fn upstream_openai_responses_trailing_function_call_output_keeps_previous_assistant_message()
+{
     let upstream_body = json!({
         "id": "resp_tool_output_trailing_message",
         "object": "response",
@@ -1299,20 +1468,25 @@ async fn upstream_openai_responses_trailing_function_call_output_keeps_previous_
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1325,7 +1499,10 @@ async fn upstream_openai_responses_trailing_function_call_output_keeps_previous_
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     assert_eq!(body["choices"][0]["message"]["content"], "final answer");
-    assert!(body["choices"][0]["message"]["tool_calls"].is_null(), "{body}");
+    assert!(
+        body["choices"][0]["message"]["tool_calls"].is_null(),
+        "{body}"
+    );
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
 }
 
@@ -1355,20 +1532,25 @@ async fn upstream_openai_responses_image_content_maps_to_chat_content_parts() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1381,7 +1563,10 @@ async fn upstream_openai_responses_image_content_maps_to_chat_content_parts() {
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["choices"][0]["message"]["content"][0]["type"], "text");
     assert_eq!(body["choices"][0]["message"]["content"][0]["text"], "look");
-    assert_eq!(body["choices"][0]["message"]["content"][1]["type"], "image_url");
+    assert_eq!(
+        body["choices"][0]["message"]["content"][1]["type"],
+        "image_url"
+    );
     assert_eq!(
         body["choices"][0]["message"]["content"][1]["image_url"]["url"],
         "https://example.com/cat.png"
@@ -1414,20 +1599,25 @@ async fn upstream_openai_responses_image_url_object_maps_to_chat_content_parts()
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1438,7 +1628,10 @@ async fn upstream_openai_responses_image_url_object_maps_to_chat_content_parts()
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["choices"][0]["message"]["content"][0]["type"], "image_url");
+    assert_eq!(
+        body["choices"][0]["message"]["content"][0]["type"],
+        "image_url"
+    );
     assert_eq!(
         body["choices"][0]["message"]["content"][0]["image_url"]["url"],
         "https://example.com/dog.png"
@@ -1469,20 +1662,25 @@ async fn upstream_openai_responses_image_url_string_field_maps_to_chat_content_p
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1493,7 +1691,10 @@ async fn upstream_openai_responses_image_url_string_field_maps_to_chat_content_p
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["choices"][0]["message"]["content"][0]["type"], "image_url");
+    assert_eq!(
+        body["choices"][0]["message"]["content"][0]["type"],
+        "image_url"
+    );
     assert_eq!(
         body["choices"][0]["message"]["content"][0]["image_url"]["url"],
         "https://example.com/string.png"
@@ -1524,20 +1725,25 @@ async fn upstream_openai_responses_image_url_flat_url_field_maps_to_chat_content
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1548,7 +1754,10 @@ async fn upstream_openai_responses_image_url_flat_url_field_maps_to_chat_content
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["choices"][0]["message"]["content"][0]["type"], "image_url");
+    assert_eq!(
+        body["choices"][0]["message"]["content"][0]["type"],
+        "image_url"
+    );
     assert_eq!(
         body["choices"][0]["message"]["content"][0]["image_url"]["url"],
         "https://example.com/flat.png"
@@ -1581,20 +1790,25 @@ async fn upstream_openai_responses_image_object_url_field_maps_to_chat_content_p
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1605,7 +1819,10 @@ async fn upstream_openai_responses_image_object_url_field_maps_to_chat_content_p
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
-    assert_eq!(body["choices"][0]["message"]["content"][0]["type"], "image_url");
+    assert_eq!(
+        body["choices"][0]["message"]["content"][0]["type"],
+        "image_url"
+    );
     assert_eq!(
         body["choices"][0]["message"]["content"][0]["image_url"]["url"],
         "https://example.com/nested.png"
@@ -1641,20 +1858,25 @@ async fn upstream_openai_responses_multiple_text_parts_join_with_newlines() {
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1697,20 +1919,25 @@ async fn upstream_openai_responses_only_uses_last_message_item_for_final_chat_me
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1742,20 +1969,25 @@ async fn upstream_openai_responses_reasoning_item_maps_to_chat_reasoning_content
 
     let upstream_base = spawn_json_upstream(upstream_body).await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1784,14 +2016,17 @@ async fn upstream_openai_responses_empty_output_keeps_empty_assistant_message_sh
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
     let proxy_url = format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions");
 
     let response = reqwest::Client::builder()
@@ -1811,7 +2046,10 @@ async fn upstream_openai_responses_empty_output_keeps_empty_assistant_message_sh
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     assert!(body["choices"][0]["message"]["content"].is_null(), "{body}");
-    assert!(body["choices"][0]["message"]["tool_calls"].is_null(), "{body}");
+    assert!(
+        body["choices"][0]["message"]["tool_calls"].is_null(),
+        "{body}"
+    );
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert_eq!(body.get("usage"), Some(&Value::Null));
 }
@@ -1831,7 +2069,9 @@ async fn non_json_success_response_is_wrapped_as_json_like_python() {
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1873,7 +2113,9 @@ async fn non_json_success_response_respects_declared_charset_like_python() {
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1916,7 +2158,9 @@ async fn successful_json_response_does_not_preserve_upstream_custom_headers_like
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1946,20 +2190,25 @@ async fn json_array_success_response_is_passed_through_when_response_transform_f
     )
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses"
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1988,7 +2237,9 @@ async fn json_scalar_success_response_is_passed_through_like_python() {
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2018,17 +2269,22 @@ async fn delay_stream_header_allows_json_scalar_success_response_like_python() {
     )
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "delay_stream_header": true
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "delay_stream_header": true
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2058,17 +2314,22 @@ async fn delay_stream_header_skips_validation_for_non_200_success_like_python() 
     )
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "delay_stream_header": true
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "delay_stream_header": true
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2091,7 +2352,8 @@ async fn delay_stream_header_skips_validation_for_non_200_success_like_python() 
 
 #[tokio::test]
 async fn non_200_ok_empty_response_is_passed_through_like_python() {
-    let upstream_base = spawn_fixed_upstream(StatusCode::NO_CONTENT, "text/plain", Vec::new()).await;
+    let upstream_base =
+        spawn_fixed_upstream(StatusCode::NO_CONTENT, "text/plain", Vec::new()).await;
     let proxy_base = spawn_proxy_server().await;
     let config = percent_encode(&json!({}).to_string());
 
@@ -2099,7 +2361,9 @@ async fn non_200_ok_empty_response_is_passed_through_like_python() {
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2136,7 +2400,9 @@ async fn non_200_response_preserves_upstream_custom_headers_like_python() {
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2177,7 +2443,9 @@ async fn non_200_response_strips_denied_headers_like_python() {
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2211,21 +2479,26 @@ async fn delay_stream_header_validates_non_stream_empty_response_like_python() {
     }))
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses",
-            "delay_stream_header": true
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses",
+                "delay_stream_header": true
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2249,17 +2522,22 @@ async fn delay_stream_header_rejects_non_json_success_response_like_python() {
     )
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "delay_stream_header": true
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "delay_stream_header": true
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2275,7 +2553,8 @@ async fn delay_stream_header_rejects_non_json_success_response_like_python() {
 }
 
 #[tokio::test]
-async fn delay_stream_header_non_json_transform_failure_uses_client_format_for_validation_like_python() {
+async fn delay_stream_header_non_json_transform_failure_uses_client_format_for_validation_like_python(
+) {
     let upstream_base = spawn_fixed_upstream(
         StatusCode::OK,
         "text/plain; charset=utf-8",
@@ -2283,21 +2562,26 @@ async fn delay_stream_header_non_json_transform_failure_uses_client_format_for_v
     )
     .await;
     let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(&json!({
-        "format_transform": {
-            "enabled": true,
-            "strict_parse": true,
-            "from": "openai_chat",
-            "to": "openai_responses",
-            "delay_stream_header": true
-        }
-    }).to_string());
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses",
+                "delay_stream_header": true
+            }
+        })
+        .to_string(),
+    );
 
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .expect("reqwest client")
-        .post(format!("{proxy_base}/{config}${upstream_base}/v1/chat/completions"))
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}]
@@ -2310,19 +2594,20 @@ async fn delay_stream_header_non_json_transform_failure_uses_client_format_for_v
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["error"]["code"], "EMPTY_RESPONSE");
     assert_eq!(body["error"]["type"], "content_validation_error");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("Format name: openai_chat")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("Format name: openai_chat"));
 }
 
 async fn spawn_json_upstream(body: Value) -> String {
     spawn_json_upstream_with_header(body, ("x-unused", "unused")).await
 }
 
-async fn spawn_json_upstream_with_header(body: Value, header: (&'static str, &'static str)) -> String {
+async fn spawn_json_upstream_with_header(
+    body: Value,
+    header: (&'static str, &'static str),
+) -> String {
     let app = Router::new().route(
         "/*path",
         post(move || {
@@ -2348,14 +2633,13 @@ async fn spawn_json_upstream_with_header(body: Value, header: (&'static str, &'s
     format!("http://{}", addr)
 }
 
-async fn spawn_fixed_upstream(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> String {
-    spawn_fixed_upstream_with_headers(
-        status,
-        content_type,
-        body,
-        vec![("x-unused", "unused")],
-    )
-    .await
+async fn spawn_fixed_upstream(
+    status: StatusCode,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> String {
+    spawn_fixed_upstream_with_headers(status, content_type, body, vec![("x-unused", "unused")])
+        .await
 }
 
 async fn spawn_fixed_upstream_with_extra_header(
