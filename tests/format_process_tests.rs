@@ -120,6 +120,40 @@ fn pass_through_preserves_detected_request_shape_and_moderation_text() {
 }
 
 #[test]
+fn pass_through_openai_chat_collects_object_and_system_text_for_moderation() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "pass_through"
+        }
+    });
+    let original = json!({
+        "model": "gpt-4.1-mini",
+        "system": [{"type": "text", "text": "system rules"}],
+        "messages": [
+            {
+                "role": "developer",
+                "content": {"type": "text", "text": "developer guidance"}
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "user prompt"}]
+            }
+        ]
+    });
+
+    let plan = process_request(&config, "/v1/chat/completions", &[], original)
+        .expect("openai chat request should pass through");
+
+    assert_eq!(
+        plan.moderation_text.as_deref(),
+        Some("system rules\ndeveloper guidance\nuser prompt")
+    );
+}
+
+#[test]
 fn detects_claude_chat_from_headers_and_rewrites_path_for_openai_chat_target() {
     let plan = process_request(
         &transform_config(true, "openai_chat"),
