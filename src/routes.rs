@@ -53,10 +53,6 @@ pub fn router(state: AppState) -> Router {
             get(debug_profile).fallback(method_not_allowed),
         )
         .route(
-            "/debug/profile/:profile/metrics",
-            get(debug_profile_metrics).fallback(method_not_allowed),
-        )
-        .route(
             "/debug/url-config",
             get(debug_url_config).fallback(method_not_allowed),
         )
@@ -77,7 +73,7 @@ pub fn router(state: AppState) -> Router {
                 .fallback(method_not_allowed),
         );
 
-    attach_storage_debug_routes(router).with_state(state)
+    attach_storage_debug_routes(attach_storage_profile_routes(router)).with_state(state)
 }
 
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
@@ -251,10 +247,7 @@ async fn debug_profile(
     let model_mtime = std::fs::metadata(&model_path)
         .ok()
         .and_then(|meta| meta.modified().ok());
-    let live_sample_count = SampleStorage::open_read_only(profile.history_rocks_path())
-        .ok()
-        .and_then(|storage| storage.sample_count())
-        .map(|count| count as usize);
+    let live_sample_count = live_profile_sample_count(&profile);
     let training_status_sample_count = profile
         .training_status()
         .as_ref()
@@ -285,6 +278,19 @@ async fn debug_profile(
         "training_decision": training_decision,
         "config": profile.config
     })))
+}
+
+#[cfg(feature = "storage-debug")]
+fn live_profile_sample_count(profile: &ModerationProfile) -> Option<usize> {
+    SampleStorage::open_read_only(profile.history_rocks_path())
+        .ok()
+        .and_then(|storage| storage.sample_count())
+        .map(|count| count as usize)
+}
+
+#[cfg(not(feature = "storage-debug"))]
+fn live_profile_sample_count(_profile: &ModerationProfile) -> Option<usize> {
+    None
 }
 
 #[cfg_attr(any(test, not(feature = "storage-debug")), allow(dead_code))]
@@ -464,6 +470,19 @@ async fn debug_find_by_text(
         "profile_name": profile.profile_name,
         "sample": sample,
     })))
+}
+
+#[cfg(feature = "storage-debug")]
+fn attach_storage_profile_routes(router: Router<AppState>) -> Router<AppState> {
+    router.route(
+        "/debug/profile/:profile/metrics",
+        get(debug_profile_metrics).fallback(method_not_allowed),
+    )
+}
+
+#[cfg(not(feature = "storage-debug"))]
+fn attach_storage_profile_routes(router: Router<AppState>) -> Router<AppState> {
+    router
 }
 
 #[cfg(feature = "storage-debug")]
