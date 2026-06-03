@@ -10,7 +10,7 @@ test = false
 bench = false
 
 [features]
-default = ["storage-debug"]
+default = []
 storage-debug = ["dep:rocksdb", "dep:rusqlite"]
 
 [dependencies]
