@@ -10,7 +10,7 @@
   <a href="https://github.com/CassiopeiaCode/PrismGuard/pkgs/container/prismguard"><img alt="GHCR image" src="https://img.shields.io/badge/GHCR-prismguard-0f766e?logo=github"></a>
   <a href="https://github.com/CassiopeiaCode/PrismGuard/releases"><img alt="Release binaries" src="https://img.shields.io/badge/releases-linux%2Famd64-111827?logo=github"></a>
   <a href="https://github.com/CassiopeiaCode/PrismGuard"><img alt="Repository" src="https://img.shields.io/badge/repo-public-22c55e?logo=github"></a>
-  <a href="#license"><img alt="License" src="https://img.shields.io/badge/license-not%20specified-64748b"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-2563eb"></a>
 </p>
 
 <p align="center">
@@ -26,9 +26,9 @@
   <a href="tests"><img alt="Coverage focus" src="https://img.shields.io/badge/tests-proxy%20%7C%20streaming%20%7C%20moderation-7c3aed"></a>
 </p>
 
-PrismGuard Rust is the Rust implementation of the PrismGuard moderation proxy. It sits between clients and upstream LLM APIs, understands multiple request/response protocols, applies moderation before the upstream call, can transcode streaming SSE responses, and optionally persists moderation history for local model training.
+PrismGuard Rust is an AI API moderation gateway. It sits between clients and upstream LLM APIs, understands multiple request/response protocols, applies moderation before the upstream call, can transcode streaming SSE responses, and optionally persists moderation history for local model training.
 
-It is built for compatibility work, not only raw forwarding. The codebase tracks Python-reference behavior across HTTP routing, request format detection, JSON response conversion, SSE event conversion, moderation error envelopes, history reuse, and training scheduling.
+It is built for production proxy work, not only raw forwarding. The codebase keeps protocol behavior explicit across HTTP routing, request format detection, JSON response conversion, SSE event conversion, moderation error envelopes, history reuse, and training scheduling.
 
 ## Highlights
 
@@ -53,6 +53,7 @@ It is built for compatibility work, not only raw forwarding. The codebase tracks
 - [Testing](#testing)
 - [Repository Map](#repository-map)
 - [Operational Notes](#operational-notes)
+- [Acknowledgements](#acknowledgements)
 - [License](#license)
 
 ## Install
@@ -497,6 +498,7 @@ taskset -c 0 env CARGO_BUILD_JOBS=1 cargo test --test http_proxy_stream_tests --
 ├── Dockerfile
 ├── start.sh
 ├── Cargo.toml
+├── LICENSE
 └── README.md
 ```
 
@@ -507,8 +509,11 @@ taskset -c 0 env CARGO_BUILD_JOBS=1 cargo test --test http_proxy_stream_tests --
 - Request bodies with supported compression encodings are decoded before JSON parsing in the proxy pipeline.
 - Several debugging and training paths assume a stable repository root because profile paths are resolved relative to the process working directory.
 - The checked-in `.env` and profile files may contain deployment-specific values. Review them before using this repository in a different environment.
-- There is no committed `LICENSE` file in this worktree. Treat reuse and redistribution rights as unspecified until a license is added.
+
+## Acknowledgements
+
+PrismGuard Rust is grateful for the support, feedback, and technical discussions from the [linux.do community](https://linux.do/).
 
 ## License
 
-No license file is currently present in this repository.
+PrismGuard Rust is licensed under the [Apache License 2.0](LICENSE).
