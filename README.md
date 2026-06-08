@@ -360,6 +360,105 @@ The profile field `local_model_type` selects one of:
 
 When local confidence is clearly below the low-risk threshold or above the high-risk threshold, the local model can decide without an LLM call. Uncertain scores fall back to LLM review unless concurrency fallback logic applies.
 
+### Writing a Moderation Config
+
+Moderation is configured in two layers.
+
+The proxy request config decides whether moderation runs for a specific upstream call:
+
+```json
+{
+  "basic_moderation": {
+    "enabled": true,
+    "keywords_file": "configs/keywords.txt",
+    "error_code": "BASIC_MODERATION_BLOCKED"
+  },
+  "smart_moderation": {
+    "enabled": true,
+    "profile": "4claudecode"
+  }
+}
+```
+
+The profile file decides how smart moderation behaves:
+
+```text
+configs/mod_profiles/4claudecode/profile.json
+```
+
+A compact profile can look like this:
+
+```json
+{
+  "ai": {
+    "provider": "openai",
+    "base_url": "https://api.example.com/v1",
+    "model": "moderation-model-a,moderation-model-b",
+    "api_key_env": "MODERATION_API_KEY",
+    "timeout": 50,
+    "max_retries": 1
+  },
+  "prompt": {
+    "template_file": "ai_prompt.txt",
+    "max_text_length": 50000
+  },
+  "probability": {
+    "ai_review_rate": 0.01,
+    "random_seed": 42,
+    "low_risk_threshold": 0.60,
+    "high_risk_threshold": 0.80,
+    "enable_concurrency_limit_fallback": true
+  },
+  "local_model_type": "hashlinear",
+  "hashlinear_training": {
+    "min_samples": 30,
+    "retrain_interval_minutes": 600,
+    "max_samples": 10000,
+    "max_db_items": 100000,
+    "sample_loading": "random_duplicate",
+    "analyzer": "char",
+    "ngram_range": [2, 4],
+    "n_features": 1048576,
+    "alpha": 0.00001,
+    "epochs": 2,
+    "batch_size": 2048,
+    "max_seconds": 300
+  }
+}
+```
+
+Profile fields:
+
+| Field | Meaning |
+| --- | --- |
+| `ai.provider` | Reviewer provider label. The current smart path is OpenAI-compatible. |
+| `ai.base_url` | Base URL for the reviewer API. |
+| `ai.model` | Reviewer model name. Comma-separated values are treated as retry candidates. |
+| `ai.api_key_env` | Environment variable that holds the reviewer API key. |
+| `ai.timeout` | Reviewer HTTP timeout in seconds. |
+| `ai.max_retries` | Number of retry attempts for reviewer failures. |
+| `prompt.template_file` | Prompt template file relative to the profile directory. |
+| `prompt.max_text_length` | Maximum moderation text length passed to the reviewer prompt. |
+| `probability.ai_review_rate` | Fraction of requests forced through AI review even when a local model can decide. |
+| `probability.low_risk_threshold` | Scores below this threshold can be treated as locally safe. |
+| `probability.high_risk_threshold` | Scores above this threshold can be treated as locally unsafe. |
+| `probability.enable_concurrency_limit_fallback` | Lets the proxy use local confidence fallback when reviewer concurrency is exhausted. |
+| `local_model_type` | Selects `hashlinear`, `bow`, or `fasttext`. |
+| `*_training.min_samples` | Minimum stored samples before a training run is considered. |
+| `*_training.retrain_interval_minutes` | Cooldown between training runs for the profile. |
+| `*_training.max_samples` | Maximum samples loaded into a training run. |
+| `*_training.max_db_items` | Maximum history items considered when sampling. |
+| `*_training.sample_loading` | Sample strategy, for example `random_full` or `random_duplicate`. |
+
+Training blocks are model-specific. Use `hashlinear_training` when `local_model_type` is `hashlinear`, `bow_training` when it is `bow`, and `fasttext_training` when it is `fasttext`. Extra blocks can remain in the profile; the active runtime only uses the block that matches `local_model_type`.
+
+Useful checks while editing a profile:
+
+```bash
+curl -s http://127.0.0.1:8000/debug/profile/4claudecode
+curl -s 'http://127.0.0.1:8000/debug/profile/4claudecode/metrics?sample_size=1000&threshold=0.5'
+```
+
 ## Runtime Features
 
 `Cargo.toml` defines one optional feature:
