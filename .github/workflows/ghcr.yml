@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - master
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -20,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install system build dependencies
         run: |
@@ -42,12 +44,27 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/Prismguand-Rust dist/Prismguand-Rust-linux-amd64
+          tar -C dist -czf dist/Prismguand-Rust-linux-amd64.tar.gz Prismguand-Rust-linux-amd64
+          sha256sum dist/Prismguand-Rust-linux-amd64.tar.gz > dist/Prismguand-Rust-linux-amd64.tar.gz.sha256
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: Prismguand-Rust-linux-amd64
-          path: dist/Prismguand-Rust-linux-amd64
+          path: |
+            dist/Prismguand-Rust-linux-amd64
+            dist/Prismguand-Rust-linux-amd64.tar.gz
+            dist/Prismguand-Rust-linux-amd64.tar.gz.sha256
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Prismguand-Rust-linux-amd64
+            dist/Prismguand-Rust-linux-amd64.tar.gz
+            dist/Prismguand-Rust-linux-amd64.tar.gz.sha256
+          generate_release_notes: true
 
   build-and-publish-image:
     runs-on: ubuntu-24.04
@@ -55,13 +72,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -69,16 +86,19 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=master,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
             type=sha,prefix=sha-
 
       - name: Build and push image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
