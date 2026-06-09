@@ -218,26 +218,27 @@ The Docker image builds the default feature set. Storage debug routes and sample
 
 ## Publishing
 
-The repository publishes through `.github/workflows/ghcr.yml`.
+The repository uses two publishing workflows.
 
-On every push to `master`:
+`.github/workflows/ghcr.yml` publishes the container image. On every push to `master`, it builds and pushes:
 
-- builds a `linux/amd64` release binary;
-- uploads the binary tarball and checksum as a workflow artifact;
-- builds and pushes `ghcr.io/cassiopeiacode/transformvetter:latest`;
-- also pushes `:master` and `:sha-<commit>` image tags.
+- `ghcr.io/cassiopeiacode/transformvetter:latest`
+- `ghcr.io/cassiopeiacode/transformvetter:master`
+- `ghcr.io/cassiopeiacode/transformvetter:sha-<commit>`
 
-On `v*` tags:
+On `v*` tags, the same workflow also publishes semver image tags such as `:1.2.3`, `:1.2`, and `:1`.
 
-- builds the same binary package;
-- creates or updates a GitHub Release with generated notes;
-- attaches `TransformVetter-linux-amd64`, `TransformVetter-linux-amd64.tar.gz`, and `TransformVetter-linux-amd64.tar.gz.sha256`;
-- publishes semver container image tags such as `:1.2.3`, `:1.2`, and `:1`.
+`.github/workflows/release.yml` publishes GitHub Releases. On `v*` tags, it builds a Linux amd64 binary, creates or updates the release, and attaches:
+
+- `TransformVetter-linux-amd64`
+- `TransformVetter-linux-amd64.tar.gz`
+- `TransformVetter-linux-amd64.tar.gz.sha256`
 
 Manual publishing is available from GitHub Actions:
 
 ```bash
 gh workflow run ghcr.yml --repo CassiopeiaCode/TransformVetter --ref master
+gh workflow run release.yml --repo CassiopeiaCode/TransformVetter --ref master -f tag=v1.2.3
 ```
 
 ## Proxy Configuration

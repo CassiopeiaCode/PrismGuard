@@ -1,0 +1,61 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, for example v1.2.3'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  LIBCLANG_PATH: /usr/lib/llvm-18/lib
+
+jobs:
+  release-linux-amd64:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release assets
+        run: |
+          mkdir -p dist
+          cp target/release/TransformVetter dist/TransformVetter-linux-amd64
+          tar -C dist -czf dist/TransformVetter-linux-amd64.tar.gz TransformVetter-linux-amd64
+          sha256sum dist/TransformVetter-linux-amd64.tar.gz > dist/TransformVetter-linux-amd64.tar.gz.sha256
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist/TransformVetter-linux-amd64
+            dist/TransformVetter-linux-amd64.tar.gz
+            dist/TransformVetter-linux-amd64.tar.gz.sha256
+          generate_release_notes: true

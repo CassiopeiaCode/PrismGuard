@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 env:
@@ -17,58 +17,8 @@ env:
   LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
 jobs:
-  build-binary:
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install system build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.89.0
-
-      - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Package binary artifact
-        run: |
-          mkdir -p dist
-          cp target/release/TransformVetter dist/TransformVetter-linux-amd64
-          tar -C dist -czf dist/TransformVetter-linux-amd64.tar.gz TransformVetter-linux-amd64
-          sha256sum dist/TransformVetter-linux-amd64.tar.gz > dist/TransformVetter-linux-amd64.tar.gz.sha256
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: TransformVetter-linux-amd64
-          path: |
-            dist/TransformVetter-linux-amd64
-            dist/TransformVetter-linux-amd64.tar.gz
-            dist/TransformVetter-linux-amd64.tar.gz.sha256
-
-      - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/TransformVetter-linux-amd64
-            dist/TransformVetter-linux-amd64.tar.gz
-            dist/TransformVetter-linux-amd64.tar.gz.sha256
-          generate_release_notes: true
-
   build-and-publish-image:
     runs-on: ubuntu-24.04
-    needs: build-binary
 
     steps:
       - name: Checkout
