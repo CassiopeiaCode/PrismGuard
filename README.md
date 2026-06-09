@@ -1,4 +1,4 @@
-# PrismGuard Rust
+# PrismGuard API Gateway
 
 <p align="center">
   <strong>AI API gateway for protocol translation, inline moderation, streaming parity, and local moderation training.</strong>
@@ -26,7 +26,7 @@
   <a href="tests"><img alt="Coverage focus" src="https://img.shields.io/badge/tests-proxy%20%7C%20streaming%20%7C%20moderation-7c3aed"></a>
 </p>
 
-PrismGuard Rust is an AI API moderation gateway. It sits between clients and upstream LLM APIs, understands multiple request/response protocols, applies moderation before the upstream call, can transcode streaming SSE responses, and optionally persists moderation history for local model training.
+PrismGuard is an AI API gateway for moderation, protocol translation, and streaming response conversion. It sits between clients and upstream LLM APIs, understands multiple request/response protocols, applies moderation before the upstream call, can transcode streaming SSE responses, and optionally persists moderation history for local model training.
 
 It is built for production proxy work, not only raw forwarding. The codebase keeps protocol behavior explicit across HTTP routing, request format detection, JSON response conversion, SSE event conversion, moderation error envelopes, history reuse, and training scheduling.
 
@@ -611,8 +611,8 @@ taskset -c 0 env CARGO_BUILD_JOBS=1 cargo test --test http_proxy_stream_tests --
 
 ## Acknowledgements
 
-PrismGuard Rust is grateful for the support, feedback, and technical discussions from the [linux.do community](https://linux.do/).
+PrismGuard is grateful for the support, feedback, and technical discussions from the [linux.do community](https://linux.do/).
 
 ## License
 
-PrismGuard Rust is licensed under the [Apache License 2.0](LICENSE).
+PrismGuard is licensed under the [Apache License 2.0](LICENSE).
