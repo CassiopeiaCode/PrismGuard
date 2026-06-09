@@ -1,11 +1,11 @@
 [package]
-name = "Prismguand-Rust"
+name = "TransformVetter"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [[bin]]
-name = "Prismguand-Rust"
+name = "TransformVetter"
 path = "src/main.rs"
 test = false
 bench = false

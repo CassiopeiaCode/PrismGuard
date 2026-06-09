@@ -79,7 +79,7 @@ pub fn router(state: AppState) -> Router {
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "ok": true,
-        "service": "PrismGuard",
+        "service": "TransformVetter",
         "host": state.settings.host,
         "port": state.settings.port,
         "debug": state.settings.debug,
@@ -90,7 +90,7 @@ async fn openapi_json() -> impl IntoResponse {
     Json(json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "PrismGuard",
+            "title": "TransformVetter",
             "description": "高级 AI API 中间件 - 智能审核 · 格式转换 · 透明代理",
             "version": "1.0.0"
         },
@@ -151,10 +151,10 @@ async fn docs_html() -> impl IntoResponse {
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>PrismGuard - Swagger UI</title>
+    <title>TransformVetter - Swagger UI</title>
   </head>
   <body>
-    <h1>PrismGuard Swagger UI</h1>
+    <h1>TransformVetter Swagger UI</h1>
     <p>Swagger UI schema: <a href="/openapi.json">/openapi.json</a></p>
   </body>
 </html>"#,
@@ -168,7 +168,7 @@ async fn docs_oauth2_redirect_html() -> impl IntoResponse {
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>PrismGuard - OAuth2 Redirect</title>
+    <title>TransformVetter - OAuth2 Redirect</title>
   </head>
   <body>
     <script>
@@ -191,10 +191,10 @@ async fn redoc_html() -> impl IntoResponse {
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>PrismGuard - ReDoc</title>
+    <title>TransformVetter - ReDoc</title>
   </head>
   <body>
-    <h1>PrismGuard ReDoc</h1>
+    <h1>TransformVetter ReDoc</h1>
     <p>ReDoc schema: <a href="/openapi.json">/openapi.json</a></p>
   </body>
 </html>"#,

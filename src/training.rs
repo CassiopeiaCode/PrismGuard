@@ -626,7 +626,7 @@ fn current_unix_secs() -> u64 {
 }
 
 fn binary_name(args: &[String]) -> &str {
-    args.first().map(String::as_str).unwrap_or("prismguard-rust")
+    args.first().map(String::as_str).unwrap_or("transformvetter")
 }
 
 fn hashlinear_training_spec(profile: &ModerationProfile) -> HashlinearTrainingSpec {

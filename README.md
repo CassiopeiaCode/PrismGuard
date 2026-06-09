@@ -1,15 +1,15 @@
-# PrismGuard API Gateway
+# TransformVetter
 
 <p align="center">
   <strong>AI API gateway for protocol translation, inline moderation, streaming parity, and local moderation training.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/CassiopeiaCode/PrismGuard/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/CassiopeiaCode/PrismGuard/actions/workflows/tests.yml/badge.svg"></a>
-  <a href="https://github.com/CassiopeiaCode/PrismGuard/actions/workflows/ghcr.yml"><img alt="GHCR workflow" src="https://github.com/CassiopeiaCode/PrismGuard/actions/workflows/ghcr.yml/badge.svg"></a>
-  <a href="https://github.com/CassiopeiaCode/PrismGuard/pkgs/container/prismguard"><img alt="GHCR image" src="https://img.shields.io/badge/GHCR-prismguard-0f766e?logo=github"></a>
-  <a href="https://github.com/CassiopeiaCode/PrismGuard/releases"><img alt="Release binaries" src="https://img.shields.io/badge/releases-linux%2Famd64-111827?logo=github"></a>
-  <a href="https://github.com/CassiopeiaCode/PrismGuard"><img alt="Repository" src="https://img.shields.io/badge/repo-public-22c55e?logo=github"></a>
+  <a href="https://github.com/CassiopeiaCode/TransformVetter/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/CassiopeiaCode/TransformVetter/actions/workflows/tests.yml/badge.svg"></a>
+  <a href="https://github.com/CassiopeiaCode/TransformVetter/actions/workflows/ghcr.yml"><img alt="GHCR workflow" src="https://github.com/CassiopeiaCode/TransformVetter/actions/workflows/ghcr.yml/badge.svg"></a>
+  <a href="https://github.com/CassiopeiaCode/TransformVetter/pkgs/container/transformvetter"><img alt="GHCR image" src="https://img.shields.io/badge/GHCR-transformvetter-0f766e?logo=github"></a>
+  <a href="https://github.com/CassiopeiaCode/TransformVetter/releases"><img alt="Release binaries" src="https://img.shields.io/badge/releases-linux%2Famd64-111827?logo=github"></a>
+  <a href="https://github.com/CassiopeiaCode/TransformVetter"><img alt="Repository" src="https://img.shields.io/badge/repo-public-22c55e?logo=github"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-2563eb"></a>
 </p>
 
@@ -26,7 +26,9 @@
   <a href="tests"><img alt="Coverage focus" src="https://img.shields.io/badge/tests-proxy%20%7C%20streaming%20%7C%20moderation-7c3aed"></a>
 </p>
 
-PrismGuard is an AI API gateway for moderation, protocol translation, and streaming response conversion. It sits between clients and upstream LLM APIs, understands multiple request/response protocols, applies moderation before the upstream call, can transcode streaming SSE responses, and optionally persists moderation history for local model training.
+TransformVetter transforms AI API requests and responses across OpenAI, Claude, and Gemini-compatible formats, then vets request content with keyword rules, smart moderation, local models, and optional LLM review before forwarding upstream.
+
+> Note: TransformVetter was previously published as PrismGuard and, earlier, GuardianBraidge.
 
 It is built for production proxy work, not only raw forwarding. The codebase keeps protocol behavior explicit across HTTP routing, request format detection, JSON response conversion, SSE event conversion, moderation error envelopes, history reuse, and training scheduling.
 
@@ -63,8 +65,8 @@ It is built for production proxy work, not only raw forwarding. The codebase kee
 The default image is published to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/cassiopeiacode/prismguard:latest
-docker run --rm -p 8000:8000 --env-file .env ghcr.io/cassiopeiacode/prismguard:latest
+docker pull ghcr.io/cassiopeiacode/transformvetter:latest
+docker run --rm -p 8000:8000 --env-file .env ghcr.io/cassiopeiacode/transformvetter:latest
 ```
 
 Common tags:
@@ -79,7 +81,7 @@ Common tags:
 Package page:
 
 ```text
-https://github.com/CassiopeiaCode/PrismGuard/pkgs/container/prismguard
+https://github.com/CassiopeiaCode/TransformVetter/pkgs/container/transformvetter
 ```
 
 ### Precompiled Binary from GitHub Releases
@@ -87,27 +89,27 @@ https://github.com/CassiopeiaCode/PrismGuard/pkgs/container/prismguard
 Tagged releases publish a Linux amd64 binary and checksum:
 
 ```bash
-gh release download --repo CassiopeiaCode/PrismGuard --pattern 'Prismguand-Rust-linux-amd64.tar.gz'
-gh release download --repo CassiopeiaCode/PrismGuard --pattern 'Prismguand-Rust-linux-amd64.tar.gz.sha256'
-sha256sum -c Prismguand-Rust-linux-amd64.tar.gz.sha256
-tar -xzf Prismguand-Rust-linux-amd64.tar.gz
-chmod +x Prismguand-Rust-linux-amd64
-./Prismguand-Rust-linux-amd64
+gh release download --repo CassiopeiaCode/TransformVetter --pattern 'TransformVetter-linux-amd64.tar.gz'
+gh release download --repo CassiopeiaCode/TransformVetter --pattern 'TransformVetter-linux-amd64.tar.gz.sha256'
+sha256sum -c TransformVetter-linux-amd64.tar.gz.sha256
+tar -xzf TransformVetter-linux-amd64.tar.gz
+chmod +x TransformVetter-linux-amd64
+./TransformVetter-linux-amd64
 ```
 
 Release page:
 
 ```text
-https://github.com/CassiopeiaCode/PrismGuard/releases
+https://github.com/CassiopeiaCode/TransformVetter/releases
 ```
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/CassiopeiaCode/PrismGuard.git
-cd PrismGuard
+git clone https://github.com/CassiopeiaCode/TransformVetter.git
+cd TransformVetter
 cargo build --release
-./target/release/Prismguand-Rust
+./target/release/TransformVetter
 ```
 
 ## How It Works
@@ -169,7 +171,7 @@ The transformation layer handles normal messages, system/instruction fields, mul
 ### Run Locally
 
 ```bash
-cd /services/llms/moderation/Prismguand-Rust
+cd TransformVetter
 cargo run
 ```
 
@@ -184,7 +186,7 @@ Expected shape:
 ```json
 {
   "ok": true,
-  "service": "PrismGuard",
+  "service": "TransformVetter",
   "host": "0.0.0.0",
   "port": 8000,
   "debug": true
@@ -195,7 +197,7 @@ Expected shape:
 
 ```bash
 cargo build --release
-./target/release/Prismguand-Rust
+./target/release/TransformVetter
 ```
 
 The bundled `start.sh` expects a `.env` file and a release binary:
@@ -208,8 +210,8 @@ nice -n 19 cargo build --release -j 1
 ### Docker Build
 
 ```bash
-docker build -t prismguard-rust .
-docker run --rm -p 8080:8080 prismguard-rust
+docker build -t transformvetter .
+docker run --rm -p 8080:8080 transformvetter
 ```
 
 The Docker image builds the default feature set. Storage debug routes and sample RPC service code require the explicit `storage-debug` feature, described below.
@@ -222,25 +224,25 @@ On every push to `master`:
 
 - builds a `linux/amd64` release binary;
 - uploads the binary tarball and checksum as a workflow artifact;
-- builds and pushes `ghcr.io/cassiopeiacode/prismguard:latest`;
+- builds and pushes `ghcr.io/cassiopeiacode/transformvetter:latest`;
 - also pushes `:master` and `:sha-<commit>` image tags.
 
 On `v*` tags:
 
 - builds the same binary package;
 - creates or updates a GitHub Release with generated notes;
-- attaches `Prismguand-Rust-linux-amd64`, `Prismguand-Rust-linux-amd64.tar.gz`, and `Prismguand-Rust-linux-amd64.tar.gz.sha256`;
+- attaches `TransformVetter-linux-amd64`, `TransformVetter-linux-amd64.tar.gz`, and `TransformVetter-linux-amd64.tar.gz.sha256`;
 - publishes semver container image tags such as `:1.2.3`, `:1.2`, and `:1`.
 
 Manual publishing is available from GitHub Actions:
 
 ```bash
-gh workflow run ghcr.yml --repo CassiopeiaCode/PrismGuard --ref master
+gh workflow run ghcr.yml --repo CassiopeiaCode/TransformVetter --ref master
 ```
 
 ## Proxy Configuration
 
-PrismGuard does not use a single static upstream route. The proxy route is encoded as:
+TransformVetter does not use a single static upstream route. The proxy route is encoded as:
 
 ```text
 /{config}${upstream-url}
@@ -603,7 +605,7 @@ taskset -c 0 env CARGO_BUILD_JOBS=1 cargo test --test http_proxy_stream_tests --
 
 ## Operational Notes
 
-- The binary name in `Cargo.toml` is `Prismguand-Rust`; the product and service name are presented as PrismGuard.
+- The binary name in `Cargo.toml` is `TransformVetter`; older builds used `Prismguand-Rust`.
 - The process attempts to lower its own priority to `nice=19` at startup. Failure is logged as a warning and does not stop the server.
 - Request bodies with supported compression encodings are decoded before JSON parsing in the proxy pipeline.
 - Several debugging and training paths assume a stable repository root because profile paths are resolved relative to the process working directory.
@@ -611,8 +613,8 @@ taskset -c 0 env CARGO_BUILD_JOBS=1 cargo test --test http_proxy_stream_tests --
 
 ## Acknowledgements
 
-PrismGuard is grateful for the support, feedback, and technical discussions from the [linux.do community](https://linux.do/).
+TransformVetter is grateful for the support, feedback, and technical discussions from the [linux.do community](https://linux.do/).
 
 ## License
 
-PrismGuard is licensed under the [Apache License 2.0](LICENSE).
+TransformVetter is licensed under the [Apache License 2.0](LICENSE).

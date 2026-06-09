@@ -37,11 +37,11 @@ RUN apt-get update \
         libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/Prismguand-Rust /app/Prismguand-Rust
+COPY --from=builder /app/target/release/TransformVetter /app/TransformVetter
 COPY --from=builder /app/artifacts /app/artifacts
 COPY --from=builder /app/start.sh /app/start.sh
 COPY --from=builder /app/README.md /app/README.md
 
 EXPOSE 8080
 
-ENTRYPOINT ["/app/Prismguand-Rust"]
+ENTRYPOINT ["/app/TransformVetter"]

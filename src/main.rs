@@ -78,7 +78,7 @@ async fn run_server() -> Result<()> {
         .with_context(|| format!("failed to bind {}", addr))?;
 
     info!(
-        service = "Prismguand-Rust",
+        service = "TransformVetter",
         root_dir = %root_dir.display(),
         %addr,
         "starting server"
@@ -116,7 +116,7 @@ fn select_startup_mode(args: &[String]) -> Result<StartupMode> {
 }
 
 fn binary_name(args: &[String]) -> &str {
-    args.first().map(String::as_str).unwrap_or("prismguard-rust")
+    args.first().map(String::as_str).unwrap_or("transformvetter")
 }
 
 fn prepare_sample_rpc(settings: &Settings) -> Result<()> {

@@ -9,7 +9,7 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-BIN="${1:-./target/release/Prismguand-Rust}"
+BIN="${1:-./target/release/TransformVetter}"
 
 if [ ! -x "$BIN" ]; then
     echo "错误: 可执行文件不存在或不可执行: $BIN"
@@ -17,5 +17,5 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-echo "以 nice=19 启动 Prismguand-Rust: $BIN"
+echo "以 nice=19 启动 TransformVetter: $BIN"
 exec nice -n 19 "$BIN"

@@ -164,7 +164,7 @@ async fn openai_chat_system_messages_map_to_claude_system_string_upstream() {
 }
 
 #[tokio::test]
-async fn healthz_uses_prismguard_service_name() {
+async fn healthz_uses_transformvetter_service_name() {
     let proxy_base = spawn_proxy_server().await;
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -178,7 +178,7 @@ async fn healthz_uses_prismguard_service_name() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["ok"], true);
-    assert_eq!(body["service"], "PrismGuard");
+    assert_eq!(body["service"], "TransformVetter");
 }
 
 #[tokio::test]
@@ -221,7 +221,7 @@ async fn healthz_method_not_allowed_uses_json_detail_body() {
 }
 
 #[tokio::test]
-async fn openapi_json_exposes_prismguard_metadata() {
+async fn openapi_json_exposes_transformvetter_metadata() {
     let proxy_base = spawn_proxy_server().await;
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -242,7 +242,7 @@ async fn openapi_json_exposes_prismguard_metadata() {
     );
     let body: Value = response.json().await.expect("json body");
     assert_eq!(body["openapi"], "3.1.0");
-    assert_eq!(body["info"]["title"], "PrismGuard");
+    assert_eq!(body["info"]["title"], "TransformVetter");
     assert_eq!(
         body["info"]["description"],
         "高级 AI API 中间件 - 智能审核 · 格式转换 · 透明代理"
@@ -279,7 +279,7 @@ async fn docs_serves_html_that_references_openapi_schema() {
     let body = response.text().await.expect("html body");
     assert!(body.contains("Swagger UI"));
     assert!(body.contains("/openapi.json"));
-    assert!(body.contains("PrismGuard"));
+    assert!(body.contains("TransformVetter"));
 }
 
 #[tokio::test]
@@ -305,7 +305,7 @@ async fn redoc_serves_html_that_references_openapi_schema() {
     let body = response.text().await.expect("html body");
     assert!(body.contains("ReDoc"));
     assert!(body.contains("/openapi.json"));
-    assert!(body.contains("PrismGuard"));
+    assert!(body.contains("TransformVetter"));
 }
 
 #[tokio::test]

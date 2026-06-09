@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/cassiopeiacode/prismguard
+  IMAGE_NAME: ghcr.io/cassiopeiacode/transformvetter
   LIBCLANG_PATH: /usr/lib/llvm-18/lib
 
 jobs:
@@ -43,27 +43,27 @@ jobs:
       - name: Package binary artifact
         run: |
           mkdir -p dist
-          cp target/release/Prismguand-Rust dist/Prismguand-Rust-linux-amd64
-          tar -C dist -czf dist/Prismguand-Rust-linux-amd64.tar.gz Prismguand-Rust-linux-amd64
-          sha256sum dist/Prismguand-Rust-linux-amd64.tar.gz > dist/Prismguand-Rust-linux-amd64.tar.gz.sha256
+          cp target/release/TransformVetter dist/TransformVetter-linux-amd64
+          tar -C dist -czf dist/TransformVetter-linux-amd64.tar.gz TransformVetter-linux-amd64
+          sha256sum dist/TransformVetter-linux-amd64.tar.gz > dist/TransformVetter-linux-amd64.tar.gz.sha256
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Prismguand-Rust-linux-amd64
+          name: TransformVetter-linux-amd64
           path: |
-            dist/Prismguand-Rust-linux-amd64
-            dist/Prismguand-Rust-linux-amd64.tar.gz
-            dist/Prismguand-Rust-linux-amd64.tar.gz.sha256
+            dist/TransformVetter-linux-amd64
+            dist/TransformVetter-linux-amd64.tar.gz
+            dist/TransformVetter-linux-amd64.tar.gz.sha256
 
       - name: Publish GitHub release assets
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/Prismguand-Rust-linux-amd64
-            dist/Prismguand-Rust-linux-amd64.tar.gz
-            dist/Prismguand-Rust-linux-amd64.tar.gz.sha256
+            dist/TransformVetter-linux-amd64
+            dist/TransformVetter-linux-amd64.tar.gz
+            dist/TransformVetter-linux-amd64.tar.gz.sha256
           generate_release_notes: true
 
   build-and-publish-image:
