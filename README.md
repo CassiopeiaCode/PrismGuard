@@ -32,17 +32,12 @@ TransformVetter transforms AI API requests and responses across OpenAI, Claude, 
 
 It is built for production proxy work, not only raw forwarding. The codebase keeps protocol behavior explicit across HTTP routing, request format detection, JSON response conversion, SSE event conversion, moderation error envelopes, history reuse, and training scheduling.
 
-## Highlights
-
-- **Protocol bridge:** OpenAI Chat Completions, OpenAI Responses, Claude Messages, and Gemini GenerateContent request families.
-- **Streaming parity:** SSE decoding and re-emission with text deltas, tool-call deltas, final events, usage metadata, and single `[DONE]` handling.
-- **Inline moderation:** keyword moderation plus smart moderation with cache/history reuse, local model decisions, LLM fallback, retry logic, and concurrency limiting.
-- **Local runtimes:** `hashlinear`, `bow`, and `fasttext` moderation paths selected per profile.
-- **Training loop:** profile-aware sample RPC, training subprocess mode, cooldown decisions, and scheduler support.
-- **Debug surface:** health, OpenAPI stub, URL config parsing, profile inspection, model metrics, and storage inspection routes.
+Use it when you need one front door for mixed LLM clients, but still want request moderation before traffic reaches the upstream provider.
 
 ## Contents
 
+- [Why TransformVetter](#why-transformvetter)
+- [Fit](#fit)
 - [Install](#install)
 - [How It Works](#how-it-works)
 - [Supported Protocols](#supported-protocols)
@@ -55,10 +50,64 @@ It is built for production proxy work, not only raw forwarding. The codebase kee
 - [Testing](#testing)
 - [Repository Map](#repository-map)
 - [Operational Notes](#operational-notes)
+- [Contributing](#contributing)
+- [Security](#security)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
 
+## Why TransformVetter
+
+Most LLM proxy setups solve either API compatibility or moderation. TransformVetter does both in the same request path:
+
+| Need | What TransformVetter does |
+| --- | --- |
+| Mixed client protocols | Accepts OpenAI, Claude, Gemini, and OpenAI Responses-style traffic. |
+| Upstream format conversion | Rewrites supported requests and responses into the target API shape. |
+| Streaming behavior | Preserves SSE-style streaming while translating deltas and terminal events. |
+| Inline safety checks | Runs keyword moderation, profile-based smart moderation, and optional LLM review before forwarding. |
+| Local review models | Uses profile-selected local runtimes for confident decisions and falls back when uncertain. |
+| Training feedback loop | Stores moderation history and can retrain profile-local models from collected samples. |
+
+## Highlights
+
+- **Protocol bridge:** OpenAI Chat Completions, OpenAI Responses, Claude Messages, and Gemini GenerateContent request families.
+- **Streaming parity:** SSE decoding and re-emission with text deltas, tool-call deltas, final events, usage metadata, and single `[DONE]` handling.
+- **Inline moderation:** keyword moderation plus smart moderation with cache/history reuse, local model decisions, LLM fallback, retry logic, and concurrency limiting.
+- **Local runtimes:** `hashlinear`, `bow`, and `fasttext` moderation paths selected per profile.
+- **Training loop:** profile-aware sample RPC, training subprocess mode, cooldown decisions, and scheduler support.
+- **Debug surface:** health, OpenAPI stub, URL config parsing, profile inspection, model metrics, and storage inspection routes.
+
+## Fit
+
+TransformVetter is a good fit if you:
+
+- route multiple AI client formats through one service;
+- need moderation before an upstream LLM API receives the request;
+- care about stream-compatible protocol conversion, not only non-stream JSON;
+- want profile-specific moderation behavior and locally trained review models;
+- prefer explicit proxy configuration over hidden global routing rules.
+
+It is not designed to be a full API management platform with billing, tenant dashboards, or hosted policy authoring UI.
+
 ## Install
+
+### Fastest Path
+
+Use the published container image when you only want to try the proxy:
+
+```bash
+docker run --rm -p 8000:8000 --env-file .env ghcr.io/cassiopeiacode/transformvetter:latest
+curl -s http://127.0.0.1:8000/healthz
+```
+
+Use the release binary when you want a single executable:
+
+```bash
+gh release download --repo CassiopeiaCode/TransformVetter v1.0.0 --pattern 'TransformVetter-linux-amd64.tar.gz'
+tar -xzf TransformVetter-linux-amd64.tar.gz
+chmod +x TransformVetter-linux-amd64
+./TransformVetter-linux-amd64
+```
 
 ### Container Image from GHCR
 
@@ -611,6 +660,23 @@ taskset -c 0 env CARGO_BUILD_JOBS=1 cargo test --test http_proxy_stream_tests --
 - Request bodies with supported compression encodings are decoded before JSON parsing in the proxy pipeline.
 - Several debugging and training paths assume a stable repository root because profile paths are resolved relative to the process working directory.
 - The checked-in `.env` and profile files may contain deployment-specific values. Review them before using this repository in a different environment.
+
+## Contributing
+
+Focused issues and pull requests are welcome. The most useful contributions are usually:
+
+- protocol fixtures for real OpenAI, Claude, Gemini, or OpenAI Responses edge cases;
+- focused tests for request conversion, SSE conversion, moderation extraction, and error envelopes;
+- profile examples that make moderation configuration easier to audit;
+- small fixes that preserve existing proxy behavior and keep release artifacts reproducible.
+
+Before opening a broad refactor, start with an issue that describes the behavior change and the compatibility impact.
+
+## Security
+
+Do not publish real upstream API keys, moderation reviewer keys, private profile data, or RocksDB history files in issues. If a report involves sensitive examples, reduce it to a minimal synthetic request body that still reproduces the behavior.
+
+For deployment, keep reviewer API keys in environment variables, prefer `!ENV_KEY` proxy configs over raw JSON URLs, and review profile files before sharing them.
 
 ## Acknowledgements
 
