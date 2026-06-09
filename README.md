@@ -309,7 +309,7 @@ The env form keeps long JSON configs out of client URLs. `ENV_KEY` must contain 
 Example `.env` entry:
 
 ```bash
-CLAUDE_TO_OPENAI='{"format_transform":{"enabled":true,"strict_parse":true,"from":"claude_chat","to":"openai_chat","delay_stream_header":true},"basic_moderation":{"enabled":true,"keywords_file":"configs/keywords.txt","error_code":"BASIC_MODERATION_BLOCKED"},"smart_moderation":{"enabled":true,"profile":"4claudecode"}}'
+CLAUDE_TO_OPENAI='{"format_transform":{"enabled":true,"strict_parse":true,"from":"claude_chat","to":"openai_chat","delay_stream_header":true},"basic_moderation":{"enabled":true,"keywords_file":"configs/keywords.txt","error_code":"BASIC_MODERATION_BLOCKED"},"smart_moderation":{"enabled":true,"profile":"default"}}'
 ```
 
 Example request shape:
@@ -374,7 +374,7 @@ The basic layer loads keywords from a file, matches case-insensitively, and refr
 {
   "smart_moderation": {
     "enabled": true,
-    "profile": "4claudecode"
+    "profile": "default"
   }
 }
 ```
@@ -389,10 +389,10 @@ Profiles live under:
 configs/mod_profiles/<profile>/
 ```
 
-Current checked-in profiles include:
+Example profile names:
 
-- `4claudecode`
-- `4claudeclewdr`
+- `default`
+- `strict-review`
 
 Each profile can contain:
 
@@ -427,7 +427,7 @@ The proxy request config decides whether moderation runs for a specific upstream
   },
   "smart_moderation": {
     "enabled": true,
-    "profile": "4claudecode"
+    "profile": "default"
   }
 }
 ```
@@ -435,7 +435,7 @@ The proxy request config decides whether moderation runs for a specific upstream
 The profile file decides how smart moderation behaves:
 
 ```text
-configs/mod_profiles/4claudecode/profile.json
+configs/mod_profiles/default/profile.json
 ```
 
 A compact profile can look like this:
@@ -507,8 +507,8 @@ Training blocks are model-specific. Use `hashlinear_training` when `local_model_
 Useful checks while editing a profile:
 
 ```bash
-curl -s http://127.0.0.1:8000/debug/profile/4claudecode
-curl -s 'http://127.0.0.1:8000/debug/profile/4claudecode/metrics?sample_size=1000&threshold=0.5'
+curl -s http://127.0.0.1:8000/debug/profile/default
+curl -s 'http://127.0.0.1:8000/debug/profile/default/metrics?sample_size=1000&threshold=0.5'
 ```
 
 ## Runtime Features
@@ -570,7 +570,7 @@ Server mode starts the scheduler loop when `TRAINING_SCHEDULER_ENABLED=true`. Th
 Manual training entry:
 
 ```bash
-cargo run --features storage-debug -- train-profile 4claudecode
+cargo run --features storage-debug -- train-profile default
 ```
 
 The training code can produce or refresh runtime artifacts for the configured local model type. It uses the sample RPC layer for balanced/latest/random sample loading and writes profile status for later inspection.
