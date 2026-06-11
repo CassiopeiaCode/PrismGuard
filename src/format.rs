@@ -373,7 +373,9 @@ fn can_parse_openai_chat(path: &str, body: &Map<String, Value>) -> bool {
             }
         }
     }
-    if body.get("thinking").and_then(Value::as_object).is_some() {
+    if body.get("thinking").and_then(Value::as_object).is_some()
+        && !has_openai_chat_specific_signal(path, body)
+    {
         return false;
     }
     if let Some(Value::Array(tools)) = body.get("tools") {
@@ -390,6 +392,38 @@ fn can_parse_openai_chat(path: &str, body: &Map<String, Value>) -> bool {
         .and_then(Value::as_object)
         .map(|msg| msg.contains_key("role"))
         .unwrap_or(false)
+}
+
+fn has_openai_chat_specific_signal(path: &str, body: &Map<String, Value>) -> bool {
+    if path.contains("/chat/completions") {
+        return true;
+    }
+    if body.contains_key("max_completion_tokens")
+        || body.contains_key("reasoning_effort")
+        || body.contains_key("stream_options")
+    {
+        return true;
+    }
+    if body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type").and_then(Value::as_str) == Some("function")
+                    || tool.get("function").and_then(Value::as_object).is_some()
+            })
+        })
+    {
+        return true;
+    }
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .filter_map(Value::as_object)
+                .any(|msg| msg.get("tool_calls").and_then(Value::as_array).is_some())
+        })
 }
 
 fn can_parse_claude_chat(

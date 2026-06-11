@@ -120,6 +120,76 @@ fn pass_through_preserves_detected_request_shape_and_moderation_text() {
 }
 
 #[test]
+fn openai_chat_with_thinking_and_openai_tool_shape_is_detected() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "pass_through"
+        }
+    });
+    let original = json!({
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "system", "content": "policy text"},
+            {"role": "user", "content": "hello"}
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup information.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }],
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+        "stream_options": {"include_usage": true}
+    });
+
+    let plan = process_request(&config, "/proxy", &[], original.clone())
+        .expect("OpenAI-compatible chat request should pass strict detection");
+
+    assert_eq!(plan.source_format, Some(RequestFormat::OpenAiChat));
+    assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+    assert_eq!(plan.body, original);
+    assert_eq!(plan.moderation_text.as_deref(), Some("policy text\nhello"));
+}
+
+#[test]
+fn claude_chat_with_thinking_without_openai_signal_stays_disallowed_for_openai_only() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_chat",
+            "to": "pass_through"
+        }
+    });
+
+    let error = process_request(
+        &config,
+        "/proxy",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "enabled"}
+        }),
+    )
+    .expect_err("Claude-style thinking should not satisfy openai_chat-only detection");
+
+    match error {
+        RequestProcessError::StrictParse(message) => {
+            assert!(message.contains("Format mismatch"), "{message}");
+            assert!(message.contains("'claude_chat'"), "{message}");
+        }
+        other => panic!("expected strict parse error, got {other:?}"),
+    }
+}
+
+#[test]
 #[ignore = "temporarily disabled pending format detection fix"]
 fn pass_through_openai_chat_collects_object_and_system_text_for_moderation() {
     let config = json!({
