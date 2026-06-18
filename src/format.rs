@@ -1303,7 +1303,7 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
 }
 
 fn emit_openai_chat(req: &InternalRequest) -> Value {
-    let mut body = Map::new();
+    let mut body = normalize_extra_for_openai_chat(&req.extra);
     body.insert("model".to_string(), Value::String(req.model.clone()));
     body.insert("stream".to_string(), Value::Bool(req.stream));
     let mut messages = Vec::new();
@@ -1346,7 +1346,6 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
     if let Some(reasoning) = normalize_claude_thinking_for_openai(req.thinking.as_ref()) {
         body.insert("reasoning".to_string(), reasoning);
     }
-    body.extend(req.extra.clone());
     Value::Object(body)
 }
 
@@ -2012,12 +2011,33 @@ fn normalize_claude_thinking_for_openai(thinking: Option<&Value>) -> Option<Valu
     }
 }
 
+fn normalize_extra_for_openai_chat(extra: &Map<String, Value>) -> Map<String, Value> {
+    if extra.is_empty() {
+        return Map::new();
+    }
+
+    let mut out = extra.clone();
+    if !out.contains_key("stop") {
+        if let Some(stop_sequences) = out.get("stop_sequences").cloned() {
+            out.insert("stop".to_string(), stop_sequences);
+        }
+    }
+
+    remove_non_openai_extra(&mut out);
+    out.remove("stop_sequences");
+    out.remove("top_k");
+    out.remove("mcp_servers");
+    out.remove("container");
+    out
+}
+
 fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<String, Value> {
     if extra.is_empty() {
         return Map::new();
     }
 
     let mut out = extra.clone();
+    remove_non_openai_extra(&mut out);
 
     if !out.contains_key("max_output_tokens") {
         let maybe_max = out
@@ -2063,6 +2083,12 @@ fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<Strin
     }
 
     out
+}
+
+fn remove_non_openai_extra(out: &mut Map<String, Value>) {
+    for key in ["anthropic_version", "context_management", "output_config"] {
+        out.remove(key);
+    }
 }
 
 fn normalize_responses_text_format(response_format: &Value) -> Option<Value> {
@@ -2303,6 +2329,40 @@ mod tests {
             plan.body.get("reasoning"),
             Some(&json!({"max_tokens": 2048}))
         );
+    }
+
+    #[test]
+    fn strips_claude_only_extra_fields_for_openai_chat_requests() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        });
+        let body = json!({
+            "model": "gpt-4.1-mini",
+            "stream": false,
+            "anthropic_version": "2023-06-01",
+            "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]},
+            "output_config": {"type": "json"},
+            "stop_sequences": ["END"],
+            "top_k": 20,
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let plan =
+            process_request(&config, "/v1/messages", &[], body).expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+        assert_eq!(plan.path, "/v1/chat/completions");
+        assert_eq!(plan.body.get("stream"), Some(&json!(false)));
+        assert_eq!(plan.body.get("context_management"), None);
+        assert_eq!(plan.body.get("output_config"), None);
+        assert_eq!(plan.body.get("anthropic_version"), None);
+        assert_eq!(plan.body.get("stop_sequences"), None);
+        assert_eq!(plan.body.get("top_k"), None);
+        assert_eq!(plan.body.get("stop"), Some(&json!(["END"])));
     }
 
     #[test]
