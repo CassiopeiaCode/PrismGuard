@@ -129,6 +129,10 @@ pub fn process_request(
         .get("disable_tools")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let strip_tool_choice = transform_cfg
+        .get("strip_tool_choice")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let from_cfg = transform_cfg.get("from");
     let candidates = configured_candidates(from_cfg);
     let detectable = detect_formats_from_candidates(&candidates, path, headers, &plan.body);
@@ -183,6 +187,8 @@ pub fn process_request(
     let (source, internal) = parsed.expect("checked is_some");
     let internal = if disable_tools {
         strip_tools(internal)
+    } else if strip_tool_choice {
+        strip_tool_choice_from_request(internal)
     } else {
         internal
     };
@@ -205,7 +211,7 @@ pub fn process_request(
     plan.passthrough = passthrough;
     plan.moderation_text = Some(moderation_text_from_internal_request(&internal));
 
-    if !passthrough && (target != source || disable_tools) {
+    if !passthrough && (target != source || disable_tools || strip_tool_choice) {
         plan.body = emit_request(target, &internal).map_err(|error| {
             RequestProcessError::Transform(format!("Format transform error: {error}"))
         })?;
@@ -1505,6 +1511,17 @@ fn strip_tools(req: InternalRequest) -> InternalRequest {
         model: req.model,
         stream: req.stream,
         tools: Vec::new(),
+        tool_choice: None,
+        extra: req.extra,
+    }
+}
+
+fn strip_tool_choice_from_request(req: InternalRequest) -> InternalRequest {
+    InternalRequest {
+        messages: req.messages,
+        model: req.model,
+        stream: req.stream,
+        tools: req.tools,
         tool_choice: None,
         extra: req.extra,
     }
