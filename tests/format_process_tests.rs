@@ -395,6 +395,49 @@ fn non_strict_mode_preserves_request_when_detection_fails() {
 }
 
 #[test]
+fn strip_tool_choice_removes_tool_choice_without_disabling_tools() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "strip_tool_choice": true,
+            "from": "openai_chat",
+            "to": "openai_chat"
+        }
+    });
+
+    let plan = process_request(
+        &config,
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "gpt-4.1",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        }
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }),
+    )
+    .expect("openai chat request should still parse");
+
+    assert_eq!(plan.source_format, Some(RequestFormat::OpenAiChat));
+    assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+    assert_eq!(plan.path, "/v1/chat/completions");
+    assert!(plan.body.get("tool_choice").is_none());
+    assert_eq!(plan.body["tools"][0]["function"]["name"], "lookup_weather");
+}
+
+#[test]
 fn disable_tools_strips_openai_responses_tool_fields_without_format_change() {
     let config = json!({
         "format_transform": {

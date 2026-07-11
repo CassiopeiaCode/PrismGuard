@@ -4317,6 +4317,59 @@ async fn openai_chat_request_keeps_string_tool_choice_auto_for_responses_upstrea
 }
 
 #[tokio::test]
+async fn openai_chat_request_can_strip_tool_choice_for_responses_upstream() {
+    let (upstream_base, seen) = spawn_upstream_echo_server().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "strip_tool_choice": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        })
+        .to_string(),
+    );
+    let upstream_full = format!("{upstream_base}/v1/chat/completions");
+    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(proxy_url)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        }
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen = seen.lock().expect("seen lock");
+    let request = seen.last().expect("upstream request");
+    assert!(request.json_body.get("tool_choice").is_none());
+    assert_eq!(request.json_body["tools"][0]["name"], "lookup_weather");
+}
+
+#[tokio::test]
 async fn openai_chat_request_keeps_string_tool_choice_none_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
