@@ -56,6 +56,7 @@ struct InternalRequest {
     stream: bool,
     tools: Vec<InternalTool>,
     tool_choice: Option<Value>,
+    thinking: Option<Value>,
     extra: Map<String, Value>,
 }
 
@@ -257,6 +258,7 @@ fn push_non_empty_text(text: &str, texts: &mut Vec<String>) {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn detect_format(
     from_cfg: Option<&Value>,
     path: &str,
@@ -365,6 +367,19 @@ fn can_parse_openai_chat(path: &str, body: &Map<String, Value>) -> bool {
     }
     if body.contains_key("system") || body.contains_key("anthropic_version") {
         return false;
+    }
+    if let Some(Value::Array(messages)) = body.get("messages") {
+        for msg in messages.iter().filter_map(Value::as_object) {
+            if let Some(Value::Array(content)) = msg.get("content") {
+                if content
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .any(|block| block.contains_key("cache_control"))
+                {
+                    return false;
+                }
+            }
+        }
     }
     if body.get("thinking").and_then(Value::as_object).is_some()
         && !has_openai_chat_specific_signal(path, body)
@@ -554,6 +569,7 @@ fn parse_openai_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         tools,
         tool_choice: body.get("tool_choice").cloned(),
+        thinking: None,
         extra: filter_keys(
             body,
             &["messages", "model", "stream", "tools", "tool_choice"],
@@ -614,10 +630,11 @@ fn parse_openai_chat_message(msg: &Map<String, Value>) -> Result<InternalMessage
                 .get("name")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-            output: msg
-                .get("content")
-                .cloned()
-                .unwrap_or(Value::String(String::new())),
+            output: normalize_openai_tool_result(
+                msg.get("content")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new())),
+            )?,
         });
     }
 
@@ -664,6 +681,41 @@ fn parse_openai_chat_message(msg: &Map<String, Value>) -> Result<InternalMessage
     })
 }
 
+fn normalize_openai_tool_result(output: Value) -> Result<Value> {
+    let Value::Array(items) = output else {
+        return Ok(output);
+    };
+    let mut normalized = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item
+            .as_object()
+            .ok_or_else(|| anyhow!("OpenAI tool content blocks must be objects"))?;
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") | Some("input_text") | Some("output_text") => normalized.push(json!({
+                "type":"input_text",
+                "text":item.get("text").and_then(Value::as_str).unwrap_or_default()
+            })),
+            Some("image_url") | Some("input_image") => {
+                let image_url = item.get("image_url");
+                let url = image_url
+                    .and_then(Value::as_str)
+                    .or_else(|| image_url.and_then(Value::as_object).and_then(|image| image.get("url")).and_then(Value::as_str))
+                    .or_else(|| item.get("url").and_then(Value::as_str))
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("OpenAI tool image is missing image_url"))?;
+                let detail = item
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .or_else(|| image_url.and_then(Value::as_object).and_then(|image| image.get("detail")).and_then(Value::as_str))
+                    .unwrap_or("auto");
+                normalized.push(json!({"type":"input_image","detail":detail,"image_url":url}));
+            }
+            other => return Err(anyhow!("unsupported OpenAI tool content type: {other:?}")),
+        }
+    }
+    Ok(Value::Array(normalized))
+}
+
 fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
     if body.get("prompt").and_then(Value::as_str).is_some() && !body.contains_key("messages") {
         return parse_claude_code(body);
@@ -700,7 +752,7 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
         match msg.get("content") {
             Some(Value::String(text)) => content.push(InternalContentBlock::Text(text.clone())),
             Some(Value::Object(part)) => {
-                parse_claude_parts(std::slice::from_ref(part), &mut content)
+                parse_claude_parts(std::slice::from_ref(part), &mut content)?
             }
             Some(Value::Array(parts)) => parse_claude_parts(
                 &parts
@@ -709,7 +761,7 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
                     .cloned()
                     .collect::<Vec<_>>(),
                 &mut content,
-            ),
+            )?,
             _ => {}
         }
         if content.is_empty() {
@@ -735,6 +787,7 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         tools: parse_claude_tools(body.get("tools")),
         tool_choice: body.get("tool_choice").cloned(),
+        thinking: body.get("thinking").cloned(),
         extra: filter_keys(
             body,
             &[
@@ -744,12 +797,13 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
                 "stream",
                 "tools",
                 "tool_choice",
+                "thinking",
             ],
         ),
     })
 }
 
-fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalContentBlock>) {
+fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalContentBlock>) -> Result<()> {
     for part in parts {
         match part.get("type").and_then(Value::as_str) {
             Some("text") => out.push(InternalContentBlock::Text(
@@ -764,6 +818,35 @@ fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalConten
                     .unwrap_or_default()
                     .to_string(),
             )),
+            Some("image") => {
+                let source = part
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow!("Claude image.source must be an object"))?;
+                let url = match source.get("type").and_then(Value::as_str) {
+                    Some("base64") => {
+                        let media_type = source
+                            .get("media_type")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| anyhow!("Claude base64 image is missing media_type"))?;
+                        let data = source
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| anyhow!("Claude base64 image is missing data"))?;
+                        format!("data:{media_type};base64,{data}")
+                    }
+                    Some("url") => source
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| anyhow!("Claude URL image is missing url"))?,
+                    other => return Err(anyhow!("unsupported Claude image source type: {other:?}")),
+                };
+                out.push(InternalContentBlock::ImageUrl { url, detail: None });
+            }
             Some("tool_use") => out.push(InternalContentBlock::ToolCall {
                 id: part
                     .get("id")
@@ -783,15 +866,7 @@ fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalConten
             }),
             Some("tool_result") => {
                 let output = match part.get("content") {
-                    Some(Value::Array(items)) => Value::String(
-                        items
-                            .iter()
-                            .filter_map(Value::as_object)
-                            .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-                            .filter_map(|item| item.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ),
+                    Some(Value::Array(items)) => normalize_claude_tool_result(items)?,
                     Some(value) => value.clone(),
                     None => Value::String(String::new()),
                 };
@@ -808,6 +883,47 @@ fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalConten
             _ => {}
         }
     }
+    Ok(())
+}
+
+fn normalize_claude_tool_result(items: &[Value]) -> Result<Value> {
+    let has_image = items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("image")
+    });
+    if !has_image {
+        return Ok(Value::String(
+            items
+                .iter()
+                .filter_map(Value::as_object)
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    let mut output = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item
+            .as_object()
+            .ok_or_else(|| anyhow!("Claude tool_result content blocks must be objects"))?;
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => output.push(json!({
+                "type": "input_text",
+                "text": item.get("text").and_then(Value::as_str).unwrap_or_default()
+            })),
+            Some("image") => {
+                let mut parsed = Vec::new();
+                parse_claude_parts(std::slice::from_ref(item), &mut parsed)?;
+                let Some(InternalContentBlock::ImageUrl { url, .. }) = parsed.into_iter().next() else {
+                    return Err(anyhow!("invalid Claude tool_result image"));
+                };
+                output.push(json!({"type":"input_image","detail":"auto","image_url":url}));
+            }
+            _ => {}
+        }
+    }
+    Ok(Value::Array(output))
 }
 
 fn parse_claude_code(body: &Map<String, Value>) -> Result<InternalRequest> {
@@ -839,9 +955,16 @@ fn parse_claude_code(body: &Map<String, Value>) -> Result<InternalRequest> {
         stream: false,
         tools: Vec::new(),
         tool_choice: options.get("tool_choice").cloned(),
+        thinking: options.get("thinking").cloned(),
         extra: filter_keys(
             &options,
-            &["model", "systemPrompt", "mcpServers", "tool_choice"],
+            &[
+                "model",
+                "systemPrompt",
+                "mcpServers",
+                "tool_choice",
+                "thinking",
+            ],
         ),
     })
 }
@@ -927,6 +1050,7 @@ fn parse_openai_responses(body: &Map<String, Value>) -> Result<InternalRequest> 
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         tools: parse_responses_tools(body.get("tools")),
         tool_choice: body.get("tool_choice").cloned(),
+        thinking: None,
         extra,
     })
 }
@@ -973,10 +1097,10 @@ fn parse_responses_input_item(item: &Value) -> Result<Option<InternalMessage>> {
                     .get("name")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
-                output: Value::String(responses_output_text(
+                output: normalize_responses_tool_output(
                     item.get("output"),
                     item.get("text").and_then(Value::as_str),
-                )),
+                ),
             }]
         }
         _ => responses_content_blocks(None, None)
@@ -1039,6 +1163,50 @@ fn responses_content_blocks(
     blocks
 }
 
+fn normalize_responses_tool_output(output: Option<&Value>, default_text: Option<&str>) -> Value {
+    if !responses_output_has_image(output) {
+        return Value::String(responses_output_text(output, default_text));
+    }
+    match output {
+        Some(Value::Array(items)) => normalize_responses_output_items(items),
+        Some(Value::Object(object)) => object
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| normalize_responses_output_items(items))
+            .unwrap_or_else(|| Value::Object(object.clone())),
+        Some(value) => value.clone(),
+        None => Value::String(default_text.unwrap_or_default().to_string()),
+    }
+}
+
+fn responses_output_has_image(output: Option<&Value>) -> bool {
+    match output {
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("input_image") | Some("image_url")
+            )
+        }),
+        Some(Value::Object(object)) => {
+            matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_image") | Some("image_url")
+            ) || object
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("input_image") | Some("image_url")
+                        )
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
 fn responses_output_text(output: Option<&Value>, default_text: Option<&str>) -> String {
     let blocks = responses_content_blocks(output, default_text);
     blocks
@@ -1049,6 +1217,33 @@ fn responses_output_text(output: Option<&Value>, default_text: Option<&str>) -> 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn normalize_responses_output_items(items: &[Value]) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("text") | Some("input_text") | Some("output_text") => json!({
+                    "type":"input_text",
+                    "text":item.get("text").cloned().unwrap_or(Value::String(String::new()))
+                }),
+                Some("input_image") | Some("image_url") => {
+                    let image_url = item
+                        .get("image_url")
+                        .cloned()
+                        .or_else(|| item.get("url").cloned())
+                        .unwrap_or(Value::String(String::new()));
+                    let detail = item
+                        .get("detail")
+                        .cloned()
+                        .unwrap_or(Value::String("auto".to_string()));
+                    json!({"type":"input_image","detail":detail,"image_url":image_url})
+                }
+                _ => item.clone(),
+            })
+            .collect(),
+    )
 }
 
 fn push_responses_content_block(
@@ -1127,44 +1322,7 @@ fn push_responses_content_block(
             });
         }
         Some("function_call_output") => {
-            let output = match part.get("output") {
-                Some(Value::String(text)) => Value::String(text.clone()),
-                Some(Value::Array(items)) => Value::String(
-                    items
-                        .iter()
-                        .filter_map(Value::as_object)
-                        .filter(|item| {
-                            matches!(
-                                item.get("type").and_then(Value::as_str),
-                                Some("input_text") | Some("output_text") | Some("text")
-                            )
-                        })
-                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                Some(Value::Object(obj)) => {
-                    if let Some(Value::Array(items)) = obj.get("items") {
-                        Value::String(
-                            items
-                                .iter()
-                                .filter_map(Value::as_object)
-                                .filter(|item| {
-                                    matches!(
-                                        item.get("type").and_then(Value::as_str),
-                                        Some("input_text") | Some("output_text") | Some("text")
-                                    )
-                                })
-                                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        )
-                    } else {
-                        Value::String(String::new())
-                    }
-                }
-                _ => Value::String(String::new()),
-            };
+            let output = normalize_responses_tool_output(part.get("output"), None);
             content.push(InternalContentBlock::ToolResult {
                 call_id: part
                     .get("call_id")
@@ -1279,12 +1437,13 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
         stream: path.contains("streamGenerateContent"),
         tools: parse_gemini_tools(body.get("tools")),
         tool_choice: body.get("toolConfig").cloned(),
+        thinking: None,
         extra,
     })
 }
 
 fn emit_openai_chat(req: &InternalRequest) -> Value {
-    let mut body = Map::new();
+    let mut body = normalize_extra_for_openai_chat(&req.extra);
     body.insert("model".to_string(), Value::String(req.model.clone()));
     body.insert("stream".to_string(), Value::Bool(req.stream));
     let mut messages = Vec::new();
@@ -1303,13 +1462,7 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": name,
-                    "content": match output {
-                        Value::Object(_) | Value::Array(_) => {
-                            Value::String(serde_json::to_string(output).unwrap_or_else(|_| String::new()))
-                        }
-                        Value::String(text) => Value::String(text.clone()),
-                        other => Value::String(other.to_string()),
-                    }
+                    "content": openai_tool_result_content(output)
                 }));
             }
         }
@@ -1324,7 +1477,9 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
     if let Some(tool_choice) = &req.tool_choice {
         body.insert("tool_choice".to_string(), tool_choice.clone());
     }
-    body.extend(req.extra.clone());
+    if let Some(reasoning) = normalize_claude_thinking_for_openai(req.thinking.as_ref()) {
+        body.insert("reasoning".to_string(), reasoning);
+    }
     Value::Object(body)
 }
 
@@ -1360,7 +1515,10 @@ fn emit_claude_chat(req: &InternalRequest) -> Value {
         );
     }
     if let Some(tool_choice) = &req.tool_choice {
-        body.insert("tool_choice".to_string(), tool_choice.clone());
+        body.insert(
+            "tool_choice".to_string(),
+            normalize_tool_choice_for_claude(tool_choice),
+        );
     }
     body.extend(req.extra.clone());
     Value::Object(body)
@@ -1407,12 +1565,14 @@ fn emit_openai_responses(req: &InternalRequest) -> Value {
             normalize_tool_choice_for_openai_responses(tool_choice),
         );
     }
+    if let Some(reasoning) = normalize_claude_thinking_for_openai(req.thinking.as_ref()) {
+        body.insert("reasoning".to_string(), reasoning);
+    }
     Value::Object(body)
 }
 
 fn emit_gemini_chat(req: &InternalRequest) -> Value {
     let mut body = Map::new();
-    body.insert("model".to_string(), Value::String(req.model.clone()));
     let contents = req
         .messages
         .iter()
@@ -1420,6 +1580,22 @@ fn emit_gemini_chat(req: &InternalRequest) -> Value {
         .filter_map(gemini_message)
         .collect::<Vec<_>>();
     body.insert("contents".to_string(), Value::Array(contents));
+    let system_text = req
+        .messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            InternalContentBlock::Text(text) if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !system_text.is_empty() {
+        body.insert(
+            "systemInstruction".to_string(),
+            json!({"parts": [{"text": system_text.join("\n") }]}),
+        );
+    }
     if !req.tools.is_empty() {
         body.insert(
             "tools".to_string(),
@@ -1512,6 +1688,7 @@ fn strip_tools(req: InternalRequest) -> InternalRequest {
         stream: req.stream,
         tools: Vec::new(),
         tool_choice: None,
+        thinking: req.thinking,
         extra: req.extra,
     }
 }
@@ -1523,6 +1700,7 @@ fn strip_tool_choice_from_request(req: InternalRequest) -> InternalRequest {
         stream: req.stream,
         tools: req.tools,
         tool_choice: None,
+        thinking: req.thinking,
         extra: req.extra,
     }
 }
@@ -1709,6 +1887,7 @@ fn claude_message(message: &InternalMessage) -> Value {
         .iter()
         .filter_map(|block| match block {
             InternalContentBlock::Text(text) => Some(json!({"type":"text","text": text})),
+            InternalContentBlock::ImageUrl { url, .. } => Some(claude_image_block(url)),
             InternalContentBlock::ToolCall {
                 id,
                 name,
@@ -1724,15 +1903,7 @@ fn claude_message(message: &InternalMessage) -> Value {
             } => Some(json!({
                 "type":"tool_result",
                 "tool_use_id": call_id,
-                "content": match output {
-                    Value::String(text) => Value::Array(vec![json!({"type":"text","text": text})]),
-                    Value::Object(_) => Value::Array(vec![json!({
-                        "type":"text",
-                        "text": serde_json::to_string(output).unwrap_or_else(|_| String::new())
-                    })]),
-                    Value::Array(items) => Value::Array(items.clone()),
-                    other => Value::Array(vec![json!({"type":"text","text": other.to_string()})]),
-                }
+                "content": claude_tool_result_content(output)
             })),
             _ => None,
         })
@@ -1741,6 +1912,70 @@ fn claude_message(message: &InternalMessage) -> Value {
         "role": if message.role == "assistant" { "assistant" } else { "user" },
         "content": parts
     })
+}
+
+fn split_image_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (metadata, data) = rest.split_once(',')?;
+    let media_type = metadata.strip_suffix(";base64")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type, data))
+}
+
+fn claude_image_block(url: &str) -> Value {
+    if let Some((media_type, data)) = split_image_data_url(url) {
+        json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":data}})
+    } else {
+        json!({"type":"image","source":{"type":"url","url":url}})
+    }
+}
+
+fn openai_tool_result_content(output: &Value) -> Value {
+    let Value::Array(items) = output else {
+        return match output {
+            Value::String(text) => Value::String(text.clone()),
+            other => Value::String(serde_json::to_string(other).unwrap_or_default()),
+        };
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("input_text") => json!({"type":"text","text":item.get("text").cloned().unwrap_or(Value::String(String::new()))}),
+                Some("input_image") => {
+                    let url = item.get("image_url").cloned().unwrap_or(Value::String(String::new()));
+                    let detail = item.get("detail").cloned().unwrap_or(Value::String("auto".to_string()));
+                    json!({"type":"image_url","image_url":{"url":url,"detail":detail}})
+                }
+                _ => item.clone(),
+            })
+            .collect(),
+    )
+}
+
+fn claude_tool_result_content(output: &Value) -> Value {
+    let Value::Array(items) = output else {
+        return match output {
+            Value::String(text) => Value::Array(vec![json!({"type":"text","text":text})]),
+            other => Value::Array(vec![json!({"type":"text","text":serde_json::to_string(other).unwrap_or_default()})]),
+        };
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("input_text") => json!({"type":"text","text":item.get("text").cloned().unwrap_or(Value::String(String::new()))}),
+                Some("input_image") => item
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(claude_image_block)
+                    .unwrap_or_else(|| json!({"type":"text","text":""})),
+                _ => json!({"type":"text","text":serde_json::to_string(item).unwrap_or_default()}),
+            })
+            .collect(),
+    )
 }
 
 fn responses_message(message: &InternalMessage) -> Value {
@@ -1903,11 +2138,42 @@ fn normalize_claude_input_schema(schema: &Value) -> Value {
     if !matches!(schema.get("properties"), Some(Value::Object(_))) {
         schema.insert("properties".to_string(), Value::Object(Map::new()));
     }
-    if matches!(schema.get("required"), Some(value) if !value.is_array()) {
+    if !matches!(schema.get("required"), Some(Value::Array(_)) | None) {
         schema.remove("required");
     }
 
     Value::Object(schema)
+}
+
+fn normalize_tool_choice_for_claude(tool_choice: &Value) -> Value {
+    match tool_choice {
+        Value::String(mode) => match mode.as_str() {
+            "auto" => json!({"type": "auto"}),
+            "required" => json!({"type": "any"}),
+            "none" => json!({"type": "auto"}),
+            other => json!({"type": other}),
+        },
+        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                let name = choice.get("name").and_then(Value::as_str).or_else(|| {
+                    choice
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|function| function.get("name").and_then(Value::as_str))
+                });
+                name.map(|name| json!({"type": "tool", "name": name}))
+                    .unwrap_or_else(|| json!({"type": "any"}))
+            }
+            Some("tool") if choice.get("name").and_then(Value::as_str).is_some() => {
+                json!({"type": "tool", "name": choice.get("name").and_then(Value::as_str).unwrap_or_default()})
+            }
+            Some("auto" | "any") => {
+                json!({"type": choice.get("type").and_then(Value::as_str).unwrap_or_default()})
+            }
+            _ => tool_choice.clone(),
+        },
+        _ => tool_choice.clone(),
+    }
 }
 
 fn normalize_tool_choice_for_openai_responses(tool_choice: &Value) -> Value {
@@ -1937,12 +2203,44 @@ fn normalize_tool_choice_for_openai_responses(tool_choice: &Value) -> Value {
     }
 }
 
+fn normalize_claude_thinking_for_openai(thinking: Option<&Value>) -> Option<Value> {
+    let thinking = thinking?.as_object()?;
+    match thinking.get("type").and_then(Value::as_str) {
+        Some("enabled") => {
+            let budget_tokens = thinking.get("budget_tokens").and_then(Value::as_i64)?;
+            Some(json!({"max_tokens": budget_tokens}))
+        }
+        _ => None,
+    }
+}
+
+fn normalize_extra_for_openai_chat(extra: &Map<String, Value>) -> Map<String, Value> {
+    if extra.is_empty() {
+        return Map::new();
+    }
+
+    let mut out = extra.clone();
+    if !out.contains_key("stop") {
+        if let Some(stop_sequences) = out.get("stop_sequences").cloned() {
+            out.insert("stop".to_string(), stop_sequences);
+        }
+    }
+
+    remove_non_openai_extra(&mut out);
+    out.remove("stop_sequences");
+    out.remove("top_k");
+    out.remove("mcp_servers");
+    out.remove("container");
+    out
+}
+
 fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<String, Value> {
     if extra.is_empty() {
         return Map::new();
     }
 
     let mut out = extra.clone();
+    remove_non_openai_extra(&mut out);
 
     if !out.contains_key("max_output_tokens") {
         let maybe_max = out
@@ -1990,6 +2288,12 @@ fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<Strin
     out
 }
 
+fn remove_non_openai_extra(out: &mut Map<String, Value>) {
+    for key in ["anthropic_version", "context_management", "output_config"] {
+        out.remove(key);
+    }
+}
+
 fn normalize_responses_text_format(response_format: &Value) -> Option<Value> {
     let response_format = response_format.as_object()?;
     let format = match response_format.get("type").and_then(Value::as_str) {
@@ -2030,4 +2334,266 @@ fn normalize_responses_text_format(response_format: &Value) -> Option<Value> {
     };
 
     Some(json!({"format": format}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transforms_openai_chat_response_format_into_responses_text_format() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "openai_chat",
+                "to": "openai_responses"
+            }
+        });
+        let body = json!({
+            "model": "gpt-4.1",
+            "messages": [{"role": "user", "content": "Return JSON"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string"}
+                        }
+                    },
+                    "strict": true
+                }
+            },
+            "max_tokens": 64
+        });
+
+        let plan = process_request(&config, "/v1/chat/completions", &[], body)
+            .expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiResponses));
+        assert_eq!(plan.path, "/v1/responses");
+        assert_eq!(plan.body.get("response_format"), None);
+        assert_eq!(plan.body.get("max_tokens"), None);
+        assert_eq!(plan.body.get("max_output_tokens"), Some(&json!(64)));
+        assert_eq!(
+            plan.body.get("text"),
+            Some(&json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string"}
+                        }
+                    },
+                    "strict": true
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn transforms_system_messages_into_gemini_system_instruction() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "openai_chat",
+                "to": "gemini_chat"
+            }
+        });
+        let body = json!({
+            "model": "gemini-2.5-pro",
+            "messages": [
+                {"role": "system", "content": "Be terse"},
+                {"role": "user", "content": "Hello"}
+            ]
+        });
+
+        let plan = process_request(&config, "/v1/chat/completions", &[], body)
+            .expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::GeminiChat));
+        assert_eq!(
+            plan.body.get("systemInstruction"),
+            Some(&json!({"parts": [{"text": "Be terse"}]}))
+        );
+        assert_eq!(
+            plan.body.get("contents"),
+            Some(&json!([
+                {"role": "user", "parts": [{"text": "Hello"}]}
+            ]))
+        );
+    }
+
+    #[test]
+    fn normalizes_openai_tool_choice_for_claude_requests() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "openai_chat",
+                "to": "claude_chat"
+            }
+        });
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "lookup_weather"}
+            },
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {"properties": {"city": {"type": "string"}}}
+                }
+            }]
+        });
+
+        let plan = process_request(&config, "/v1/chat/completions", &[], body)
+            .expect("request should transform");
+
+        assert_eq!(
+            plan.body.get("tool_choice"),
+            Some(&json!({"type": "tool", "name": "lookup_weather"}))
+        );
+        assert_eq!(
+            plan.body.pointer("/tools/0/input_schema/type"),
+            Some(&json!("object"))
+        );
+        assert_eq!(
+            plan.body
+                .pointer("/tools/0/input_schema/properties/city/type"),
+            Some(&json!("string"))
+        );
+    }
+
+    #[test]
+    fn strict_parse_reports_format_mismatch_when_request_matches_excluded_format() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "openai_chat",
+                "to": "claude_chat",
+                "strict_parse": true
+            }
+        });
+        let body = json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": "Hello"}]
+            }]
+        });
+
+        let err = process_request(
+            &config,
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            &[],
+            body,
+        )
+        .expect_err("strict parse should reject mismatched format");
+
+        match err {
+            RequestProcessError::StrictParse(message) => {
+                assert!(message.contains("Format mismatch"), "{message}");
+                assert!(message.contains("gemini_chat"), "{message}");
+                assert!(message.contains("openai_chat"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transforms_claude_thinking_into_openai_chat_reasoning() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        });
+        let body = json!({
+            "model": "gpt-4.1-mini",
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 2048
+            },
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let plan =
+            process_request(&config, "/v1/messages", &[], body).expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+        assert_eq!(plan.body.get("thinking"), None);
+        assert_eq!(
+            plan.body.get("reasoning"),
+            Some(&json!({"max_tokens": 2048}))
+        );
+    }
+
+    #[test]
+    fn strips_claude_only_extra_fields_for_openai_chat_requests() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        });
+        let body = json!({
+            "model": "gpt-4.1-mini",
+            "stream": false,
+            "anthropic_version": "2023-06-01",
+            "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]},
+            "output_config": {"type": "json"},
+            "stop_sequences": ["END"],
+            "top_k": 20,
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let plan =
+            process_request(&config, "/v1/messages", &[], body).expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+        assert_eq!(plan.path, "/v1/chat/completions");
+        assert_eq!(plan.body.get("stream"), Some(&json!(false)));
+        assert_eq!(plan.body.get("context_management"), None);
+        assert_eq!(plan.body.get("output_config"), None);
+        assert_eq!(plan.body.get("anthropic_version"), None);
+        assert_eq!(plan.body.get("stop_sequences"), None);
+        assert_eq!(plan.body.get("top_k"), None);
+        assert_eq!(plan.body.get("stop"), Some(&json!(["END"])));
+    }
+
+    #[test]
+    fn transforms_claude_thinking_into_openai_responses_reasoning() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_responses"
+            }
+        });
+        let body = json!({
+            "model": "gpt-4.1-mini",
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 1024
+            },
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let plan =
+            process_request(&config, "/v1/messages", &[], body).expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiResponses));
+        assert_eq!(plan.body.get("thinking"), None);
+        assert_eq!(
+            plan.body.get("reasoning"),
+            Some(&json!({"max_tokens": 1024}))
+        );
+    }
 }
