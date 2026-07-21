@@ -208,6 +208,8 @@ Request flow:
 
 The transformation layer handles normal messages, system/instruction fields, multimodal content blocks, tool declarations, tool calls, tool results, stream flags, and path rewrites for target APIs. The response layer includes both JSON conversion and SSE conversion paths, with the broadest coverage in the HTTP proxy and stream tests.
 
+Image content is preserved across OpenAI Chat Completions, OpenAI Responses, and Claude Messages request transforms. Claude `base64` image sources are represented as `data:` URLs at the OpenAI boundary, URL sources remain URLs, and multimodal tool results remain structured arrays (for example, Claude Code screenshot/read results become Responses `function_call_output.output` content blocks). The proxy only transforms protocol JSON; it does not download, decode, resize, or re-encode image data.
+
 ## Quick Start
 
 ### Requirements

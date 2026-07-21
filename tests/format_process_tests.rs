@@ -1548,3 +1548,94 @@ fn claude_tool_use_non_object_input_maps_to_openai_chat_empty_arguments_like_pyt
         }])
     );
 }
+
+#[test]
+fn claude_base64_image_maps_to_responses_data_url() {
+    let plan = process_request(
+        &transform_config(true, "openai_responses"),
+        "/v1/messages",
+        &[("anthropic-version".to_string(), "2023-06-01".to_string())],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"describe"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+            ]}]
+        }),
+    )
+    .expect("Claude image should transform");
+
+    assert_eq!(plan.body["input"][0]["content"], json!([
+        {"type":"input_text","text":"describe"},
+        {"type":"input_image","image_url":"data:image/png;base64,AA=="}
+    ]));
+}
+
+#[test]
+fn claude_code_tool_result_image_maps_to_responses_multimodal_output() {
+    let plan = process_request(
+        &transform_config(true, "openai_responses"),
+        "/v1/messages",
+        &[("anthropic-version".to_string(), "2023-06-01".to_string())],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role":"user","content":[{
+                "type":"tool_result","tool_use_id":"toolu_1","content":[
+                    {"type":"text","text":"Read screenshot.png"},
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+                ]
+            }]}]
+        }),
+    )
+    .expect("Claude tool image should transform");
+
+    assert_eq!(plan.body["input"][0]["type"], "function_call_output");
+    assert_eq!(plan.body["input"][0]["output"], json!([
+        {"type":"input_text","text":"Read screenshot.png"},
+        {"type":"input_image","detail":"auto","image_url":"data:image/png;base64,AA=="}
+    ]));
+}
+
+#[test]
+fn responses_multimodal_tool_output_maps_to_claude_content_blocks() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/responses",
+        &[],
+        json!({
+            "model":"gpt-4.1-mini",
+            "input":[{"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"Read screenshot.png"},
+                {"type":"input_image","detail":"auto","image_url":"data:image/png;base64,AA=="}
+            ]}]
+        }),
+    )
+    .expect("Responses tool image should transform");
+
+    assert_eq!(plan.body["messages"][0]["content"][0]["content"], json!([
+        {"type":"text","text":"Read screenshot.png"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+    ]));
+}
+
+#[test]
+fn openai_chat_tool_image_maps_to_responses_multimodal_output() {
+    let plan = process_request(
+        &transform_config(true, "openai_responses"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model":"gpt-4.1-mini",
+            "messages":[{"role":"tool","tool_call_id":"call_1","content":[
+                {"type":"text","text":"Read screenshot.png"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","detail":"high"}}
+            ]}]
+        }),
+    )
+    .expect("OpenAI tool image should transform");
+
+    assert_eq!(plan.body["input"][0]["output"], json!([
+        {"type":"input_text","text":"Read screenshot.png"},
+        {"type":"input_image","detail":"high","image_url":"data:image/png;base64,AA=="}
+    ]));
+}

@@ -628,10 +628,11 @@ fn parse_openai_chat_message(msg: &Map<String, Value>) -> Result<InternalMessage
                 .get("name")
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
-            output: msg
-                .get("content")
-                .cloned()
-                .unwrap_or(Value::String(String::new())),
+            output: normalize_openai_tool_result(
+                msg.get("content")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new())),
+            )?,
         });
     }
 
@@ -678,6 +679,41 @@ fn parse_openai_chat_message(msg: &Map<String, Value>) -> Result<InternalMessage
     })
 }
 
+fn normalize_openai_tool_result(output: Value) -> Result<Value> {
+    let Value::Array(items) = output else {
+        return Ok(output);
+    };
+    let mut normalized = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item
+            .as_object()
+            .ok_or_else(|| anyhow!("OpenAI tool content blocks must be objects"))?;
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") | Some("input_text") | Some("output_text") => normalized.push(json!({
+                "type":"input_text",
+                "text":item.get("text").and_then(Value::as_str).unwrap_or_default()
+            })),
+            Some("image_url") | Some("input_image") => {
+                let image_url = item.get("image_url");
+                let url = image_url
+                    .and_then(Value::as_str)
+                    .or_else(|| image_url.and_then(Value::as_object).and_then(|image| image.get("url")).and_then(Value::as_str))
+                    .or_else(|| item.get("url").and_then(Value::as_str))
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("OpenAI tool image is missing image_url"))?;
+                let detail = item
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .or_else(|| image_url.and_then(Value::as_object).and_then(|image| image.get("detail")).and_then(Value::as_str))
+                    .unwrap_or("auto");
+                normalized.push(json!({"type":"input_image","detail":detail,"image_url":url}));
+            }
+            other => return Err(anyhow!("unsupported OpenAI tool content type: {other:?}")),
+        }
+    }
+    Ok(Value::Array(normalized))
+}
+
 fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
     if body.get("prompt").and_then(Value::as_str).is_some() && !body.contains_key("messages") {
         return parse_claude_code(body);
@@ -714,7 +750,7 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
         match msg.get("content") {
             Some(Value::String(text)) => content.push(InternalContentBlock::Text(text.clone())),
             Some(Value::Object(part)) => {
-                parse_claude_parts(std::slice::from_ref(part), &mut content)
+                parse_claude_parts(std::slice::from_ref(part), &mut content)?
             }
             Some(Value::Array(parts)) => parse_claude_parts(
                 &parts
@@ -723,7 +759,7 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
                     .cloned()
                     .collect::<Vec<_>>(),
                 &mut content,
-            ),
+            )?,
             _ => {}
         }
         if content.is_empty() {
@@ -765,7 +801,7 @@ fn parse_claude_chat(body: &Map<String, Value>) -> Result<InternalRequest> {
     })
 }
 
-fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalContentBlock>) {
+fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalContentBlock>) -> Result<()> {
     for part in parts {
         match part.get("type").and_then(Value::as_str) {
             Some("text") => out.push(InternalContentBlock::Text(
@@ -780,6 +816,35 @@ fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalConten
                     .unwrap_or_default()
                     .to_string(),
             )),
+            Some("image") => {
+                let source = part
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow!("Claude image.source must be an object"))?;
+                let url = match source.get("type").and_then(Value::as_str) {
+                    Some("base64") => {
+                        let media_type = source
+                            .get("media_type")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| anyhow!("Claude base64 image is missing media_type"))?;
+                        let data = source
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| anyhow!("Claude base64 image is missing data"))?;
+                        format!("data:{media_type};base64,{data}")
+                    }
+                    Some("url") => source
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| anyhow!("Claude URL image is missing url"))?,
+                    other => return Err(anyhow!("unsupported Claude image source type: {other:?}")),
+                };
+                out.push(InternalContentBlock::ImageUrl { url, detail: None });
+            }
             Some("tool_use") => out.push(InternalContentBlock::ToolCall {
                 id: part
                     .get("id")
@@ -799,15 +864,7 @@ fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalConten
             }),
             Some("tool_result") => {
                 let output = match part.get("content") {
-                    Some(Value::Array(items)) => Value::String(
-                        items
-                            .iter()
-                            .filter_map(Value::as_object)
-                            .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-                            .filter_map(|item| item.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ),
+                    Some(Value::Array(items)) => normalize_claude_tool_result(items)?,
                     Some(value) => value.clone(),
                     None => Value::String(String::new()),
                 };
@@ -824,6 +881,47 @@ fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalConten
             _ => {}
         }
     }
+    Ok(())
+}
+
+fn normalize_claude_tool_result(items: &[Value]) -> Result<Value> {
+    let has_image = items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("image")
+    });
+    if !has_image {
+        return Ok(Value::String(
+            items
+                .iter()
+                .filter_map(Value::as_object)
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    let mut output = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item
+            .as_object()
+            .ok_or_else(|| anyhow!("Claude tool_result content blocks must be objects"))?;
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => output.push(json!({
+                "type": "input_text",
+                "text": item.get("text").and_then(Value::as_str).unwrap_or_default()
+            })),
+            Some("image") => {
+                let mut parsed = Vec::new();
+                parse_claude_parts(std::slice::from_ref(item), &mut parsed)?;
+                let Some(InternalContentBlock::ImageUrl { url, .. }) = parsed.into_iter().next() else {
+                    return Err(anyhow!("invalid Claude tool_result image"));
+                };
+                output.push(json!({"type":"input_image","detail":"auto","image_url":url}));
+            }
+            _ => {}
+        }
+    }
+    Ok(Value::Array(output))
 }
 
 fn parse_claude_code(body: &Map<String, Value>) -> Result<InternalRequest> {
@@ -997,10 +1095,10 @@ fn parse_responses_input_item(item: &Value) -> Result<Option<InternalMessage>> {
                     .get("name")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
-                output: Value::String(responses_output_text(
+                output: normalize_responses_tool_output(
                     item.get("output"),
                     item.get("text").and_then(Value::as_str),
-                )),
+                ),
             }]
         }
         _ => responses_content_blocks(None, None)
@@ -1063,6 +1161,50 @@ fn responses_content_blocks(
     blocks
 }
 
+fn normalize_responses_tool_output(output: Option<&Value>, default_text: Option<&str>) -> Value {
+    if !responses_output_has_image(output) {
+        return Value::String(responses_output_text(output, default_text));
+    }
+    match output {
+        Some(Value::Array(items)) => normalize_responses_output_items(items),
+        Some(Value::Object(object)) => object
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| normalize_responses_output_items(items))
+            .unwrap_or_else(|| Value::Object(object.clone())),
+        Some(value) => value.clone(),
+        None => Value::String(default_text.unwrap_or_default().to_string()),
+    }
+}
+
+fn responses_output_has_image(output: Option<&Value>) -> bool {
+    match output {
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("input_image") | Some("image_url")
+            )
+        }),
+        Some(Value::Object(object)) => {
+            matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("input_image") | Some("image_url")
+            ) || object
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item.get("type").and_then(Value::as_str),
+                            Some("input_image") | Some("image_url")
+                        )
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
 fn responses_output_text(output: Option<&Value>, default_text: Option<&str>) -> String {
     let blocks = responses_content_blocks(output, default_text);
     blocks
@@ -1073,6 +1215,33 @@ fn responses_output_text(output: Option<&Value>, default_text: Option<&str>) -> 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn normalize_responses_output_items(items: &[Value]) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("text") | Some("input_text") | Some("output_text") => json!({
+                    "type":"input_text",
+                    "text":item.get("text").cloned().unwrap_or(Value::String(String::new()))
+                }),
+                Some("input_image") | Some("image_url") => {
+                    let image_url = item
+                        .get("image_url")
+                        .cloned()
+                        .or_else(|| item.get("url").cloned())
+                        .unwrap_or(Value::String(String::new()));
+                    let detail = item
+                        .get("detail")
+                        .cloned()
+                        .unwrap_or(Value::String("auto".to_string()));
+                    json!({"type":"input_image","detail":detail,"image_url":image_url})
+                }
+                _ => item.clone(),
+            })
+            .collect(),
+    )
 }
 
 fn push_responses_content_block(
@@ -1151,44 +1320,7 @@ fn push_responses_content_block(
             });
         }
         Some("function_call_output") => {
-            let output = match part.get("output") {
-                Some(Value::String(text)) => Value::String(text.clone()),
-                Some(Value::Array(items)) => Value::String(
-                    items
-                        .iter()
-                        .filter_map(Value::as_object)
-                        .filter(|item| {
-                            matches!(
-                                item.get("type").and_then(Value::as_str),
-                                Some("input_text") | Some("output_text") | Some("text")
-                            )
-                        })
-                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                Some(Value::Object(obj)) => {
-                    if let Some(Value::Array(items)) = obj.get("items") {
-                        Value::String(
-                            items
-                                .iter()
-                                .filter_map(Value::as_object)
-                                .filter(|item| {
-                                    matches!(
-                                        item.get("type").and_then(Value::as_str),
-                                        Some("input_text") | Some("output_text") | Some("text")
-                                    )
-                                })
-                                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        )
-                    } else {
-                        Value::String(String::new())
-                    }
-                }
-                _ => Value::String(String::new()),
-            };
+            let output = normalize_responses_tool_output(part.get("output"), None);
             content.push(InternalContentBlock::ToolResult {
                 call_id: part
                     .get("call_id")
@@ -1328,13 +1460,7 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": name,
-                    "content": match output {
-                        Value::Object(_) | Value::Array(_) => {
-                            Value::String(serde_json::to_string(output).unwrap_or_else(|_| String::new()))
-                        }
-                        Value::String(text) => Value::String(text.clone()),
-                        other => Value::String(other.to_string()),
-                    }
+                    "content": openai_tool_result_content(output)
                 }));
             }
         }
@@ -1759,6 +1885,7 @@ fn claude_message(message: &InternalMessage) -> Value {
         .iter()
         .filter_map(|block| match block {
             InternalContentBlock::Text(text) => Some(json!({"type":"text","text": text})),
+            InternalContentBlock::ImageUrl { url, .. } => Some(claude_image_block(url)),
             InternalContentBlock::ToolCall {
                 id,
                 name,
@@ -1774,15 +1901,7 @@ fn claude_message(message: &InternalMessage) -> Value {
             } => Some(json!({
                 "type":"tool_result",
                 "tool_use_id": call_id,
-                "content": match output {
-                    Value::String(text) => Value::Array(vec![json!({"type":"text","text": text})]),
-                    Value::Object(_) => Value::Array(vec![json!({
-                        "type":"text",
-                        "text": serde_json::to_string(output).unwrap_or_else(|_| String::new())
-                    })]),
-                    Value::Array(items) => Value::Array(items.clone()),
-                    other => Value::Array(vec![json!({"type":"text","text": other.to_string()})]),
-                }
+                "content": claude_tool_result_content(output)
             })),
             _ => None,
         })
@@ -1791,6 +1910,70 @@ fn claude_message(message: &InternalMessage) -> Value {
         "role": if message.role == "assistant" { "assistant" } else { "user" },
         "content": parts
     })
+}
+
+fn split_image_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (metadata, data) = rest.split_once(',')?;
+    let media_type = metadata.strip_suffix(";base64")?;
+    if media_type.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((media_type, data))
+}
+
+fn claude_image_block(url: &str) -> Value {
+    if let Some((media_type, data)) = split_image_data_url(url) {
+        json!({"type":"image","source":{"type":"base64","media_type":media_type,"data":data}})
+    } else {
+        json!({"type":"image","source":{"type":"url","url":url}})
+    }
+}
+
+fn openai_tool_result_content(output: &Value) -> Value {
+    let Value::Array(items) = output else {
+        return match output {
+            Value::String(text) => Value::String(text.clone()),
+            other => Value::String(serde_json::to_string(other).unwrap_or_default()),
+        };
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("input_text") => json!({"type":"text","text":item.get("text").cloned().unwrap_or(Value::String(String::new()))}),
+                Some("input_image") => {
+                    let url = item.get("image_url").cloned().unwrap_or(Value::String(String::new()));
+                    let detail = item.get("detail").cloned().unwrap_or(Value::String("auto".to_string()));
+                    json!({"type":"image_url","image_url":{"url":url,"detail":detail}})
+                }
+                _ => item.clone(),
+            })
+            .collect(),
+    )
+}
+
+fn claude_tool_result_content(output: &Value) -> Value {
+    let Value::Array(items) = output else {
+        return match output {
+            Value::String(text) => Value::Array(vec![json!({"type":"text","text":text})]),
+            other => Value::Array(vec![json!({"type":"text","text":serde_json::to_string(other).unwrap_or_default()})]),
+        };
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("input_text") => json!({"type":"text","text":item.get("text").cloned().unwrap_or(Value::String(String::new()))}),
+                Some("input_image") => item
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(claude_image_block)
+                    .unwrap_or_else(|| json!({"type":"text","text":""})),
+                _ => json!({"type":"text","text":serde_json::to_string(item).unwrap_or_default()}),
+            })
+            .collect(),
+    )
 }
 
 fn responses_message(message: &InternalMessage) -> Value {
