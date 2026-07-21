@@ -374,7 +374,16 @@ fn can_parse_openai_chat(path: &str, body: &Map<String, Value>) -> bool {
                 if content
                     .iter()
                     .filter_map(Value::as_object)
-                    .any(|block| block.contains_key("cache_control"))
+                    .any(|block| {
+                        block.contains_key("cache_control")
+                            || matches!(
+                                block.get("type").and_then(Value::as_str),
+                                Some("image")
+                                    | Some("tool_use")
+                                    | Some("tool_result")
+                                    | Some("thinking")
+                            )
+                    })
                 {
                     return false;
                 }
