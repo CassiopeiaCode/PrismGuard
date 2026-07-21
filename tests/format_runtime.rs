@@ -345,13 +345,24 @@ fn can_parse(
 ) -> bool {
     match format {
         RequestFormat::GeminiChat => can_parse_gemini_chat(path, body),
-        RequestFormat::OpenAiChat => can_parse_openai_chat(path, body),
+        RequestFormat::OpenAiChat => can_parse_openai_chat(path, headers, body),
         RequestFormat::ClaudeChat => can_parse_claude_chat(path, headers, body),
         RequestFormat::OpenAiResponses => can_parse_openai_responses(path, body),
     }
 }
 
-fn can_parse_openai_chat(path: &str, body: &Map<String, Value>) -> bool {
+fn can_parse_openai_chat(
+    path: &str,
+    headers: &[(String, String)],
+    body: &Map<String, Value>,
+) -> bool {
+    if path.contains("/messages")
+        || headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("anthropic-version"))
+    {
+        return false;
+    }
     if let Some(Value::Array(contents)) = body.get("contents") {
         if contents
             .first()
@@ -374,16 +385,7 @@ fn can_parse_openai_chat(path: &str, body: &Map<String, Value>) -> bool {
                 if content
                     .iter()
                     .filter_map(Value::as_object)
-                    .any(|block| {
-                        block.contains_key("cache_control")
-                            || matches!(
-                                block.get("type").and_then(Value::as_str),
-                                Some("image")
-                                    | Some("tool_use")
-                                    | Some("tool_result")
-                                    | Some("thinking")
-                            )
-                    })
+                    .any(|block| block.contains_key("cache_control"))
                 {
                     return false;
                 }

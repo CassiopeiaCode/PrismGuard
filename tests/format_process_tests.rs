@@ -158,6 +158,29 @@ fn openai_chat_with_thinking_and_openai_tool_shape_is_detected() {
 }
 
 #[test]
+fn openai_chat_path_is_not_reclassified_by_thinking_content_blocks() {
+    let plan = process_request(
+        &transform_config(true, "pass_through"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "openai-compatible-model",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "internal reasoning"},
+                    {"type": "text", "text": "final answer"}
+                ]
+            }]
+        }),
+    )
+    .expect("OpenAI chat endpoint must retain its protocol classification");
+
+    assert_eq!(plan.source_format, Some(RequestFormat::OpenAiChat));
+    assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+}
+
+#[test]
 fn claude_chat_with_thinking_without_openai_signal_stays_disallowed_for_openai_only() {
     let config = json!({
         "format_transform": {
