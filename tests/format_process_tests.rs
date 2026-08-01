@@ -699,6 +699,114 @@ fn openai_chat_system_message_maps_to_claude_system_string_like_python() {
 }
 
 #[test]
+fn claude_target_injects_default_max_tokens_when_source_omits_token_limit() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }),
+    )
+    .expect("request should transform");
+
+    assert_eq!(plan.body["max_tokens"], json!(4096));
+}
+
+#[test]
+fn openai_responses_reasoning_maps_to_claude_thinking() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/responses",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 20000,
+            "reasoning": {"effort": "high"},
+            "input": "Think carefully"
+        }),
+    )
+    .expect("Responses request should transform to Claude");
+
+    assert_eq!(plan.body["max_tokens"], json!(20000));
+    assert_eq!(plan.body["thinking"]["type"], "enabled");
+    assert_eq!(plan.body["thinking"]["budget_tokens"], 10000);
+    assert!(plan.body.get("reasoning").is_none());
+}
+
+#[test]
+fn adaptive_claude_target_maps_reasoning_to_adaptive_thinking() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/responses",
+        &[],
+        json!({
+            "model": "claude-opus-4.8",
+            "max_output_tokens": 20000,
+            "reasoning": {"effort": "high"},
+            "input": "Think carefully"
+        }),
+    )
+    .expect("Responses request should transform to adaptive Claude");
+
+    assert_eq!(plan.body["thinking"], json!({"type": "adaptive"}));
+    assert_eq!(plan.body["output_config"], json!({"effort": "high"}));
+}
+
+#[test]
+fn forced_claude_tool_choice_disables_reasoning_thinking() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/responses",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "max_output_tokens": 20000,
+            "temperature": 0.7,
+            "reasoning": {"effort": "high"},
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+            "tool_choice": "required",
+            "input": "Use the tool"
+        }),
+    )
+    .expect("forced tool request should transform to Claude");
+
+    assert_eq!(plan.body["thinking"], json!({"type": "disabled"}));
+    assert!(plan.body.get("output_config").is_none());
+    assert_eq!(plan.body["temperature"], json!(0.7));
+    assert_eq!(plan.body["tool_choice"], json!({"type": "any"}));
+}
+
+#[test]
+fn claude_target_preserves_strict_tools_and_disables_parallel_tool_use() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "Use the tool"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {"type": "object"},
+                "strict": true
+            }}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false
+        }),
+    )
+    .expect("Chat request should transform to Claude");
+
+    assert_eq!(plan.body["tools"][0]["strict"], json!(true));
+    assert!(plan.body["tools"][0].get("description").is_none());
+    assert_eq!(
+        plan.body["tool_choice"],
+        json!({"type": "auto", "disable_parallel_tool_use": true})
+    );
+}
+
+#[test]
 fn openai_responses_tool_items_include_completed_status_like_python() {
     let config = json!({
         "format_transform": {
@@ -1801,7 +1909,7 @@ fn gemini_tool_choice_maps_to_openai_function_selector() {
 }
 
 #[test]
-fn strict_is_preserved_only_by_openai_tool_targets() {
+fn strict_is_preserved_across_supported_tool_targets() {
     let chat_to_responses = process_request(
         &transform_config(true, "openai_responses"),
         "/v1/chat/completions",
@@ -1834,7 +1942,7 @@ fn strict_is_preserved_only_by_openai_tool_targets() {
         }),
     )
     .expect("Chat tools should transform to Claude");
-    assert!(chat_to_claude.body["tools"][0].get("strict").is_none());
+    assert_eq!(chat_to_claude.body["tools"][0]["strict"], json!(true));
 }
 
 #[test]

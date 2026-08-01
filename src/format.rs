@@ -9,6 +9,8 @@ pub enum RequestFormat {
     GeminiChat,
 }
 
+const DEFAULT_CLAUDE_MAX_TOKENS: u64 = 4096;
+
 impl RequestFormat {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -100,6 +102,13 @@ struct InternalTool {
     description: Option<String>,
     input_schema: Value,
     strict: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeThinkingPlan {
+    thinking: Value,
+    output_config: Option<Value>,
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1706,11 +1715,15 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
 }
 
 fn emit_claude_chat(req: &InternalRequest) -> Value {
-    let mut body = Map::new();
+    let mut body = normalize_extra_for_claude(&req.extra);
     body.insert("model".to_string(), Value::String(req.model.clone()));
     body.insert("stream".to_string(), Value::Bool(req.stream));
-    if let Some(thinking) = normalize_claude_thinking_for_claude(req.thinking.as_ref()) {
-        body.insert("thinking".to_string(), thinking);
+    let thinking_plan = normalize_claude_thinking_for_request(req, &body);
+    if let Some(plan) = &thinking_plan {
+        body.insert("thinking".to_string(), plan.thinking.clone());
+        if let Some(output_config) = &plan.output_config {
+            body.insert("output_config".to_string(), output_config.clone());
+        }
     }
 
     let mut messages = Vec::new();
@@ -1748,7 +1761,41 @@ fn emit_claude_chat(req: &InternalRequest) -> Value {
             }
         }
     }
-    body.extend(normalize_extra_for_claude(&req.extra));
+
+    let mut thinking_enabled = thinking_plan.as_ref().is_some_and(|plan| plan.enabled);
+    if !req.tools.is_empty()
+        && req
+            .extra
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        let mut tool_choice = body
+            .get("tool_choice")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "auto"}));
+        if let Some(tool_choice) = tool_choice.as_object_mut() {
+            tool_choice.insert("disable_parallel_tool_use".to_string(), json!(true));
+        }
+        body.insert("tool_choice".to_string(), tool_choice);
+    }
+
+    let forced_tool_choice = body
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "any" | "tool"));
+    if thinking_enabled && forced_tool_choice {
+        body.insert("thinking".to_string(), json!({"type": "disabled"}));
+        body.remove("output_config");
+        thinking_enabled = false;
+    }
+    if thinking_enabled {
+        body.remove("temperature");
+        body.remove("top_p");
+    }
+
     Value::Object(body)
 }
 
@@ -2485,11 +2532,17 @@ fn openai_tool(tool: &InternalTool) -> Value {
 }
 
 fn claude_tool(tool: &InternalTool) -> Value {
-    json!({
+    let mut output = json!({
         "name": tool.name,
-        "description": tool.description,
         "input_schema": normalize_claude_input_schema(&tool.input_schema)
-    })
+    });
+    if let Some(description) = &tool.description {
+        output["description"] = Value::String(description.clone());
+    }
+    if let Some(strict) = tool.strict {
+        output["strict"] = Value::Bool(strict);
+    }
+    output
 }
 
 fn responses_tool(tool: &InternalTool) -> Value {
@@ -2723,6 +2776,100 @@ fn normalize_claude_reasoning_effort(
         },
         _ => None,
     }
+}
+
+fn normalize_claude_thinking_for_request(
+    req: &InternalRequest,
+    body: &Map<String, Value>,
+) -> Option<ClaudeThinkingPlan> {
+    if let Some(thinking) = normalize_claude_thinking_for_claude(req.thinking.as_ref()) {
+        let enabled = thinking
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "disabled");
+        return Some(ClaudeThinkingPlan {
+            thinking,
+            output_config: None,
+            enabled,
+        });
+    }
+
+    let effort = req
+        .extra
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .or_else(|| req.extra.get("reasoning_effort").and_then(Value::as_str))?;
+
+    if matches!(effort, "none" | "off" | "disabled") {
+        return Some(ClaudeThinkingPlan {
+            thinking: json!({"type": "disabled"}),
+            output_config: None,
+            enabled: false,
+        });
+    }
+
+    let normalized_effort = normalize_claude_effort(effort)?;
+    if is_claude_adaptive_model(&req.model) {
+        return Some(ClaudeThinkingPlan {
+            thinking: json!({"type": "adaptive"}),
+            output_config: Some(json!({"effort": normalized_effort})),
+            enabled: true,
+        });
+    }
+
+    let requested_budget = match normalized_effort {
+        "low" => 2_048,
+        "medium" => 8_192,
+        "high" => 16_384,
+        "max" => 24_576,
+        _ => return None,
+    };
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_CLAUDE_MAX_TOKENS);
+    let budget = requested_budget.min(max_tokens / 2);
+    if budget < 1_024 {
+        return None;
+    }
+
+    Some(ClaudeThinkingPlan {
+        thinking: json!({"type": "enabled", "budget_tokens": budget}),
+        output_config: None,
+        enabled: true,
+    })
+}
+
+fn normalize_claude_effort(effort: &str) -> Option<&'static str> {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "minimal" | "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "max" => Some("max"),
+        _ => None,
+    }
+}
+
+fn is_claude_adaptive_model(model: &str) -> bool {
+    let normalized = model
+        .trim()
+        .to_ascii_lowercase()
+        .replace('.', "-")
+        .replace('_', "-");
+    [
+        "fable-5",
+        "mythos-5",
+        "mythos-preview",
+        "sonnet-5",
+        "opus-4-8",
+        "opus-4-7",
+        "opus-4-6",
+        "sonnet-4-6",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn supports_reasoning_effort(model: &str) -> bool {
@@ -2999,21 +3146,22 @@ fn normalize_extra_for_claude(extra: &Map<String, Value>) -> Map<String, Value> 
         out.insert("context_management".to_string(), context_management);
     }
 
-    if !out.contains_key("max_tokens") {
-        if let Some(value) = extra
-            .get("max_output_tokens")
-            .or_else(|| extra.get("max_completion_tokens"))
-        {
-            out.insert("max_tokens".to_string(), value.clone());
-        }
-    }
+    let max_tokens = [
+        extra.get("max_tokens"),
+        extra.get("max_output_tokens"),
+        extra.get("max_completion_tokens"),
+        extra
+            .get("generationConfig")
+            .and_then(Value::as_object)
+            .and_then(|generation_config| generation_config.get("maxOutputTokens")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| value.as_u64().filter(|value| *value > 0))
+    .unwrap_or(DEFAULT_CLAUDE_MAX_TOKENS);
+    out.insert("max_tokens".to_string(), json!(max_tokens));
 
     if let Some(Value::Object(generation_config)) = extra.get("generationConfig") {
-        if !out.contains_key("max_tokens") {
-            if let Some(value) = generation_config.get("maxOutputTokens") {
-                out.insert("max_tokens".to_string(), value.clone());
-            }
-        }
         copy_if_missing(&mut out, generation_config, "temperature", "temperature");
         copy_if_missing(&mut out, generation_config, "topP", "top_p");
         if !out.contains_key("stop_sequences") {

@@ -365,8 +365,11 @@ the original request shape and fields while still allowing moderation to run.
 The conversion layer follows the current request-shaping behavior used by
 [CC Switch](https://github.com/farion1231/cc-switch), including explicit mappings for token
 limits, response formats, reasoning controls, tool choices, images, and other multimodal
-content. `strip_tool_choice` is no longer supported; use `disable_tools` when the complete
-tool capability must be removed.
+content. Claude targets always receive a valid `max_tokens` value (using a 4096-token default
+when the source protocol has no equivalent limit), Responses/Chat reasoning is mapped to Claude
+thinking controls, and `parallel_tool_calls: false` is mapped to Claude's
+`disable_parallel_tool_use` constraint. `strip_tool_choice` is no longer supported; use
+`disable_tools` when the complete tool capability must be removed.
 
 ### `basic_moderation`
 
