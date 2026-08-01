@@ -311,7 +311,7 @@ The env form keeps long JSON configs out of client URLs. `ENV_KEY` must contain 
 Example `.env` entry:
 
 ```bash
-CLAUDE_TO_OPENAI='{"format_transform":{"enabled":true,"strict_parse":true,"from":"claude_chat","to":"openai_chat","strip_tool_choice":true,"delay_stream_header":true},"basic_moderation":{"enabled":true,"keywords_file":"configs/keywords.txt","error_code":"BASIC_MODERATION_BLOCKED"},"smart_moderation":{"enabled":true,"profile":"default"}}'
+CLAUDE_TO_OPENAI='{"format_transform":{"enabled":true,"strict_parse":true,"from":"claude_chat","to":"openai_chat","delay_stream_header":true},"basic_moderation":{"enabled":true,"keywords_file":"configs/keywords.txt","error_code":"BASIC_MODERATION_BLOCKED"},"smart_moderation":{"enabled":true,"profile":"default"}}'
 ```
 
 Example request shape:
@@ -340,7 +340,6 @@ curl -G http://127.0.0.1:8000/debug/url-config \
     "strict_parse": true,
     "from": "claude_chat",
     "to": "openai_chat",
-    "strip_tool_choice": true,
     "delay_stream_header": true
   }
 }
@@ -354,9 +353,20 @@ Important fields:
 | `strict_parse` | Returns a structured moderation-style error when the source format cannot be detected or is disallowed. |
 | `from` | Source format, array of formats, or auto-style detection when omitted. |
 | `to` | Target format. Use `pass_through` to keep the source protocol while still applying moderation. |
-| `strip_tool_choice` | Removes `tool_choice` while preserving `tools`. Use this for upstreams that can call tools but reject explicit `tool_choice` fields such as forced `auto`. |
 | `disable_tools` | Removes tool declarations and tool call content during transformation. |
 | `delay_stream_header` | Lets the proxy delay committing stream headers so pre-stream errors can be returned as normal JSON. |
+
+Concrete target formats are rebuilt from target-specific field allowlists. Fields that are not
+recognized by the target conversion path are dropped instead of being copied through the
+request body. `tool_choice` is normalized for the target protocol and is omitted when the
+converted request has no usable tools. `pass_through` is the explicit exception: it preserves
+the original request shape and fields while still allowing moderation to run.
+
+The conversion layer follows the current request-shaping behavior used by
+[CC Switch](https://github.com/farion1231/cc-switch), including explicit mappings for token
+limits, response formats, reasoning controls, tool choices, images, and other multimodal
+content. `strip_tool_choice` is no longer supported; use `disable_tools` when the complete
+tool capability must be removed.
 
 ### `basic_moderation`
 

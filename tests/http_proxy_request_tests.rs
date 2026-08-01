@@ -4122,11 +4122,7 @@ async fn openai_chat_request_strips_stream_include_usage_for_responses_upstream(
     let request = seen.last().expect("upstream request");
     assert_eq!(request.path, "/v1/responses");
     assert_eq!(request.json_body["stream"], true);
-    assert_eq!(
-        request.json_body["stream_options"].get("include_usage"),
-        None
-    );
-    assert_eq!(request.json_body["stream_options"]["test_marker"], 1);
+    assert_eq!(request.json_body.get("stream_options"), None);
 }
 
 #[tokio::test]
@@ -4155,6 +4151,13 @@ async fn openai_chat_request_normalizes_function_tool_choice_for_responses_upstr
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
             "tool_choice": {
                 "type": "function",
                 "function": {
@@ -4278,7 +4281,7 @@ async fn openai_chat_request_normalizes_json_object_response_format_for_response
 }
 
 #[tokio::test]
-async fn openai_chat_request_keeps_string_tool_choice_auto_for_responses_upstream() {
+async fn openai_chat_request_drops_tool_choice_without_tools_for_responses_upstream() {
     let (upstream_base, seen) = spawn_upstream_echo_server().await;
     let proxy_base = spawn_proxy_server().await;
     let config = percent_encode(
@@ -4313,60 +4316,7 @@ async fn openai_chat_request_keeps_string_tool_choice_auto_for_responses_upstrea
 
     let seen = seen.lock().expect("seen lock");
     let request = seen.last().expect("upstream request");
-    assert_eq!(request.json_body["tool_choice"], "auto");
-}
-
-#[tokio::test]
-async fn openai_chat_request_can_strip_tool_choice_for_responses_upstream() {
-    let (upstream_base, seen) = spawn_upstream_echo_server().await;
-    let proxy_base = spawn_proxy_server().await;
-    let config = percent_encode(
-        &json!({
-            "format_transform": {
-                "enabled": true,
-                "strict_parse": true,
-                "strip_tool_choice": true,
-                "from": "openai_chat",
-                "to": "openai_responses"
-            }
-        })
-        .to_string(),
-    );
-    let upstream_full = format!("{upstream_base}/v1/chat/completions");
-    let proxy_url = format!("{proxy_base}/{config}${upstream_full}");
-
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .expect("reqwest client")
-        .post(proxy_url)
-        .json(&json!({
-            "model": "gpt-4.1-mini",
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "lookup_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "city": {"type": "string"}
-                        }
-                    }
-                }
-            }],
-            "tool_choice": "auto"
-        }))
-        .send()
-        .await
-        .expect("proxy response");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let seen = seen.lock().expect("seen lock");
-    let request = seen.last().expect("upstream request");
-    assert!(request.json_body.get("tool_choice").is_none());
-    assert_eq!(request.json_body["tools"][0]["name"], "lookup_weather");
+    assert_eq!(request.json_body.get("tool_choice"), None);
 }
 
 #[tokio::test]
@@ -4395,6 +4345,13 @@ async fn openai_chat_request_keeps_string_tool_choice_none_for_responses_upstrea
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
             "tool_choice": "none"
         }))
         .send()
@@ -4434,6 +4391,13 @@ async fn openai_chat_request_keeps_string_tool_choice_required_for_responses_ups
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
             "tool_choice": "required"
         }))
         .send()
@@ -4473,6 +4437,13 @@ async fn openai_chat_request_normalizes_tool_tool_choice_for_responses_upstream(
         .json(&json!({
             "model": "gpt-4.1-mini",
             "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
             "tool_choice": {
                 "type": "tool",
                 "name": "lookup_weather"
@@ -5096,6 +5067,7 @@ async fn openai_responses_preserves_extra_generation_fields_when_mapping_to_open
             "top_p": 0.8,
             "metadata": {"trace_id": "abc"},
             "response_format": {"type": "json_object"},
+            "unknown_option": true,
             "input": "Hello"
         }))
         .send()
@@ -5114,6 +5086,7 @@ async fn openai_responses_preserves_extra_generation_fields_when_mapping_to_open
         request.json_body["response_format"],
         json!({"type": "json_object"})
     );
+    assert_eq!(request.json_body.get("unknown_option"), None);
 }
 
 #[tokio::test]

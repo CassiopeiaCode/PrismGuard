@@ -418,12 +418,11 @@ fn non_strict_mode_preserves_request_when_detection_fails() {
 }
 
 #[test]
-fn strip_tool_choice_removes_tool_choice_without_disabling_tools() {
+fn concrete_target_rebuilds_tool_choice_and_drops_unknown_fields() {
     let config = json!({
         "format_transform": {
             "enabled": true,
             "strict_parse": true,
-            "strip_tool_choice": true,
             "from": "openai_chat",
             "to": "openai_chat"
         }
@@ -448,7 +447,8 @@ fn strip_tool_choice_removes_tool_choice_without_disabling_tools() {
                     }
                 }
             }],
-            "tool_choice": "auto"
+            "tool_choice": "auto",
+            "unknown_option": true
         }),
     )
     .expect("openai chat request should still parse");
@@ -456,7 +456,8 @@ fn strip_tool_choice_removes_tool_choice_without_disabling_tools() {
     assert_eq!(plan.source_format, Some(RequestFormat::OpenAiChat));
     assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
     assert_eq!(plan.path, "/v1/chat/completions");
-    assert!(plan.body.get("tool_choice").is_none());
+    assert_eq!(plan.body["tool_choice"], "auto");
+    assert!(plan.body.get("unknown_option").is_none());
     assert_eq!(plan.body["tools"][0]["function"]["name"], "lookup_weather");
 }
 
@@ -1053,6 +1054,7 @@ fn openai_responses_preserves_extra_generation_fields_when_mapping_to_openai_cha
             "top_p": 0.8,
             "metadata": {"trace_id": "abc"},
             "response_format": {"type": "json_object"},
+            "unknown_option": true,
             "input": "Hello"
         }),
     )
@@ -1065,6 +1067,7 @@ fn openai_responses_preserves_extra_generation_fields_when_mapping_to_openai_cha
     assert_eq!(plan.body["top_p"], json!(0.8));
     assert_eq!(plan.body["metadata"], json!({"trace_id": "abc"}));
     assert_eq!(plan.body["response_format"], json!({"type": "json_object"}));
+    assert!(plan.body.get("unknown_option").is_none());
 }
 
 #[test]
@@ -1102,6 +1105,95 @@ fn openai_responses_single_input_object_maps_like_python() {
             "role": "user",
             "content": "Hello from dict"
         }])
+    );
+}
+
+#[test]
+fn openai_responses_file_and_audio_items_map_to_openai_chat_parts() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "openai_responses",
+            "to": "openai_chat"
+        }
+    });
+
+    let plan = process_request(
+        &config,
+        "/v1/responses",
+        &[],
+        json!({
+            "model": "gpt-4.1-mini",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,FILE_SENTINEL",
+                        "filename": "manual.pdf"
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "AUDIO_SENTINEL", "format": "wav"}
+                    }
+                ]
+            }]
+        }),
+    )
+    .expect("Responses multimodal request should transform");
+
+    assert_eq!(plan.body["messages"][0]["content"][0]["type"], "file");
+    assert_eq!(
+        plan.body["messages"][0]["content"][0]["file"]["filename"],
+        "manual.pdf"
+    );
+    assert_eq!(
+        plan.body["messages"][0]["content"][1]["input_audio"]["data"],
+        "AUDIO_SENTINEL"
+    );
+}
+
+#[test]
+fn claude_document_maps_to_gemini_inline_data() {
+    let config = json!({
+        "format_transform": {
+            "enabled": true,
+            "strict_parse": true,
+            "from": "claude_chat",
+            "to": "gemini_chat"
+        }
+    });
+
+    let plan = process_request(
+        &config,
+        "/v1/messages",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "document",
+                    "title": "manual.pdf",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": "FILE_SENTINEL"
+                    }
+                }]
+            }]
+        }),
+    )
+    .expect("Claude document request should transform");
+
+    assert_eq!(
+        plan.body["contents"][0]["parts"][0]["inlineData"]["mimeType"],
+        "application/pdf"
+    );
+    assert_eq!(
+        plan.body["contents"][0]["parts"][0]["inlineData"]["data"],
+        "FILE_SENTINEL"
     );
 }
 
@@ -1661,4 +1753,134 @@ fn openai_chat_tool_image_maps_to_responses_multimodal_output() {
         {"type":"input_text","text":"Read screenshot.png"},
         {"type":"input_image","detail":"high","image_url":"data:image/png;base64,AA=="}
     ]));
+}
+
+#[test]
+fn claude_any_tool_choice_maps_to_openai_required() {
+    let plan = process_request(
+        &transform_config(true, "openai_chat"),
+        "/v1/messages",
+        &[("anthropic-version".to_string(), "2023-06-01".to_string())],
+        json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "use a tool"}],
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any"}
+        }),
+    )
+    .expect("Claude tool choice should transform");
+
+    assert_eq!(plan.body["tool_choice"], json!("required"));
+}
+
+#[test]
+fn gemini_tool_choice_maps_to_openai_function_selector() {
+    let plan = process_request(
+        &transform_config(true, "openai_chat"),
+        "/v1beta/models/gemini-2.5-flash:generateContent",
+        &[],
+        json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "use a tool"}]}],
+            "tools": [{"functionDeclarations": [{
+                "name": "lookup",
+                "parameters": {"type": "object"}
+            }]}],
+            "toolConfig": {"functionCallingConfig": {
+                "mode": "ANY",
+                "allowedFunctionNames": ["lookup"]
+            }}
+        }),
+    )
+    .expect("Gemini tool choice should transform");
+
+    assert_eq!(
+        plan.body["tool_choice"],
+        json!({"type": "function", "function": {"name": "lookup"}})
+    );
+}
+
+#[test]
+fn strict_is_preserved_only_by_openai_tool_targets() {
+    let chat_to_responses = process_request(
+        &transform_config(true, "openai_responses"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {"type": "object"},
+                "strict": true
+            }}]
+        }),
+    )
+    .expect("Chat tools should transform to Responses");
+    assert_eq!(chat_to_responses.body["tools"][0]["strict"], json!(true));
+
+    let chat_to_claude = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {"type": "object"},
+                "strict": true
+            }}]
+        }),
+    )
+    .expect("Chat tools should transform to Claude");
+    assert!(chat_to_claude.body["tools"][0].get("strict").is_none());
+}
+
+#[test]
+fn gemini_generation_config_maps_only_known_fields_to_openai_chat() {
+    let plan = process_request(
+        &transform_config(true, "openai_chat"),
+        "/v1beta/models/gemini-2.5-flash:generateContent",
+        &[],
+        json!({
+            "model": "gemini-2.5-flash",
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 128,
+                "temperature": 0.2,
+                "topP": 0.8,
+                "unknown_generation_option": true
+            },
+            "unknown_root_option": true
+        }),
+    )
+    .expect("Gemini generation config should transform");
+
+    assert_eq!(plan.body["max_tokens"], json!(128));
+    assert_eq!(plan.body["temperature"], json!(0.2));
+    assert_eq!(plan.body["top_p"], json!(0.8));
+    assert!(plan.body.get("generationConfig").is_none());
+    assert!(plan.body.get("unknown_root_option").is_none());
+}
+
+#[test]
+fn responses_file_id_is_not_rewritten_as_a_file_url() {
+    let plan = process_request(
+        &transform_config(true, "openai_chat"),
+        "/v1/responses",
+        &[],
+        json!({
+            "model": "gpt-4.1-mini",
+            "input": [{"role": "user", "content": [{
+                "type": "input_file",
+                "file_id": "file_123",
+                "filename": "manual.pdf"
+            }]}]
+        }),
+    )
+    .expect("Responses file id should transform");
+
+    assert_eq!(plan.body["messages"][0]["content"][0]["file"]["file_id"], "file_123");
+    assert!(plan.body["messages"][0]["content"][0]["file"].get("file_data").is_none());
 }

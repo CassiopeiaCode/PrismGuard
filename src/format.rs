@@ -81,6 +81,17 @@ enum InternalContentBlock {
         url: String,
         detail: Option<String>,
     },
+    File {
+        file_id: Option<String>,
+        url: Option<String>,
+        data: Option<String>,
+        media_type: Option<String>,
+        filename: Option<String>,
+    },
+    Audio {
+        data: String,
+        format: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +99,15 @@ struct InternalTool {
     name: String,
     description: Option<String>,
     input_schema: Value,
+    strict: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormalizedToolChoice {
+    Auto,
+    None,
+    Required,
+    Tool(String),
 }
 
 pub fn process_request(
@@ -126,10 +146,6 @@ pub fn process_request(
         .unwrap_or(false);
     let disable_tools = transform_cfg
         .get("disable_tools")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let strip_tool_choice = transform_cfg
-        .get("strip_tool_choice")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let from_cfg = transform_cfg.get("from");
@@ -186,8 +202,6 @@ pub fn process_request(
     let (source, internal) = parsed.expect("checked is_some");
     let internal = if disable_tools {
         strip_tools(internal)
-    } else if strip_tool_choice {
-        strip_tool_choice_from_request(internal)
     } else {
         internal
     };
@@ -210,7 +224,7 @@ pub fn process_request(
     plan.passthrough = passthrough;
     plan.moderation_text = Some(moderation_text_from_internal_request(&internal));
 
-    if !passthrough && (target != source || disable_tools || strip_tool_choice) {
+    if !passthrough {
         plan.body = emit_request(target, &internal).map_err(|error| {
             RequestProcessError::Transform(format!("Format transform error: {error}"))
         })?;
@@ -231,7 +245,10 @@ fn moderation_text_from_internal_request(req: &InternalRequest) -> String {
                 InternalContentBlock::ToolResult { output, .. } => {
                     collect_moderation_value_text(output, &mut texts);
                 }
-                InternalContentBlock::ToolCall { .. } | InternalContentBlock::ImageUrl { .. } => {}
+                InternalContentBlock::ToolCall { .. }
+                | InternalContentBlock::ImageUrl { .. }
+                | InternalContentBlock::File { .. }
+                | InternalContentBlock::Audio { .. } => {}
             }
         }
     }
@@ -620,6 +637,54 @@ fn parse_openai_chat_message(msg: &Map<String, Value>) -> Result<InternalMessage
                                 }
                             }
                         }
+                        Some("file") => {
+                            if let Some(file) = part.get("file").and_then(Value::as_object) {
+                                let file_data = file
+                                    .get("file_data")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.trim().is_empty())
+                                    .map(parse_file_data);
+                                let file_id = file
+                                    .get("file_id")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.trim().is_empty())
+                                    .map(ToString::to_string);
+                                let file_url = file
+                                    .get("file_url")
+                                    .and_then(Value::as_str)
+                                    .filter(|value| !value.trim().is_empty())
+                                    .map(ToString::to_string);
+                                if file_data.is_some() || file_id.is_some() || file_url.is_some() {
+                                    let (data, media_type) = file_data
+                                        .map(|(data, media_type)| (Some(data), media_type))
+                                        .unwrap_or((None, None));
+                                    content.push(InternalContentBlock::File {
+                                        file_id,
+                                        url: file_url,
+                                        data,
+                                        media_type,
+                                        filename: file
+                                            .get("filename")
+                                            .and_then(Value::as_str)
+                                            .map(ToString::to_string),
+                                    });
+                                }
+                            }
+                        }
+                        Some("input_audio") => {
+                            if let Some(audio) = part.get("input_audio").and_then(Value::as_object)
+                            {
+                                if let (Some(data), Some(format)) = (
+                                    audio.get("data").and_then(Value::as_str),
+                                    audio.get("format").and_then(Value::as_str),
+                                ) {
+                                    content.push(InternalContentBlock::Audio {
+                                        data: data.to_string(),
+                                        format: format.to_string(),
+                                    });
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -855,6 +920,43 @@ fn parse_claude_parts(parts: &[Map<String, Value>], out: &mut Vec<InternalConten
                     other => return Err(anyhow!("unsupported Claude image source type: {other:?}")),
                 };
                 out.push(InternalContentBlock::ImageUrl { url, detail: None });
+            }
+            Some("document") => {
+                let source = part
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow!("Claude document.source must be an object"))?;
+                let source_type = source.get("type").and_then(Value::as_str);
+                let url = (source_type == Some("url"))
+                    .then(|| source.get("url").and_then(Value::as_str))
+                    .flatten()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string);
+                let data = (source_type == Some("base64"))
+                    .then(|| source.get("data").and_then(Value::as_str))
+                    .flatten()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToString::to_string);
+                if url.is_some() || data.is_some() {
+                    out.push(InternalContentBlock::File {
+                        file_id: None,
+                        url,
+                        data,
+                        media_type: source
+                            .get("media_type")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                            .or_else(|| {
+                                (source_type == Some("base64"))
+                                    .then(|| "application/pdf".to_string())
+                            }),
+                        filename: part
+                            .get("title")
+                            .or_else(|| part.get("filename"))
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    });
+                }
             }
             Some("tool_use") => out.push(InternalContentBlock::ToolCall {
                 id: part
@@ -1132,7 +1234,7 @@ fn parse_responses_input_item(item: &Value) -> Result<Option<InternalMessage>> {
         role: match role {
             "assistant" | "model" => "assistant",
             "function_call" => "assistant",
-            "system" => "system",
+            "system" | "developer" => "system",
             "function_call_output" | "tool" => "tool",
             _ => "user",
         }
@@ -1307,6 +1409,51 @@ fn push_responses_content_block(
                 content.push(InternalContentBlock::ImageUrl { url, detail });
             }
         }
+        Some("input_file") => {
+            let url = part
+                .get("file_url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string);
+            let data = part
+                .get("file_data")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(parse_file_data);
+            let file_id = part
+                .get("file_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToString::to_string);
+            if file_id.is_some() || url.is_some() || data.is_some() {
+                let (data, media_type) = data
+                    .map(|(data, media_type)| (Some(data), media_type))
+                    .unwrap_or((None, None));
+                content.push(InternalContentBlock::File {
+                    file_id,
+                    url,
+                    data,
+                    media_type,
+                    filename: part
+                        .get("filename")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                });
+            }
+        }
+        Some("input_audio") => {
+            if let Some(audio) = part.get("input_audio").and_then(Value::as_object) {
+                if let (Some(data), Some(format)) = (
+                    audio.get("data").and_then(Value::as_str),
+                    audio.get("format").and_then(Value::as_str),
+                ) {
+                    content.push(InternalContentBlock::Audio {
+                        data: data.to_string(),
+                        format: format.to_string(),
+                    });
+                }
+            }
+        }
         Some("function_call") => {
             let arguments = part
                 .get("arguments")
@@ -1369,6 +1516,58 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
                 for part in parts.iter().filter_map(Value::as_object) {
                     if let Some(text) = part.get("text").and_then(Value::as_str) {
                         blocks.push(InternalContentBlock::Text(text.to_string()));
+                    } else if let Some(file_data) = part.get("fileData").and_then(Value::as_object)
+                    {
+                        if let Some(url) = file_data
+                            .get("fileUri")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            blocks.push(InternalContentBlock::File {
+                                file_id: None,
+                                url: Some(url.to_string()),
+                                data: None,
+                                media_type: file_data
+                                    .get("mimeType")
+                                    .and_then(Value::as_str)
+                                    .map(ToString::to_string),
+                                filename: None,
+                            });
+                        }
+                    } else if let Some(inline_data) =
+                        part.get("inlineData").and_then(Value::as_object)
+                    {
+                        if let Some(data) = inline_data
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            let media_type = inline_data
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string);
+                            if media_type
+                                .as_deref()
+                                .is_some_and(|value| value.starts_with("audio/"))
+                            {
+                                blocks.push(InternalContentBlock::Audio {
+                                    data: data.to_string(),
+                                    format: media_type
+                                        .as_deref()
+                                        .and_then(|value| value.strip_prefix("audio/"))
+                                        .unwrap_or("wav")
+                                        .to_string(),
+                                });
+                            } else {
+                                blocks.push(InternalContentBlock::File {
+                                    file_id: None,
+                                    url: None,
+                                    data: Some(data.to_string()),
+                                    media_type,
+                                    filename: None,
+                                });
+                            }
+                        }
                     } else if let Some(function_call) =
                         part.get("functionCall").and_then(Value::as_object)
                     {
@@ -1428,6 +1627,7 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
             "generationConfig",
             "safetySettings",
             "systemInstruction",
+            "cachedContent",
         ],
     );
     if let Some(generation_config) = body.get("generationConfig") {
@@ -1435,6 +1635,11 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
     }
     if let Some(safety_settings) = body.get("safetySettings") {
         extra.insert("safetySettings".to_string(), safety_settings.clone());
+    }
+    if let Some(cached_content) = body.get("cachedContent") {
+        if cached_content.as_str().is_some() {
+            extra.insert("cachedContent".to_string(), cached_content.clone());
+        }
     }
     Ok(InternalRequest {
         messages,
@@ -1452,7 +1657,7 @@ fn parse_gemini_chat(body: &Map<String, Value>, path: &str) -> Result<InternalRe
 }
 
 fn emit_openai_chat(req: &InternalRequest) -> Value {
-    let mut body = normalize_extra_for_openai_chat(&req.extra);
+    let mut body = normalize_extra_for_openai_chat(&req.extra, &req.model);
     body.insert("model".to_string(), Value::String(req.model.clone()));
     body.insert("stream".to_string(), Value::Bool(req.stream));
     let mut messages = Vec::new();
@@ -1483,11 +1688,19 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
             Value::Array(req.tools.iter().map(openai_tool).collect()),
         );
     }
-    if let Some(tool_choice) = &req.tool_choice {
-        body.insert("tool_choice".to_string(), tool_choice.clone());
+    if !req.tools.is_empty() {
+        if let Some(tool_choice) = &req.tool_choice {
+            if let Some(tool_choice) = normalize_tool_choice_for_openai_chat(tool_choice) {
+                body.insert("tool_choice".to_string(), tool_choice);
+            }
+        }
     }
-    if let Some(reasoning) = normalize_claude_thinking_for_openai(req.thinking.as_ref()) {
-        body.insert("reasoning".to_string(), reasoning);
+    if !body.contains_key("reasoning_effort") {
+        if let Some(effort) = normalize_claude_reasoning_effort(req.thinking.as_ref(), &req.extra)
+            .filter(|_| supports_reasoning_effort(&req.model))
+        {
+            body.insert("reasoning_effort".to_string(), json!(effort));
+        }
     }
     Value::Object(body)
 }
@@ -1496,11 +1709,14 @@ fn emit_claude_chat(req: &InternalRequest) -> Value {
     let mut body = Map::new();
     body.insert("model".to_string(), Value::String(req.model.clone()));
     body.insert("stream".to_string(), Value::Bool(req.stream));
+    if let Some(thinking) = normalize_claude_thinking_for_claude(req.thinking.as_ref()) {
+        body.insert("thinking".to_string(), thinking);
+    }
 
     let mut messages = Vec::new();
     let mut system_text = Vec::new();
     for message in &req.messages {
-        if message.role == "system" {
+        if matches!(message.role.as_str(), "system" | "developer") {
             for block in &message.content {
                 if let InternalContentBlock::Text(text) = block {
                     if !text.is_empty() {
@@ -1510,7 +1726,9 @@ fn emit_claude_chat(req: &InternalRequest) -> Value {
             }
             continue;
         }
-        messages.push(claude_message(message));
+        if let Some(message) = claude_message(message) {
+            messages.push(message);
+        }
     }
 
     if !system_text.is_empty() {
@@ -1523,13 +1741,14 @@ fn emit_claude_chat(req: &InternalRequest) -> Value {
             Value::Array(req.tools.iter().map(claude_tool).collect()),
         );
     }
-    if let Some(tool_choice) = &req.tool_choice {
-        body.insert(
-            "tool_choice".to_string(),
-            normalize_tool_choice_for_claude(tool_choice),
-        );
+    if !req.tools.is_empty() {
+        if let Some(tool_choice) = &req.tool_choice {
+            if let Some(tool_choice) = normalize_tool_choice_for_claude(tool_choice) {
+                body.insert("tool_choice".to_string(), tool_choice);
+            }
+        }
     }
-    body.extend(req.extra.clone());
+    body.extend(normalize_extra_for_claude(&req.extra));
     Value::Object(body)
 }
 
@@ -1541,7 +1760,7 @@ fn emit_openai_responses(req: &InternalRequest) -> Value {
     let mut input = Vec::new();
     let mut instructions = Vec::new();
     for message in &req.messages {
-        if message.role == "system" {
+        if matches!(message.role.as_str(), "system" | "developer") {
             for block in &message.content {
                 if let InternalContentBlock::Text(text) = block {
                     instructions.push(text.clone());
@@ -1568,14 +1787,19 @@ fn emit_openai_responses(req: &InternalRequest) -> Value {
             Value::Array(req.tools.iter().map(responses_tool).collect()),
         );
     }
-    if let Some(tool_choice) = &req.tool_choice {
-        body.insert(
-            "tool_choice".to_string(),
-            normalize_tool_choice_for_openai_responses(tool_choice),
-        );
+    if !req.tools.is_empty() {
+        if let Some(tool_choice) = &req.tool_choice {
+            if let Some(tool_choice) = normalize_tool_choice_for_openai_responses(tool_choice) {
+                body.insert("tool_choice".to_string(), tool_choice);
+            }
+        }
     }
-    if let Some(reasoning) = normalize_claude_thinking_for_openai(req.thinking.as_ref()) {
-        body.insert("reasoning".to_string(), reasoning);
+    if !body.contains_key("reasoning") {
+        if let Some(effort) = normalize_claude_reasoning_effort(req.thinking.as_ref(), &req.extra)
+            .filter(|_| supports_reasoning_effort(&req.model))
+        {
+            body.insert("reasoning".to_string(), json!({"effort": effort}));
+        }
     }
     Value::Object(body)
 }
@@ -1585,14 +1809,14 @@ fn emit_gemini_chat(req: &InternalRequest) -> Value {
     let contents = req
         .messages
         .iter()
-        .filter(|message| message.role != "system")
+        .filter(|message| !matches!(message.role.as_str(), "system" | "developer"))
         .filter_map(gemini_message)
         .collect::<Vec<_>>();
     body.insert("contents".to_string(), Value::Array(contents));
     let system_text = req
         .messages
         .iter()
-        .filter(|message| message.role == "system")
+        .filter(|message| matches!(message.role.as_str(), "system" | "developer"))
         .flat_map(|message| message.content.iter())
         .filter_map(|block| match block {
             InternalContentBlock::Text(text) if !text.is_empty() => Some(text.clone()),
@@ -1613,10 +1837,14 @@ fn emit_gemini_chat(req: &InternalRequest) -> Value {
             })]),
         );
     }
-    if let Some(tool_choice) = &req.tool_choice {
-        body.insert("toolConfig".to_string(), tool_choice.clone());
+    if !req.tools.is_empty() {
+        if let Some(tool_choice) = &req.tool_choice {
+            if let Some(tool_choice) = normalize_tool_choice_for_gemini(tool_choice) {
+                body.insert("toolConfig".to_string(), tool_choice);
+            }
+        }
     }
-    body.extend(req.extra.clone());
+    body.extend(normalize_extra_for_gemini(&req.extra));
     Value::Object(body)
 }
 
@@ -1702,18 +1930,6 @@ fn strip_tools(req: InternalRequest) -> InternalRequest {
     }
 }
 
-fn strip_tool_choice_from_request(req: InternalRequest) -> InternalRequest {
-    InternalRequest {
-        messages: req.messages,
-        model: req.model,
-        stream: req.stream,
-        tools: req.tools,
-        tool_choice: None,
-        thinking: req.thinking,
-        extra: req.extra,
-    }
-}
-
 fn parse_openai_tools(value: Option<&Value>) -> Vec<InternalTool> {
     value
         .and_then(Value::as_array)
@@ -1722,12 +1938,12 @@ fn parse_openai_tools(value: Option<&Value>) -> Vec<InternalTool> {
         .filter_map(Value::as_object)
         .filter_map(|tool| {
             let function = tool.get("function")?.as_object()?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())?;
             Some(InternalTool {
-                name: function
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                name: name.to_string(),
                 description: function
                     .get("description")
                     .and_then(Value::as_str)
@@ -1736,6 +1952,7 @@ fn parse_openai_tools(value: Option<&Value>) -> Vec<InternalTool> {
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| json!({})),
+                strict: function.get("strict").and_then(Value::as_bool),
             })
         })
         .collect()
@@ -1747,12 +1964,14 @@ fn parse_claude_tools(value: Option<&Value>) -> Vec<InternalTool> {
         .into_iter()
         .flatten()
         .filter_map(Value::as_object)
+        .filter(|tool| tool.get("type").and_then(Value::as_str) != Some("BatchTool"))
         .filter_map(|tool| {
             let function = tool.get("function").and_then(Value::as_object);
             let name = tool
                 .get("name")
                 .and_then(Value::as_str)
-                .or_else(|| function.and_then(|func| func.get("name").and_then(Value::as_str)))?;
+                .or_else(|| function.and_then(|func| func.get("name").and_then(Value::as_str)))
+                .filter(|name| !name.trim().is_empty())?;
             Some(InternalTool {
                 name: name.to_string(),
                 description: tool
@@ -1769,6 +1988,7 @@ fn parse_claude_tools(value: Option<&Value>) -> Vec<InternalTool> {
                     .cloned()
                     .or_else(|| function.and_then(|func| func.get("parameters").cloned()))
                     .unwrap_or_else(|| json!({})),
+                strict: None,
             })
         })
         .collect()
@@ -1781,15 +2001,15 @@ fn parse_responses_tools(value: Option<&Value>) -> Vec<InternalTool> {
         .flatten()
         .filter_map(Value::as_object)
         .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
-        .map(|tool| {
+        .filter_map(|tool| {
             let function = tool.get("function").and_then(Value::as_object);
-            InternalTool {
-                name: tool
+            let name = tool
                     .get("name")
                     .and_then(Value::as_str)
                     .or_else(|| function.and_then(|func| func.get("name").and_then(Value::as_str)))
-                    .unwrap_or_default()
-                    .to_string(),
+                    .filter(|name| !name.trim().is_empty())?;
+            Some(InternalTool {
+                name: name.to_string(),
                 description: tool
                     .get("description")
                     .and_then(Value::as_str)
@@ -1804,7 +2024,11 @@ fn parse_responses_tools(value: Option<&Value>) -> Vec<InternalTool> {
                     .cloned()
                     .or_else(|| function.and_then(|func| func.get("parameters").cloned()))
                     .unwrap_or_else(|| json!({})),
-            }
+                strict: tool
+                    .get("strict")
+                    .and_then(Value::as_bool)
+                    .or_else(|| function.and_then(|func| func.get("strict").and_then(Value::as_bool))),
+            })
         })
         .collect()
 }
@@ -1815,17 +2039,21 @@ fn parse_gemini_tools(value: Option<&Value>) -> Vec<InternalTool> {
         for tool_set in tool_sets.iter().filter_map(Value::as_object) {
             if let Some(Value::Array(decls)) = tool_set.get("functionDeclarations") {
                 for decl in decls.iter().filter_map(Value::as_object) {
+                    let Some(name) = decl
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                    else {
+                        continue;
+                    };
                     tools.push(InternalTool {
-                        name: decl
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
+                        name: name.to_string(),
                         description: decl
                             .get("description")
                             .and_then(Value::as_str)
                             .map(ToString::to_string),
                         input_schema: decl.get("parameters").cloned().unwrap_or_else(|| json!({})),
+                        strict: None,
                     });
                 }
             }
@@ -1857,6 +2085,35 @@ fn openai_chat_message(message: &InternalMessage) -> Value {
                     ("image_url".to_string(), Value::Object(image)),
                 ])));
             }
+            InternalContentBlock::File {
+                file_id,
+                url: _,
+                data,
+                media_type,
+                filename,
+            } => {
+                let mut file = Map::new();
+                if let Some(file_id) = file_id {
+                    file.insert("file_id".to_string(), Value::String(file_id.clone()));
+                } else if let Some(data) = data {
+                    file.insert(
+                        "file_data".to_string(),
+                        Value::String(file_data_url(data, media_type.as_deref())),
+                    );
+                }
+                if let Some(filename) = filename {
+                    file.insert("filename".to_string(), Value::String(filename.clone()));
+                }
+                if !file.is_empty() {
+                    rich_parts.push(json!({"type":"file","file":Value::Object(file)}));
+                }
+            }
+            InternalContentBlock::Audio { data, format } => {
+                rich_parts.push(json!({
+                    "type": "input_audio",
+                    "input_audio": {"data": data, "format": format}
+                }));
+            }
             InternalContentBlock::ToolCall {
                 id,
                 name,
@@ -1875,10 +2132,9 @@ fn openai_chat_message(message: &InternalMessage) -> Value {
         }
     }
     if msg.get("content").is_none() {
-        if rich_parts
-            .iter()
-            .any(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
-        {
+        if rich_parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) != Some("text")
+        }) {
             msg.insert("content".to_string(), Value::Array(rich_parts));
         } else {
             msg.insert("content".to_string(), Value::String(text_parts.join("\n")));
@@ -1890,13 +2146,28 @@ fn openai_chat_message(message: &InternalMessage) -> Value {
     Value::Object(msg)
 }
 
-fn claude_message(message: &InternalMessage) -> Value {
+fn claude_message(message: &InternalMessage) -> Option<Value> {
     let parts = message
         .content
         .iter()
         .filter_map(|block| match block {
             InternalContentBlock::Text(text) => Some(json!({"type":"text","text": text})),
             InternalContentBlock::ImageUrl { url, .. } => Some(claude_image_block(url)),
+            InternalContentBlock::File {
+                file_id,
+                url,
+                data,
+                media_type,
+                filename,
+            } => (file_id.is_none() && (url.is_some() || data.is_some())).then(|| {
+                claude_document_block(
+                    url.as_deref(),
+                    data.as_deref(),
+                    media_type.as_deref(),
+                    filename.as_deref(),
+                )
+            }),
+            InternalContentBlock::Audio { .. } => None,
             InternalContentBlock::ToolCall {
                 id,
                 name,
@@ -1914,13 +2185,12 @@ fn claude_message(message: &InternalMessage) -> Value {
                 "tool_use_id": call_id,
                 "content": claude_tool_result_content(output)
             })),
-            _ => None,
         })
         .collect::<Vec<_>>();
-    json!({
+    (!parts.is_empty()).then(|| json!({
         "role": if message.role == "assistant" { "assistant" } else { "user" },
         "content": parts
-    })
+    }))
 }
 
 fn split_image_data_url(url: &str) -> Option<(&str, &str)> {
@@ -1939,6 +2209,63 @@ fn claude_image_block(url: &str) -> Value {
     } else {
         json!({"type":"image","source":{"type":"url","url":url}})
     }
+}
+
+fn file_data_url(data: &str, media_type: Option<&str>) -> String {
+    if data.starts_with("data:") {
+        data.to_string()
+    } else {
+        format!(
+            "data:{};base64,{}",
+            media_type.unwrap_or("application/octet-stream"),
+            data
+        )
+    }
+}
+
+fn parse_file_data(data: &str) -> (String, Option<String>) {
+    if let Some((media_type, payload)) = split_image_data_url(data) {
+        return (payload.to_string(), Some(media_type.to_string()));
+    }
+    (data.to_string(), None)
+}
+
+fn format_to_audio_mime(format: &str) -> String {
+    match format {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        other if other.starts_with("audio/") => other,
+        other => return format!("audio/{other}"),
+    }
+    .to_string()
+}
+
+fn claude_document_block(
+    url: Option<&str>,
+    data: Option<&str>,
+    media_type: Option<&str>,
+    filename: Option<&str>,
+) -> Value {
+    let mut block = if let Some(data) = data {
+        let data_url = file_data_url(data, media_type.or(Some("application/pdf")));
+        let (media_type, data) = split_image_data_url(&data_url)
+            .unwrap_or((media_type.unwrap_or("application/pdf"), data));
+        json!({
+            "type": "document",
+            "source": {"type": "base64", "media_type": media_type, "data": data}
+        })
+    } else {
+        json!({
+            "type": "document",
+            "source": {"type": "url", "url": url.unwrap_or_default()}
+        })
+    };
+    if let Some(filename) = filename {
+        block["title"] = Value::String(filename.to_string());
+    }
+    block
 }
 
 fn openai_tool_result_content(output: &Value) -> Value {
@@ -2002,6 +2329,38 @@ fn responses_message(message: &InternalMessage) -> Value {
                     part.insert("detail".to_string(), Value::String(detail.clone()));
                 }
                 content.push(Value::Object(part));
+            }
+            InternalContentBlock::File {
+                file_id,
+                url,
+                data,
+                media_type,
+                filename,
+            } => {
+                let mut part = Map::new();
+                part.insert("type".to_string(), Value::String("input_file".to_string()));
+                if let Some(file_id) = file_id {
+                    part.insert("file_id".to_string(), Value::String(file_id.clone()));
+                } else if let Some(data) = data {
+                    part.insert(
+                        "file_data".to_string(),
+                        Value::String(file_data_url(data, media_type.as_deref())),
+                    );
+                } else if let Some(url) = url {
+                    part.insert("file_url".to_string(), Value::String(url.clone()));
+                }
+                if let Some(filename) = filename {
+                    part.insert("filename".to_string(), Value::String(filename.clone()));
+                }
+                if part.len() > 1 {
+                    content.push(Value::Object(part));
+                }
+            }
+            InternalContentBlock::Audio { data, format } => {
+                content.push(json!({
+                    "type": "input_audio",
+                    "input_audio": {"data": data, "format": format}
+                }));
             }
             InternalContentBlock::ToolCall {
                 id,
@@ -2067,6 +2426,37 @@ fn gemini_message(message: &InternalMessage) -> Option<Value> {
                     "response": output
                 }
             })),
+            InternalContentBlock::File {
+                file_id,
+                url,
+                data,
+                media_type,
+                ..
+            } => {
+                if file_id.is_some() {
+                    None
+                } else if let Some(data) = data {
+                    Some(json!({
+                        "inlineData": {
+                            "mimeType": media_type.as_deref().unwrap_or("application/octet-stream"),
+                            "data": data
+                        }
+                    }))
+                } else {
+                    url.as_ref().map(|url| json!({
+                        "fileData": {
+                            "mimeType": media_type.as_deref().unwrap_or("application/octet-stream"),
+                            "fileUri": url
+                        }
+                    }))
+                }
+            }
+            InternalContentBlock::Audio { data, format } => Some(json!({
+                "inlineData": {
+                    "mimeType": format_to_audio_mime(format),
+                    "data": data
+                }
+            })),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2080,13 +2470,17 @@ fn gemini_message(message: &InternalMessage) -> Option<Value> {
 }
 
 fn openai_tool(tool: &InternalTool) -> Value {
+    let mut function = json!({
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": normalize_openai_input_schema(&tool.input_schema)
+    });
+    if let Some(strict) = tool.strict {
+        function["strict"] = Value::Bool(strict);
+    }
     json!({
         "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.input_schema
-        }
+        "function": function
     })
 }
 
@@ -2099,19 +2493,23 @@ fn claude_tool(tool: &InternalTool) -> Value {
 }
 
 fn responses_tool(tool: &InternalTool) -> Value {
-    json!({
+    let mut output = json!({
         "type": "function",
         "name": tool.name,
         "description": tool.description,
-        "parameters": tool.input_schema
-    })
+        "parameters": normalize_openai_input_schema(&tool.input_schema)
+    });
+    if let Some(strict) = tool.strict {
+        output["strict"] = Value::Bool(strict);
+    }
+    output
 }
 
 fn gemini_tool_decl(tool: &InternalTool) -> Value {
     json!({
         "name": tool.name,
         "description": tool.description,
-        "parameters": tool.input_schema
+        "parameters": normalize_openai_input_schema(&tool.input_schema)
     })
 }
 
@@ -2154,119 +2552,414 @@ fn normalize_claude_input_schema(schema: &Value) -> Value {
     Value::Object(schema)
 }
 
-fn normalize_tool_choice_for_claude(tool_choice: &Value) -> Value {
-    match tool_choice {
-        Value::String(mode) => match mode.as_str() {
-            "auto" => json!({"type": "auto"}),
-            "required" => json!({"type": "any"}),
-            "none" => json!({"type": "auto"}),
-            other => json!({"type": other}),
-        },
-        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
-            Some("function") => {
-                let name = choice.get("name").and_then(Value::as_str).or_else(|| {
-                    choice
-                        .get("function")
-                        .and_then(Value::as_object)
-                        .and_then(|function| function.get("name").and_then(Value::as_str))
-                });
-                name.map(|name| json!({"type": "tool", "name": name}))
-                    .unwrap_or_else(|| json!({"type": "any"}))
-            }
-            Some("tool") if choice.get("name").and_then(Value::as_str).is_some() => {
-                json!({"type": "tool", "name": choice.get("name").and_then(Value::as_str).unwrap_or_default()})
-            }
-            Some("auto" | "any") => {
-                json!({"type": choice.get("type").and_then(Value::as_str).unwrap_or_default()})
-            }
-            _ => tool_choice.clone(),
-        },
-        _ => tool_choice.clone(),
+fn normalize_openai_input_schema(schema: &Value) -> Value {
+    let mut schema = match schema {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        schema.insert("type".to_string(), Value::String("object".to_string()));
+    }
+    if !matches!(schema.get("properties"), Some(Value::Object(_))) {
+        schema.insert("properties".to_string(), Value::Object(Map::new()));
+    }
+    Value::Object(schema)
+}
+
+fn normalize_tool_choice_for_openai_chat(tool_choice: &Value) -> Option<Value> {
+    match normalize_tool_choice(tool_choice)? {
+        NormalizedToolChoice::Auto => Some(json!("auto")),
+        NormalizedToolChoice::None => Some(json!("none")),
+        NormalizedToolChoice::Required => Some(json!("required")),
+        NormalizedToolChoice::Tool(name) => Some(json!({
+            "type": "function",
+            "function": {"name": name}
+        })),
     }
 }
 
-fn normalize_tool_choice_for_openai_responses(tool_choice: &Value) -> Value {
-    match tool_choice {
-        Value::String(_) => tool_choice.clone(),
-        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
-            Some("function") => {
-                if let Some(name) = choice.get("name").and_then(Value::as_str).or_else(|| {
-                    choice
-                        .get("function")
-                        .and_then(Value::as_object)
-                        .and_then(|function| function.get("name").and_then(Value::as_str))
-                }) {
-                    json!({"type": "function", "name": name})
-                } else {
-                    tool_choice.clone()
+fn normalize_tool_choice_for_claude(tool_choice: &Value) -> Option<Value> {
+    match normalize_tool_choice(tool_choice)? {
+        NormalizedToolChoice::Auto => Some(json!({"type": "auto"})),
+        NormalizedToolChoice::Required => Some(json!({"type": "any"})),
+        NormalizedToolChoice::Tool(name) => Some(json!({"type": "tool", "name": name})),
+        // Anthropic has no `none` tool-choice mode. Omitting it is safer than
+        // sending a non-Anthropic discriminator and is consistent with the
+        // whitelist rule for unsupported target fields.
+        NormalizedToolChoice::None => None,
+    }
+}
+
+fn normalize_tool_choice_for_openai_responses(tool_choice: &Value) -> Option<Value> {
+    match normalize_tool_choice(tool_choice)? {
+        NormalizedToolChoice::Auto => Some(json!("auto")),
+        NormalizedToolChoice::None => Some(json!("none")),
+        NormalizedToolChoice::Required => Some(json!("required")),
+        NormalizedToolChoice::Tool(name) => Some(json!({"type": "function", "name": name})),
+    }
+}
+
+fn normalize_tool_choice_for_gemini(tool_choice: &Value) -> Option<Value> {
+    if let Value::Object(choice) = tool_choice {
+        if let Some(config) = choice.get("functionCallingConfig").and_then(Value::as_object) {
+            let mode = config.get("mode").and_then(Value::as_str)?;
+            if !matches!(mode, "AUTO" | "NONE" | "ANY") {
+                return None;
+            }
+            let mut normalized = Map::new();
+            normalized.insert("mode".to_string(), Value::String(mode.to_string()));
+            if mode == "ANY" {
+                if let Some(names) = config.get("allowedFunctionNames").and_then(Value::as_array) {
+                    let names = names
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .map(|name| Value::String(name.to_string()))
+                        .collect::<Vec<_>>();
+                    if !names.is_empty() {
+                        normalized.insert("allowedFunctionNames".to_string(), Value::Array(names));
+                    }
                 }
             }
-            Some("tool") => choice
-                .get("name")
-                .and_then(Value::as_str)
-                .map(|name| json!({"type": "function", "name": name}))
-                .unwrap_or_else(|| tool_choice.clone()),
-            _ => tool_choice.clone(),
-        },
-        _ => tool_choice.clone(),
+            return Some(json!({"functionCallingConfig": normalized}));
+        }
     }
+
+    let config = match normalize_tool_choice(tool_choice)? {
+        NormalizedToolChoice::Auto => json!({"mode": "AUTO"}),
+        NormalizedToolChoice::None => json!({"mode": "NONE"}),
+        NormalizedToolChoice::Required => json!({"mode": "ANY"}),
+        NormalizedToolChoice::Tool(name) => {
+            json!({"mode": "ANY", "allowedFunctionNames": [name]})
+        }
+    };
+
+    Some(json!({"functionCallingConfig": config}))
 }
 
-fn normalize_claude_thinking_for_openai(thinking: Option<&Value>) -> Option<Value> {
-    let thinking = thinking?.as_object()?;
-    match thinking.get("type").and_then(Value::as_str) {
-        Some("enabled") => {
-            let budget_tokens = thinking.get("budget_tokens").and_then(Value::as_i64)?;
-            Some(json!({"max_tokens": budget_tokens}))
+fn normalize_tool_choice(tool_choice: &Value) -> Option<NormalizedToolChoice> {
+    match tool_choice {
+        Value::String(mode) => normalize_tool_choice_mode(mode),
+        Value::Object(choice) => {
+            if let Some(config) = choice.get("functionCallingConfig").and_then(Value::as_object) {
+                let mode = config.get("mode").and_then(Value::as_str)?;
+                return match mode {
+                    "AUTO" => Some(NormalizedToolChoice::Auto),
+                    "NONE" => Some(NormalizedToolChoice::None),
+                    "ANY" => {
+                        let names = config
+                            .get("allowedFunctionNames")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .collect::<Vec<_>>();
+                        if names.len() == 1 {
+                            Some(NormalizedToolChoice::Tool(names[0].to_string()))
+                        } else {
+                            Some(NormalizedToolChoice::Required)
+                        }
+                    }
+                    _ => None,
+                };
+            }
+
+            match choice.get("type").and_then(Value::as_str) {
+                Some("function") | Some("tool") => choice
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        choice
+                            .get("function")
+                            .and_then(Value::as_object)
+                            .and_then(|function| function.get("name").and_then(Value::as_str))
+                    })
+                    .filter(|name| !name.is_empty())
+                    .map(|name| NormalizedToolChoice::Tool(name.to_string())),
+                Some(mode) => normalize_tool_choice_mode(mode),
+                None => None,
+            }
         }
         _ => None,
     }
 }
 
-fn normalize_extra_for_openai_chat(extra: &Map<String, Value>) -> Map<String, Value> {
-    if extra.is_empty() {
-        return Map::new();
+fn normalize_tool_choice_mode(mode: &str) -> Option<NormalizedToolChoice> {
+    match mode {
+        "auto" => Some(NormalizedToolChoice::Auto),
+        "none" => Some(NormalizedToolChoice::None),
+        "required" | "any" => Some(NormalizedToolChoice::Required),
+        _ => None,
+    }
+}
+
+fn normalize_claude_reasoning_effort(
+    thinking: Option<&Value>,
+    extra: &Map<String, Value>,
+) -> Option<&'static str> {
+    if let Some(effort) = extra
+        .get("output_config")
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+    {
+        return match effort {
+            "low" => Some("low"),
+            "medium" => Some("medium"),
+            "high" => Some("high"),
+            "max" => Some("xhigh"),
+            _ => None,
+        };
     }
 
-    let mut out = extra.clone();
-    if !out.contains_key("stop") {
-        if let Some(stop_sequences) = out.get("stop_sequences").cloned() {
-            out.insert("stop".to_string(), stop_sequences);
+    let thinking = thinking?.as_object()?;
+    match thinking.get("type").and_then(Value::as_str) {
+        Some("adaptive") => Some("xhigh"),
+        Some("enabled") => match thinking.get("budget_tokens").and_then(Value::as_u64) {
+            Some(budget) if budget < 4_000 => Some("low"),
+            Some(budget) if budget < 16_000 => Some("medium"),
+            Some(_) | None => Some("high"),
+        },
+        _ => None,
+    }
+}
+
+fn supports_reasoning_effort(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    is_openai_o_series(&model)
+        || model
+            .strip_prefix("gpt-")
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|character| character.is_ascii_digit() && character >= '5')
+        || model == "grok-4.5"
+        || model.starts_with("grok-4.5-")
+        || model.starts_with("grok-build-")
+}
+
+fn normalize_claude_thinking_for_claude(thinking: Option<&Value>) -> Option<Value> {
+    let thinking = thinking?.as_object()?;
+    let kind = thinking.get("type").and_then(Value::as_str)?;
+    if !matches!(kind, "enabled" | "disabled" | "adaptive") {
+        return None;
+    }
+    let mut out = Map::new();
+    out.insert("type".to_string(), Value::String(kind.to_string()));
+    if let Some(budget_tokens) = thinking.get("budget_tokens") {
+        if budget_tokens.as_u64().is_some() {
+            out.insert("budget_tokens".to_string(), budget_tokens.clone());
+        }
+    }
+    Some(Value::Object(out))
+}
+
+fn normalize_openai_response_format(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let kind = object.get("type").and_then(Value::as_str)?;
+    match kind {
+        "text" | "json_object" => Some(json!({"type": kind})),
+        "json_schema" => {
+            let schema = object
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut json_schema = Map::new();
+            for key in ["name", "description", "schema", "strict"] {
+                if let Some(value) = schema.get(key) {
+                    json_schema.insert(key.to_string(), value.clone());
+                }
+            }
+            if !json_schema.contains_key("name") {
+                json_schema.insert("name".to_string(), Value::String("response".to_string()));
+            }
+            if !json_schema.contains_key("schema") {
+                json_schema.insert("schema".to_string(), json!({}));
+            }
+            Some(json!({"type": "json_schema", "json_schema": json_schema}))
+        }
+        _ => None,
+    }
+}
+
+fn normalize_claude_output_config(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let effort = object.get("effort").and_then(Value::as_str)?;
+    if !matches!(effort, "low" | "medium" | "high" | "max") {
+        return None;
+    }
+    Some(json!({"effort": effort}))
+}
+
+fn normalize_claude_context_management(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let edits = object.get("edits").and_then(Value::as_array)?;
+    Some(json!({"edits": edits}))
+}
+
+fn normalize_extra_for_openai_chat(extra: &Map<String, Value>, model: &str) -> Map<String, Value> {
+    let mut out = Map::new();
+    copy_allowed_keys(
+        &mut out,
+        extra,
+        &[
+            "frequency_penalty",
+            "logit_bias",
+            "logprobs",
+            "metadata",
+            "n",
+            "parallel_tool_calls",
+            "presence_penalty",
+            "response_format",
+            "reasoning_effort",
+            "seed",
+            "service_tier",
+            "stop",
+            "temperature",
+            "top_p",
+            "top_logprobs",
+            "user",
+            "max_tokens",
+            "max_completion_tokens",
+        ],
+    );
+    if let Some(response_format) = extra
+        .get("response_format")
+        .and_then(normalize_openai_response_format)
+    {
+        out.insert("response_format".to_string(), response_format);
+    } else {
+        out.remove("response_format");
+    }
+
+    if !out.contains_key("max_tokens") && !out.contains_key("max_completion_tokens") {
+        if let Some(value) = extra.get("max_output_tokens") {
+            let key = if is_openai_o_series(model) {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            out.insert(key.to_string(), value.clone());
         }
     }
 
-    remove_non_openai_extra(&mut out);
-    out.remove("stop_sequences");
-    out.remove("top_k");
-    out.remove("mcp_servers");
-    out.remove("container");
+    if let Some(Value::Object(generation_config)) = extra.get("generationConfig") {
+        if !out.contains_key("max_tokens") && !out.contains_key("max_completion_tokens") {
+            if let Some(value) = generation_config.get("maxOutputTokens") {
+                let key = if is_openai_o_series(model) {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+                out.insert(key.to_string(), value.clone());
+            }
+        }
+        copy_if_missing(&mut out, generation_config, "temperature", "temperature");
+        copy_if_missing(&mut out, generation_config, "topP", "top_p");
+        if !out.contains_key("stop") {
+            copy_if_missing(&mut out, generation_config, "stopSequences", "stop");
+        }
+        if !out.contains_key("seed") {
+            copy_if_missing(&mut out, generation_config, "seed", "seed");
+        }
+        if !out.contains_key("frequency_penalty") {
+            copy_if_missing(
+                &mut out,
+                generation_config,
+                "frequencyPenalty",
+                "frequency_penalty",
+            );
+        }
+        if !out.contains_key("presence_penalty") {
+            copy_if_missing(
+                &mut out,
+                generation_config,
+                "presencePenalty",
+                "presence_penalty",
+            );
+        }
+        if !out.contains_key("response_format") {
+            if let Some(response_format) = response_format_from_gemini_generation(generation_config)
+            {
+                out.insert("response_format".to_string(), response_format);
+            }
+        }
+    }
+
+    if !out.contains_key("stop") {
+        if let Some(stop_sequences) = extra.get("stop_sequences") {
+            out.insert("stop".to_string(), stop_sequences.clone());
+        }
+    }
+
+    if let Some(Value::Object(options)) = extra.get("stream_options") {
+        let mut filtered = Map::new();
+        copy_allowed_keys(&mut filtered, options, &["include_usage"]);
+        if !filtered.is_empty() {
+            out.insert("stream_options".to_string(), Value::Object(filtered));
+        }
+    }
+
     out
 }
 
 fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<String, Value> {
-    if extra.is_empty() {
-        return Map::new();
-    }
+    let mut out = Map::new();
+    copy_allowed_keys(
+        &mut out,
+        extra,
+        &[
+            "metadata",
+            "parallel_tool_calls",
+            "reasoning",
+            "service_tier",
+            "store",
+            "temperature",
+            "top_p",
+            "user",
+            "include",
+            "prompt_cache_key",
+            "previous_response_id",
+            "conversation",
+            "background",
+            "max_tool_calls",
+            "truncation",
+        ],
+    );
 
-    let mut out = extra.clone();
-    remove_non_openai_extra(&mut out);
-
-    if !out.contains_key("max_output_tokens") {
-        let maybe_max = out
-            .get("max_tokens")
-            .and_then(Value::as_i64)
-            .or_else(|| out.get("max_completion_tokens").and_then(Value::as_i64));
-        if let Some(max_output_tokens) = maybe_max {
-            out.insert(
-                "max_output_tokens".to_string(),
-                Value::Number(max_output_tokens.into()),
-            );
+    if !out.contains_key("reasoning") {
+        if let Some(effort) = extra
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .filter(|effort| matches!(*effort, "low" | "medium" | "high" | "xhigh"))
+        {
+            out.insert("reasoning".to_string(), json!({"effort": effort}));
         }
     }
-    out.remove("max_tokens");
-    out.remove("max_completion_tokens");
 
-    let response_format = out.remove("response_format");
+    if let Some(text) = extra.get("text").and_then(normalize_responses_text_parameter) {
+        out.insert("text".to_string(), text);
+    }
+
+    if let Some(value) = extra
+        .get("max_output_tokens")
+        .or_else(|| extra.get("max_tokens"))
+        .or_else(|| extra.get("max_completion_tokens"))
+    {
+        out.insert("max_output_tokens".to_string(), value.clone());
+    }
+
+    if let Some(Value::Object(generation_config)) = extra.get("generationConfig") {
+        if !out.contains_key("max_output_tokens") {
+            if let Some(value) = generation_config.get("maxOutputTokens") {
+                out.insert("max_output_tokens".to_string(), value.clone());
+            }
+        }
+        copy_if_missing(&mut out, generation_config, "temperature", "temperature");
+        copy_if_missing(&mut out, generation_config, "topP", "top_p");
+    }
+
+    let response_format = extra.get("response_format");
     if let Some(response_format) = response_format {
         if !out.contains_key("text") {
             if let Some(text) = normalize_responses_text_format(&response_format) {
@@ -2275,32 +2968,271 @@ fn normalize_extra_for_openai_responses(extra: &Map<String, Value>) -> Map<Strin
         }
     }
 
-    if let Some(Value::Object(stream_options)) = out.get_mut("stream_options") {
-        stream_options.remove("include_usage");
-        if stream_options.is_empty() {
-            out.remove("stream_options");
+    out
+}
+
+fn normalize_extra_for_claude(extra: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = Map::new();
+    copy_allowed_keys(
+        &mut out,
+        extra,
+        &[
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "metadata",
+            "service_tier",
+        ],
+    );
+
+    if let Some(output_config) = extra
+        .get("output_config")
+        .and_then(normalize_claude_output_config)
+    {
+        out.insert("output_config".to_string(), output_config);
+    }
+    if let Some(context_management) = extra
+        .get("context_management")
+        .and_then(normalize_claude_context_management)
+    {
+        out.insert("context_management".to_string(), context_management);
+    }
+
+    if !out.contains_key("max_tokens") {
+        if let Some(value) = extra
+            .get("max_output_tokens")
+            .or_else(|| extra.get("max_completion_tokens"))
+        {
+            out.insert("max_tokens".to_string(), value.clone());
         }
     }
 
-    for key in [
-        "messages",
-        "n",
-        "stop",
-        "frequency_penalty",
-        "presence_penalty",
-        "logit_bias",
-        "logprobs",
-    ] {
-        out.remove(key);
+    if let Some(Value::Object(generation_config)) = extra.get("generationConfig") {
+        if !out.contains_key("max_tokens") {
+            if let Some(value) = generation_config.get("maxOutputTokens") {
+                out.insert("max_tokens".to_string(), value.clone());
+            }
+        }
+        copy_if_missing(&mut out, generation_config, "temperature", "temperature");
+        copy_if_missing(&mut out, generation_config, "topP", "top_p");
+        if !out.contains_key("stop_sequences") {
+            copy_if_missing(
+                &mut out,
+                generation_config,
+                "stopSequences",
+                "stop_sequences",
+            );
+        }
+    }
+
+    if let Some(stop) = extra.get("stop") {
+        out.insert("stop_sequences".to_string(), stop.clone());
+    } else if let Some(stop_sequences) = extra.get("stop_sequences") {
+        out.insert("stop_sequences".to_string(), stop_sequences.clone());
     }
 
     out
 }
 
-fn remove_non_openai_extra(out: &mut Map<String, Value>) {
-    for key in ["anthropic_version", "context_management", "output_config"] {
-        out.remove(key);
+fn normalize_extra_for_gemini(extra: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = Map::new();
+    let mut generation_config = Map::new();
+
+    if let Some(Value::Object(existing)) = extra.get("generationConfig") {
+        copy_allowed_keys(
+            &mut generation_config,
+            existing,
+            &[
+                "candidateCount",
+                "maxOutputTokens",
+                "temperature",
+                "topP",
+                "topK",
+                "stopSequences",
+                "responseMimeType",
+                "responseSchema",
+                "presencePenalty",
+                "frequencyPenalty",
+                "seed",
+                "responseLogprobs",
+                "logprobs",
+                "thinkingConfig",
+            ],
+        );
     }
+    if let Some(value) = extra
+        .get("max_tokens")
+        .or_else(|| extra.get("max_output_tokens"))
+        .or_else(|| extra.get("max_completion_tokens"))
+    {
+        generation_config.insert("maxOutputTokens".to_string(), value.clone());
+    }
+    copy_alias(&mut generation_config, extra, "temperature", "temperature");
+    copy_alias(&mut generation_config, extra, "top_p", "topP");
+    copy_alias(&mut generation_config, extra, "top_k", "topK");
+    copy_alias(&mut generation_config, extra, "stop_sequences", "stopSequences");
+    if !generation_config.contains_key("stopSequences") {
+        copy_alias(&mut generation_config, extra, "stop", "stopSequences");
+    }
+    copy_alias(
+        &mut generation_config,
+        extra,
+        "presence_penalty",
+        "presencePenalty",
+    );
+    copy_alias(
+        &mut generation_config,
+        extra,
+        "frequency_penalty",
+        "frequencyPenalty",
+    );
+    copy_alias(&mut generation_config, extra, "seed", "seed");
+
+    if !generation_config.contains_key("responseMimeType") {
+        if let Some(response_format) = extra.get("response_format") {
+            if let Some((mime_type, schema)) = gemini_response_format(response_format) {
+                generation_config.insert("responseMimeType".to_string(), json!(mime_type));
+                if let Some(schema) = schema {
+                    generation_config.insert("responseSchema".to_string(), schema);
+                }
+            }
+        }
+    }
+
+    if !generation_config.is_empty() {
+        out.insert(
+            "generationConfig".to_string(),
+            Value::Object(generation_config),
+        );
+    }
+    if let Some(value) = extra.get("safetySettings") {
+        out.insert("safetySettings".to_string(), value.clone());
+    }
+    if let Some(value) = extra.get("cachedContent").and_then(Value::as_str) {
+        out.insert("cachedContent".to_string(), Value::String(value.to_string()));
+    }
+
+    out
+}
+
+fn copy_allowed_keys(
+    target: &mut Map<String, Value>,
+    source: &Map<String, Value>,
+    allowed: &[&str],
+) {
+    for key in allowed {
+        if let Some(value) = source.get(*key) {
+            target.insert((*key).to_string(), value.clone());
+        }
+    }
+}
+
+fn copy_alias(
+    target: &mut Map<String, Value>,
+    source: &Map<String, Value>,
+    source_key: &str,
+    target_key: &str,
+) {
+    if let Some(value) = source.get(source_key) {
+        target.insert(target_key.to_string(), value.clone());
+    }
+}
+
+fn copy_if_missing(
+    target: &mut Map<String, Value>,
+    source: &Map<String, Value>,
+    source_key: &str,
+    target_key: &str,
+) {
+    if !target.contains_key(target_key) {
+        if let Some(value) = source.get(source_key) {
+            target.insert(target_key.to_string(), value.clone());
+        }
+    }
+}
+
+fn is_openai_o_series(model: &str) -> bool {
+    model.len() > 1
+        && model.starts_with('o')
+        && model.as_bytes().get(1).is_some_and(|byte| byte.is_ascii_digit())
+}
+
+fn normalize_responses_text_parameter(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let mut out = Map::new();
+    if let Some(verbosity) = object.get("verbosity").and_then(Value::as_str) {
+        if matches!(verbosity, "low" | "medium" | "high") {
+            out.insert("verbosity".to_string(), Value::String(verbosity.to_string()));
+        }
+    }
+    if let Some(format) = object.get("format").and_then(normalize_responses_format) {
+        out.insert("format".to_string(), format);
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+fn normalize_responses_format(value: &Value) -> Option<Value> {
+    let object = value.as_object()?;
+    let kind = object.get("type").and_then(Value::as_str)?;
+    let mut out = Map::new();
+    match kind {
+        "text" | "json_object" => {
+            out.insert("type".to_string(), Value::String(kind.to_string()));
+        }
+        "json_schema" => {
+            out.insert("type".to_string(), Value::String(kind.to_string()));
+            for key in ["name", "description", "schema", "strict"] {
+                if let Some(value) = object.get(key) {
+                    out.insert(key.to_string(), value.clone());
+                }
+            }
+            if !out.contains_key("name") {
+                out.insert("name".to_string(), Value::String("response".to_string()));
+            }
+            if !out.contains_key("schema") {
+                out.insert("schema".to_string(), json!({}));
+            }
+        }
+        _ => return None,
+    }
+    Some(Value::Object(out))
+}
+
+fn gemini_response_format(value: &Value) -> Option<(&'static str, Option<Value>)> {
+    let object = value.as_object()?;
+    match object.get("type").and_then(Value::as_str)? {
+        "json_object" => Some(("application/json", None)),
+        "json_schema" => {
+            let schema = object
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .and_then(|schema| schema.get("schema"))
+                .cloned()
+                .or_else(|| Some(json!({})));
+            Some(("application/json", schema))
+        }
+        "text" => Some(("text/plain", None)),
+        _ => None,
+    }
+}
+
+fn response_format_from_gemini_generation(generation_config: &Map<String, Value>) -> Option<Value> {
+    if generation_config.get("responseMimeType").and_then(Value::as_str)
+        != Some("application/json")
+    {
+        return None;
+    }
+    if let Some(schema) = generation_config.get("responseSchema") {
+        return Some(json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response",
+                "schema": schema
+            }
+        }));
+    }
+    Some(json!({"type": "json_object"}))
 }
 
 fn normalize_responses_text_format(response_format: &Value) -> Option<Value> {
@@ -2524,7 +3456,7 @@ mod tests {
             }
         });
         let body = json!({
-            "model": "gpt-4.1-mini",
+            "model": "gpt-5",
             "thinking": {
                 "type": "enabled",
                 "budget_tokens": 2048
@@ -2537,10 +3469,7 @@ mod tests {
 
         assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
         assert_eq!(plan.body.get("thinking"), None);
-        assert_eq!(
-            plan.body.get("reasoning"),
-            Some(&json!({"max_tokens": 2048}))
-        );
+        assert_eq!(plan.body.get("reasoning_effort"), Some(&json!("low")));
     }
 
     #[test]
@@ -2587,7 +3516,7 @@ mod tests {
             }
         });
         let body = json!({
-            "model": "gpt-4.1-mini",
+            "model": "gpt-5",
             "thinking": {
                 "type": "enabled",
                 "budget_tokens": 1024
@@ -2600,9 +3529,6 @@ mod tests {
 
         assert_eq!(plan.target_format, Some(RequestFormat::OpenAiResponses));
         assert_eq!(plan.body.get("thinking"), None);
-        assert_eq!(
-            plan.body.get("reasoning"),
-            Some(&json!({"max_tokens": 1024}))
-        );
+        assert_eq!(plan.body.get("reasoning"), Some(&json!({"effort": "low"})));
     }
 }
