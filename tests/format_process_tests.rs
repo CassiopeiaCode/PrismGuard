@@ -807,6 +807,27 @@ fn claude_target_preserves_strict_tools_and_disables_parallel_tool_use() {
 }
 
 #[test]
+fn unknown_claude_tool_choice_degrades_to_auto_without_passthrough() {
+    let plan = process_request(
+        &transform_config(true, "claude_chat"),
+        "/v1/chat/completions",
+        &[],
+        json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "Use a tool"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {"type": "object"}
+            }}],
+            "tool_choice": {"type": "allowed_tools", "tools": []}
+        }),
+    )
+    .expect("request should transform with a safe tool choice fallback");
+
+    assert_eq!(plan.body["tool_choice"], json!({"type": "auto"}));
+}
+
+#[test]
 fn openai_responses_tool_items_include_completed_status_like_python() {
     let config = json!({
         "format_transform": {

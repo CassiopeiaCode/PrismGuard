@@ -2632,7 +2632,7 @@ fn normalize_tool_choice_for_openai_chat(tool_choice: &Value) -> Option<Value> {
 }
 
 fn normalize_tool_choice_for_claude(tool_choice: &Value) -> Option<Value> {
-    match normalize_tool_choice(tool_choice)? {
+    match normalize_tool_choice(tool_choice).unwrap_or(NormalizedToolChoice::Auto) {
         NormalizedToolChoice::Auto => Some(json!({"type": "auto"})),
         NormalizedToolChoice::Required => Some(json!({"type": "any"})),
         NormalizedToolChoice::Tool(name) => Some(json!({"type": "tool", "name": name})),
