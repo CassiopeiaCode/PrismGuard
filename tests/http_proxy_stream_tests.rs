@@ -553,7 +553,7 @@ async fn delay_stream_header_returns_json_error_before_committing_empty_stream()
 }
 
 #[tokio::test]
-async fn delay_stream_header_rejects_too_short_stream_content_like_python() {
+async fn delay_stream_header_allows_one_char_stream_content_like_python() {
     let upstream_base = spawn_too_short_sse_upstream().await;
     let proxy_base = spawn_proxy_server().await;
     let config = percent_encode(
@@ -585,18 +585,66 @@ async fn delay_stream_header_rejects_too_short_stream_content_like_python() {
         .await
         .expect("proxy response");
 
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok()),
-        Some("application/json")
+        Some("text/event-stream")
     );
 
-    let body: serde_json::Value = response.json().await.expect("json body");
-    assert_eq!(body["error"]["code"], "UPSTREAM_STREAM_ERROR");
-    assert_eq!(body["error"]["type"], "upstream_stream_error");
+    let body = response.text().await.expect("sse body");
+    assert!(body.contains("\"content\":\"a\""), "{body}");
+}
+
+#[tokio::test]
+async fn delay_stream_header_allows_one_char_reasoning_stream_content() {
+    let upstream_base = spawn_one_char_reasoning_sse_upstream().await;
+    let proxy_base = spawn_proxy_server().await;
+    let config = percent_encode(
+        &json!({
+            "format_transform": {
+                "enabled": true,
+                "strict_parse": true,
+                "from": "openai_chat",
+                "to": "openai_responses",
+                "delay_stream_header": true
+            }
+        })
+        .to_string(),
+    );
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .expect("reqwest client")
+        .post(format!(
+            "{proxy_base}/{config}${upstream_base}/v1/chat/completions"
+        ))
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("proxy response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = response.text().await.expect("sse body");
+    assert!(
+        body.contains("\"reasoning_content\":\"a\""),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -1861,6 +1909,16 @@ async fn spawn_too_short_sse_upstream() -> String {
     let body = concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_short\",\"model\":\"gpt-4.1-mini\",\"created_at\":1710000000}}\n\n",
         "data: {\"type\":\"response.output_text.delta\",\"delta\":\"a\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    spawn_raw_sse_upstream(body).await
+}
+
+async fn spawn_one_char_reasoning_sse_upstream() -> String {
+    let body = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning_short\",\"model\":\"gpt-4.1-mini\",\"created_at\":1710000000}}\n\n",
+        "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"a\"}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
         "data: [DONE]\n\n"
     );

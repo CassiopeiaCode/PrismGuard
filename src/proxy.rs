@@ -37,6 +37,8 @@ const HEADER_DENYLIST: &[&str] = &[
     "referrer-policy",
 ];
 
+const MIN_VALID_RESPONSE_CHARS: usize = 1;
+
 pub async fn proxy_entry(
     State(state): State<AppState>,
     Path(cfg_and_upstream): Path<String>,
@@ -1026,7 +1028,7 @@ impl StreamPrecheck {
         self.pending.extend_from_slice(chunk);
         self.consume_complete_frames();
 
-        if self.has_tool_call || self.content_chars > 2 {
+        if self.has_tool_call || self.content_chars >= MIN_VALID_RESPONSE_CHARS {
             return StreamPrecheckStatus::Passed;
         }
         if self.total_bytes > 1048 {
@@ -1037,7 +1039,7 @@ impl StreamPrecheck {
 
     fn finish(&mut self) -> Option<String> {
         self.consume_trailing_frame();
-        if self.has_tool_call || self.content_chars > 2 {
+        if self.has_tool_call || self.content_chars >= MIN_VALID_RESPONSE_CHARS {
             return None;
         }
         if self.total_bytes == 0 {
@@ -1452,7 +1454,7 @@ fn validate_response_content(
         }
     }
 
-    if has_tool_call || accumulated_content.chars().count() > 2 {
+    if has_tool_call || accumulated_content.chars().count() >= MIN_VALID_RESPONSE_CHARS {
         return None;
     }
 
@@ -1626,7 +1628,7 @@ fn validate_stream_content(
             }
         }
 
-        if has_tool_call || accumulated_content.chars().count() > 2 {
+        if has_tool_call || accumulated_content.chars().count() >= MIN_VALID_RESPONSE_CHARS {
             return None;
         }
     }
@@ -1652,8 +1654,9 @@ fn empty_response_message_with_stats(
     format: Option<crate::format::RequestFormat>,
 ) -> String {
     format!(
-        "Response content validation failed: accumulated {} chars (threshold: 2), has_tool_call: {}. The AI response appears to be empty or too short.Format name: {}",
+        "Response content validation failed: accumulated {} chars (threshold: {}), has_tool_call: {}. The AI response appears to be empty or too short.Format name: {}",
         chars,
+        MIN_VALID_RESPONSE_CHARS,
         has_tool_call,
         response_format_name(format)
     )
