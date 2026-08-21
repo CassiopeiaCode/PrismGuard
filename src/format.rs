@@ -743,15 +743,17 @@ fn can_parse_openai_chat(
     if body.contains_key("system") || body.contains_key("anthropic_version") {
         return false;
     }
-    if let Some(Value::Array(messages)) = body.get("messages") {
-        for msg in messages.iter().filter_map(Value::as_object) {
-            if let Some(Value::Array(content)) = msg.get("content") {
-                if content
-                    .iter()
-                    .filter_map(Value::as_object)
-                    .any(|block| block.contains_key("cache_control"))
-                {
-                    return false;
+    if !path.contains("/chat/completions") {
+        if let Some(Value::Array(messages)) = body.get("messages") {
+            for msg in messages.iter().filter_map(Value::as_object) {
+                if let Some(Value::Array(content)) = msg.get("content") {
+                    if content
+                        .iter()
+                        .filter_map(Value::as_object)
+                        .any(|block| block.contains_key("cache_control"))
+                    {
+                        return false;
+                    }
                 }
             }
         }
