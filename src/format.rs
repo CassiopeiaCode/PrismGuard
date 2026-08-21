@@ -202,6 +202,17 @@ pub fn process_request(
             let diagnostics = request_format_diagnostics(&candidates, path, headers, &plan.body);
             if !diagnostics.is_empty() {
                 message.push_str(&format!(" Diagnostics: {}", diagnostics.join("; ")));
+            } else {
+                message.push_str(&format!(
+                    " Diagnostics: none of the required structural checks for {} matched the request body; JSON root keys: {}",
+                    expected_formats_label(from_cfg, &candidates),
+                    plan.body
+                        .as_object()
+                        .map(|object| {
+                            object.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+                        })
+                        .unwrap_or_else(|| format!("<{}>", json_type_name(&plan.body)))
+                ));
             }
 
             if !parse_errors.is_empty() {
@@ -390,6 +401,25 @@ fn openai_chat_diagnostics(
                 .to_string(),
         );
     }
+    if body.contains_key("system") {
+        diagnostics.push(
+            "JSON path '$.system': Claude-style system field is not valid for openai_chat detection"
+                .to_string(),
+        );
+    }
+
+    if let Some(Value::Array(contents)) = body.get("contents") {
+        if contents.iter().any(|item| {
+            item.as_object()
+                .and_then(|item| item.get("parts"))
+                .is_some()
+        }) {
+            diagnostics.push(
+                "JSON path '$.contents': Gemini-style contents/parts detected; expected '$.messages' for openai_chat"
+                    .to_string(),
+            );
+        }
+    }
 
     match body.get("messages") {
         None => diagnostics.push(
@@ -441,6 +471,41 @@ fn openai_chat_diagnostics(
                 "JSON path '$.model': expected a string, got {}",
                 json_type_name(value)
             ));
+        }
+    }
+
+    if let Some(Value::Array(messages)) = body.get("messages") {
+        for (index, message) in messages.iter().enumerate() {
+            let Some(message) = message.as_object() else {
+                continue;
+            };
+            if let Some(Value::Array(content)) = message.get("content") {
+                if content.iter().any(|part| {
+                    part.as_object()
+                        .is_some_and(|part| part.contains_key("cache_control"))
+                }) {
+                    diagnostics.push(format!(
+                        "JSON path '$.messages[{index}].content': contains Claude cache_control blocks, not openai_chat content"
+                    ));
+                }
+            }
+        }
+    }
+    if body.get("thinking").and_then(Value::as_object).is_some()
+        && !has_openai_chat_specific_signal(path, body)
+    {
+        diagnostics.push(
+            "JSON path '$.thinking': Claude thinking configuration detected; expected OpenAI chat signals such as '$.reasoning_effort'"
+                .to_string(),
+        );
+    }
+    if let Some(Value::Array(tools)) = body.get("tools") {
+        for (index, tool) in tools.iter().enumerate() {
+            if tool.get("input_schema").is_some() {
+                diagnostics.push(format!(
+                    "JSON path '$.tools[{index}].input_schema': Claude-style tool schema detected; expected OpenAI '$.tools[{index}].function.parameters'"
+                ));
+            }
         }
     }
 
