@@ -362,7 +362,9 @@ fn format_diagnostics(
 
     match format {
         RequestFormat::OpenAiChat => openai_chat_diagnostics(path, headers, object),
-        _ => Vec::new(),
+        RequestFormat::ClaudeChat => claude_chat_diagnostics(path, headers, object),
+        RequestFormat::OpenAiResponses => openai_responses_diagnostics(path, object),
+        RequestFormat::GeminiChat => gemini_chat_diagnostics(path, object),
     }
 }
 
@@ -454,6 +456,152 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
+}
+
+fn claude_chat_diagnostics(
+    path: &str,
+    headers: &[(String, String)],
+    body: &Map<String, Value>,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let is_claude_endpoint = path.contains("/messages")
+        || headers
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("anthropic-version"))
+        || body.contains_key("anthropic_version");
+    if !is_claude_endpoint && !body.contains_key("prompt") {
+        diagnostics.push(
+            "format 'claude_chat': expected an Anthropic messages endpoint, anthropic-version header, or '$.anthropic_version'"
+                .to_string(),
+        );
+    }
+    match body.get("messages") {
+        Some(Value::Array(messages)) => {
+            for (index, message) in messages.iter().enumerate() {
+                let path = format!("$.messages[{index}]");
+                let Some(message) = message.as_object() else {
+                    diagnostics.push(format!(
+                        "JSON path '{path}': expected an object, got {}",
+                        json_type_name(message)
+                    ));
+                    continue;
+                };
+                if message.get("role").and_then(Value::as_str).is_none() {
+                    diagnostics.push(format!(
+                        "JSON path '{path}.role': missing or invalid; expected a string"
+                    ));
+                }
+            }
+        }
+        Some(Value::String(_)) => {}
+        Some(value) => diagnostics.push(format!(
+            "JSON path '$.messages': expected an array or string, got {}",
+            json_type_name(value)
+        )),
+        None if !body.contains_key("prompt") => diagnostics.push(
+            "JSON path '$.messages': missing required field; expected an array of Claude messages"
+                .to_string(),
+        ),
+        None => {}
+    }
+    if let Some(value) = body.get("max_tokens") {
+        if value.as_u64().is_none() {
+            diagnostics.push(format!(
+                "JSON path '$.max_tokens': expected a non-negative integer, got {}",
+                json_type_name(value)
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn openai_responses_diagnostics(path: &str, body: &Map<String, Value>) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    if !path.contains("/responses") && !body.contains_key("input") {
+        diagnostics.push(
+            "format 'openai_responses': expected an '/responses' endpoint or JSON path '$.input'"
+                .to_string(),
+        );
+    }
+    if !path.contains("/responses") && body.contains_key("input") && !body.contains_key("model") {
+        diagnostics.push(
+            "JSON path '$.model': missing required field when using '$.input'; expected a string"
+                .to_string(),
+        );
+    }
+    if let Some(value) = body.get("model") {
+        if value.as_str().is_none() {
+            diagnostics.push(format!(
+                "JSON path '$.model': expected a string, got {}",
+                json_type_name(value)
+            ));
+        }
+    }
+    if let Some(value) = body.get("input") {
+        if !matches!(value, Value::String(_) | Value::Array(_)) {
+            diagnostics.push(format!(
+                "JSON path '$.input': expected a string or array, got {}",
+                json_type_name(value)
+            ));
+        }
+    } else if !path.contains("/responses") {
+        diagnostics.push(
+            "JSON path '$.input': missing required field; expected a string or array".to_string(),
+        );
+    }
+    diagnostics
+}
+
+fn gemini_chat_diagnostics(path: &str, body: &Map<String, Value>) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let gemini_endpoint = path.contains("generateContent")
+        || path.contains("streamGenerateContent")
+        || path.contains("/v1beta/models/");
+    if !gemini_endpoint && !body.contains_key("contents") {
+        diagnostics.push(
+            "format 'gemini_chat': expected a Gemini generateContent endpoint or JSON path '$.contents'"
+                .to_string(),
+        );
+    }
+    match body.get("contents") {
+        Some(Value::Array(contents)) => {
+            if contents.is_empty() {
+                diagnostics.push("JSON path '$.contents': must contain at least one content item".to_string());
+            }
+            for (index, content) in contents.iter().enumerate() {
+                let path = format!("$.contents[{index}]");
+                let Some(content) = content.as_object() else {
+                    diagnostics.push(format!(
+                        "JSON path '{path}': expected an object, got {}",
+                        json_type_name(content)
+                    ));
+                    continue;
+                };
+                match content.get("parts") {
+                    Some(Value::Array(parts)) if !parts.is_empty() => {}
+                    Some(Value::Array(_)) => diagnostics.push(format!(
+                        "JSON path '{path}.parts': must contain at least one part"
+                    )),
+                    Some(value) => diagnostics.push(format!(
+                        "JSON path '{path}.parts': expected an array, got {}",
+                        json_type_name(value)
+                    )),
+                    None => diagnostics.push(format!(
+                        "JSON path '{path}.parts': missing required field; expected an array"
+                    )),
+                }
+            }
+        }
+        Some(value) => diagnostics.push(format!(
+            "JSON path '$.contents': expected an array, got {}",
+            json_type_name(value)
+        )),
+        None => diagnostics.push(
+            "JSON path '$.contents': missing required field; expected an array of content items"
+                .to_string(),
+        ),
+    }
+    diagnostics
 }
 
 fn all_request_formats() -> Vec<RequestFormat> {
