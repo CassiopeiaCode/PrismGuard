@@ -199,6 +199,11 @@ pub fn process_request(
                 )
             };
 
+            let diagnostics = request_format_diagnostics(&candidates, path, headers, &plan.body);
+            if !diagnostics.is_empty() {
+                message.push_str(&format!(" Diagnostics: {}", diagnostics.join("; ")));
+            }
+
             if !parse_errors.is_empty() {
                 message.push_str(&format!(" Parse errors: {}", parse_errors.join("; ")));
             }
@@ -327,6 +332,128 @@ fn detect_formats_from_candidates(
         .copied()
         .filter(|format| can_parse(*format, path, headers, body))
         .collect()
+}
+
+fn request_format_diagnostics(
+    candidates: &[RequestFormat],
+    path: &str,
+    headers: &[(String, String)],
+    body: &Value,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .flat_map(|format| format_diagnostics(*format, path, headers, body))
+        .collect()
+}
+
+fn format_diagnostics(
+    format: RequestFormat,
+    path: &str,
+    headers: &[(String, String)],
+    body: &Value,
+) -> Vec<String> {
+    let Some(object) = body.as_object() else {
+        return vec![format!(
+            "format '{}': JSON path '$' must contain an object, got {}",
+            format.as_str(),
+            json_type_name(body)
+        )];
+    };
+
+    match format {
+        RequestFormat::OpenAiChat => openai_chat_diagnostics(path, headers, object),
+        _ => Vec::new(),
+    }
+}
+
+fn openai_chat_diagnostics(
+    path: &str,
+    headers: &[(String, String)],
+    body: &Map<String, Value>,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    let anthropic_header = headers
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("anthropic-version"));
+
+    if path.contains("/messages") || anthropic_header || body.contains_key("anthropic_version") {
+        diagnostics.push(
+            "format 'openai_chat': request path or headers identify an Anthropic/Claude request"
+                .to_string(),
+        );
+    }
+    if body.contains_key("prompt") && !body.contains_key("messages") {
+        diagnostics.push(
+            "JSON path '$.prompt': found a prompt request, expected '$.messages' for openai_chat"
+                .to_string(),
+        );
+    }
+
+    match body.get("messages") {
+        None => diagnostics.push(
+            "JSON path '$.messages': missing required field; expected an array of chat messages"
+                .to_string(),
+        ),
+        Some(Value::Array(messages)) if messages.is_empty() => diagnostics.push(
+            "JSON path '$.messages': must contain at least one message".to_string(),
+        ),
+        Some(Value::Array(messages)) => {
+            for (index, message) in messages.iter().enumerate() {
+                let message_path = format!("$.messages[{index}]");
+                let Some(message) = message.as_object() else {
+                    diagnostics.push(format!(
+                        "JSON path '{message_path}': expected an object, got {}",
+                        json_type_name(message)
+                    ));
+                    continue;
+                };
+                match message.get("role") {
+                    None => diagnostics.push(format!(
+                        "JSON path '{message_path}.role': missing required field; expected a string"
+                    )),
+                    Some(value) if value.as_str().is_none() => diagnostics.push(format!(
+                        "JSON path '{message_path}.role': expected a string, got {}",
+                        json_type_name(value)
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        Some(value) => diagnostics.push(format!(
+            "JSON path '$.messages': expected an array, got {}",
+            json_type_name(value)
+        )),
+    }
+
+    if let Some(value) = body.get("stream") {
+        if value.as_bool().is_none() {
+            diagnostics.push(format!(
+                "JSON path '$.stream': expected a boolean, got {}",
+                json_type_name(value)
+            ));
+        }
+    }
+    if let Some(value) = body.get("model") {
+        if value.as_str().is_none() {
+            diagnostics.push(format!(
+                "JSON path '$.model': expected a string, got {}",
+                json_type_name(value)
+            ));
+        }
+    }
+
+    diagnostics
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn all_request_formats() -> Vec<RequestFormat> {
@@ -3589,6 +3716,60 @@ mod tests {
                 assert!(message.contains("Format mismatch"), "{message}");
                 assert!(message.contains("gemini_chat"), "{message}");
                 assert!(message.contains("openai_chat"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_parse_reports_openai_chat_json_path_for_missing_messages() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "openai_chat",
+                "strict_parse": true
+            }
+        });
+        let err = process_request(
+            &config,
+            "/v1/chat/completions",
+            &[],
+            json!({"model": "gpt-4.1-mini"}),
+        )
+        .expect_err("missing messages should be reported");
+
+        match err {
+            RequestProcessError::StrictParse(message) => {
+                assert!(message.contains("JSON path '$.messages'"), "{message}");
+                assert!(message.contains("missing required field"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_parse_reports_openai_chat_json_types() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "openai_chat",
+                "strict_parse": true
+            }
+        });
+        let err = process_request(
+            &config,
+            "/v1/chat/completions",
+            &[],
+            json!({"messages": {}, "stream": "true"}),
+        )
+        .expect_err("invalid field types should be reported");
+
+        match err {
+            RequestProcessError::StrictParse(message) => {
+                assert!(message.contains("JSON path '$.messages'"), "{message}");
+                assert!(message.contains("expected an array, got object"), "{message}");
+                assert!(message.contains("JSON path '$.stream'"), "{message}");
+                assert!(message.contains("expected a boolean, got string"), "{message}");
             }
             other => panic!("unexpected error: {other:?}"),
         }
