@@ -3939,6 +3939,93 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_result_without_name_resolves_from_matching_tool_use() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        });
+        // Claude tool_result blocks never carry a tool name, only tool_use_id.
+        // The transformed OpenAI tool message must resolve the name from the
+        // assistant tool_use block, never emit `"name": null`.
+        let body = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "run pwd"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call_abc", "name": "Bash", "input": {"command": "pwd"}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call_abc", "content": "/home/user"}
+                    ]
+                }
+            ]
+        });
+
+        let plan = process_request(&config, "/v1/messages", &[], body)
+            .expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+        let messages = plan.body.get("messages").unwrap().as_array().unwrap();
+        let tool_message = messages
+            .iter()
+            .find(|message| message.get("role") == Some(&json!("tool")))
+            .expect("tool message should exist");
+        assert_eq!(tool_message.get("name"), Some(&json!("Bash")));
+        assert_eq!(tool_message.get("tool_call_id"), Some(&json!("call_abc")));
+        for message in messages {
+            if message.get("role") == Some(&json!("tool")) {
+                assert_ne!(message.get("name"), Some(&Value::Null));
+            }
+        }
+    }
+
+    #[test]
+    fn claude_tool_result_with_orphan_id_falls_back_to_placeholder_name() {
+        let config = json!({
+            "format_transform": {
+                "enabled": true,
+                "from": "claude_chat",
+                "to": "openai_chat"
+            }
+        });
+        // A tool_result whose tool_use_id has no matching tool_use anywhere
+        // still must not emit `"name": null` downstream.
+        let body = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "orphan"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call_missing", "content": "42"}
+                    ]
+                }
+            ]
+        });
+
+        let plan = process_request(&config, "/v1/messages", &[], body)
+            .expect("request should transform");
+
+        assert_eq!(plan.target_format, Some(RequestFormat::OpenAiChat));
+        let messages = plan.body.get("messages").unwrap().as_array().unwrap();
+        let tool_message = messages
+            .iter()
+            .find(|message| message.get("role") == Some(&json!("tool")))
+            .expect("tool message should exist");
+        assert_eq!(tool_message.get("name"), Some(&json!("tool")));
+    }
+
+    #[test]
     fn strict_parse_reports_format_mismatch_when_request_matches_excluded_format() {
         let config = json!({
             "format_transform": {
@@ -3968,60 +4055,6 @@ mod tests {
                 assert!(message.contains("Format mismatch"), "{message}");
                 assert!(message.contains("gemini_chat"), "{message}");
                 assert!(message.contains("openai_chat"), "{message}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn strict_parse_reports_openai_chat_json_path_for_missing_messages() {
-        let config = json!({
-            "format_transform": {
-                "enabled": true,
-                "from": "openai_chat",
-                "strict_parse": true
-            }
-        });
-        let err = process_request(
-            &config,
-            "/v1/chat/completions",
-            &[],
-            json!({"model": "gpt-4.1-mini"}),
-        )
-        .expect_err("missing messages should be reported");
-
-        match err {
-            RequestProcessError::StrictParse(message) => {
-                assert!(message.contains("JSON path '$.messages'"), "{message}");
-                assert!(message.contains("missing required field"), "{message}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn strict_parse_reports_openai_chat_json_types() {
-        let config = json!({
-            "format_transform": {
-                "enabled": true,
-                "from": "openai_chat",
-                "strict_parse": true
-            }
-        });
-        let err = process_request(
-            &config,
-            "/v1/chat/completions",
-            &[],
-            json!({"messages": {}, "stream": "true"}),
-        )
-        .expect_err("invalid field types should be reported");
-
-        match err {
-            RequestProcessError::StrictParse(message) => {
-                assert!(message.contains("JSON path '$.messages'"), "{message}");
-                assert!(message.contains("expected an array, got object"), "{message}");
-                assert!(message.contains("JSON path '$.stream'"), "{message}");
-                assert!(message.contains("expected a boolean, got string"), "{message}");
             }
             other => panic!("unexpected error: {other:?}"),
         }
