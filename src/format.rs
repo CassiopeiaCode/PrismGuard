@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 
@@ -909,11 +911,46 @@ fn parse_request(format: RequestFormat, body: &Value, path: &str) -> Result<Inte
     let body = body
         .as_object()
         .ok_or_else(|| anyhow!("request body must be an object"))?;
-    match format {
+    let mut request = match format {
         RequestFormat::OpenAiChat => parse_openai_chat(body),
         RequestFormat::ClaudeChat => parse_claude_chat(body),
         RequestFormat::OpenAiResponses => parse_openai_responses(body),
         RequestFormat::GeminiChat => parse_gemini_chat(body, path),
+    }?;
+    backfill_tool_result_names(&mut request.messages);
+    Ok(request)
+}
+
+/// Claude `tool_result` blocks only carry `tool_use_id` — never a tool name —
+/// and OpenAI/Responses clients may omit `name` (or send it as null) on tool
+/// outputs as well. Downstream protocols (Vercel AI Gateway v3, Gemini
+/// `functionResponse`) require a string name, so resolve missing ToolResult
+/// names from the ToolCall sharing the same id anywhere in the conversation.
+/// Two passes over the block list: build the id->name map, then backfill.
+fn backfill_tool_result_names(messages: &mut [InternalMessage]) {
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    for message in messages.iter() {
+        for block in &message.content {
+            if let InternalContentBlock::ToolCall { id, name, .. } = block {
+                if !id.is_empty() && !name.is_empty() {
+                    call_names.entry(id.clone()).or_insert_with(|| name.clone());
+                }
+            }
+        }
+    }
+    if call_names.is_empty() {
+        return;
+    }
+    for message in messages.iter_mut() {
+        for block in &mut message.content {
+            if let InternalContentBlock::ToolResult { call_id, name, .. } = block {
+                if name.is_none() {
+                    if let Some(resolved) = call_names.get(call_id) {
+                        *name = Some(resolved.clone());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2026,7 +2063,7 @@ fn emit_openai_chat(req: &InternalRequest) -> Value {
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "name": name,
+                    "name": name.clone().unwrap_or_else(|| "tool".to_string()),
                     "content": openai_tool_result_content(output)
                 }));
             }
@@ -2773,7 +2810,7 @@ fn responses_message(message: &InternalMessage) -> Value {
                 return json!({
                     "type":"function_call_output",
                     "call_id": call_id,
-                    "name": name,
+                    "name": name.clone().unwrap_or_else(|| "tool".to_string()),
                     "output": output,
                     "status": "completed"
                 });
@@ -2811,7 +2848,7 @@ fn gemini_message(message: &InternalMessage) -> Option<Value> {
             } => Some(json!({
                 "functionResponse": {
                     "id": call_id,
-                    "name": name,
+                    "name": name.clone().unwrap_or_else(|| "tool".to_string()),
                     "response": output
                 }
             })),
